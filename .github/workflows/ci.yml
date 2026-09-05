@@ -157,7 +157,11 @@ jobs:
       - name: Run E2E suite
         working-directory: frontend
         env:
-          WORLDGRAPH_E2E_COMMAND: "npm run preview -- --port 5173 --strictPort"
+          # `--host 127.0.0.1` is load-bearing. Without it Vite binds to whatever
+          # `localhost` resolves to, which on this runner is ::1, while Playwright polls
+          # http://127.0.0.1:5173 and waits out its whole timeout against a port nothing
+          # is listening on. Naming the interface removes the ambiguity.
+          WORLDGRAPH_E2E_COMMAND: "npm run preview -- --host 127.0.0.1 --port 5173 --strictPort"
         run: npx playwright test
 
       - name: Upload Playwright report
