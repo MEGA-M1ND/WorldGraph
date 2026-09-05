@@ -27,7 +27,7 @@ from ..models.analysis import (
     ImpactPath,
     PathHop,
 )
-from ..models.core import DataMode, WorldEvent
+from ..models.core import Criticality, DataMode, EntityType, WorldEvent
 from .business_impact import business_impact, customer_exposure, is_customer_facing
 from .propagation import IMPACT_THRESHOLD, PropagationState, propagate
 from .risk import assess_confidence, score_impact
@@ -233,7 +233,7 @@ def _critical_paths(
     candidates = [
         record
         for record in impacted
-        if record.customer_facing or record.criticality.value == "CRITICAL"
+        if record.customer_facing is True or record.criticality is Criticality.CRITICAL
     ]
     candidates.sort(key=lambda r: (r.availability, -r.depth, r.entity_id))
     paths: list[ImpactPath] = []
@@ -297,19 +297,39 @@ def _explain(
 
     if exposure:
         worst = exposure[0]
+        customers = (
+            f"{worst.customer_count:,} modelled customers"
+            if worst.customer_count
+            else "customer count not declared"
+        )
         lines.append(
             f"Customer exposure: {worst.region} sees an estimated "
-            f"{worst.traffic_impact * 100:.0f}% traffic impact "
-            f"({worst.customer_count:,} modelled customers). MODELLED ESTIMATE."
+            f"{worst.traffic_impact * 100:.0f}% traffic impact ({customers}). "
+            "MODELLED ESTIMATE."
         )
-    else:
+    elif graph.entities_of_type(EntityType.CUSTOMER_REGION):
         lines.append("No customer region falls below nominal availability in this model.")
 
-    lines.append(
-        f"Modelled organisation availability {impact.availability * 100:.2f}%, "
-        f"{impact.critical_services_impacted} critical services impacted, "
-        f"{impact.customer_regions_impacted} customer regions impacted. MODELLED ESTIMATE."
-    )
+    # Lead with whichever availability the estate can actually support. Formatting a
+    # missing customer view as a percentage is exactly the fabrication the Reality Pass
+    # removed, so the sentence itself changes rather than the number being coerced.
+    if impact.availability is not None:
+        lines.append(
+            f"Modelled organisation availability {impact.availability * 100:.2f}%, "
+            f"{impact.critical_services_impacted} critical services impacted, "
+            f"{impact.customer_regions_impacted} customer regions impacted. "
+            "MODELLED ESTIMATE."
+        )
+    else:
+        lines.append(
+            f"Modelled infrastructure availability "
+            f"{impact.infrastructure_availability * 100:.2f}% across "
+            f"{impact.impacted_entity_count} impacted entities. "
+            "Customer-experienced availability is UNKNOWN for this workspace. "
+            "MODELLED ESTIMATE."
+        )
+    # Say what could not be computed, in the same breath as what could.
+    lines.extend(impact.unknown_reasons)
 
     for origin_id in origins:
         cause = state.dominant_cause.get(origin_id)

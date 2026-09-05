@@ -13,12 +13,12 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from .ai.analyst import build_analyst
 from .api.routes import router
 from .config import Settings, get_settings
+from .models.workspace import ATLASPAY_WORKSPACE_ID
 from .observability.logging import RequestLoggingMiddleware, configure_logging
 from .security.ratelimit import RateLimiter
-from .services.world_state import WorldState
+from .services.workspaces import WorkspaceRegistry, default_repository_for
 from .storage.repository import Repository
 
 logger = logging.getLogger("worldgraph")
@@ -37,12 +37,28 @@ def create_app(
     settings = settings or get_settings()
     configure_logging()
 
+    def repository_factory(workspace_id: str) -> Repository:
+        """One store per workspace.
+
+        An injected repository belongs to the default workspace only. Handing the same
+        connection to every workspace would put a demo fixture and a real subscription in
+        one file, which is the contamination the registry exists to prevent.
+        """
+        if repository is not None and workspace_id == ATLASPAY_WORKSPACE_ID:
+            return repository
+        return default_repository_for(settings, workspace_id)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        world = WorldState(settings, repository)
-        await world.startup()
-        app.state.world = world
-        app.state.analyst = build_analyst(world, settings)
+        workspaces = WorkspaceRegistry(settings, repository_factory)
+        await workspaces.startup()
+        app.state.workspaces = workspaces
+        # The default world, kept on app.state for the many callers that never switch.
+        app.state.world = workspaces.state(workspaces.default_id)
+        # One analyst per workspace, built on demand: an analyst is bound to a world, and
+        # answering a question about one estate with another's tools would be the same
+        # contamination bug in a different layer.
+        app.state.analysts = {}
         app.state.limiters = {
             "ai": RateLimiter(limit_per_minute=settings.ai_rate_limit_per_minute),
             "analysis": RateLimiter(limit_per_minute=settings.analysis_rate_limit_per_minute),
@@ -51,14 +67,15 @@ def create_app(
             "worldgraph_ready",
             extra={
                 "mode": settings.run_mode.value,
-                "entities": len(world.graph),
+                "entities": len(app.state.world.graph),
+                "workspaces": len(workspaces.list()),
                 "ai_enabled": settings.ai_enabled,
             },
         )
         try:
             yield
         finally:
-            await world.shutdown()
+            await workspaces.shutdown()
 
     app = FastAPI(
         title="WorldGraph",
@@ -66,8 +83,9 @@ def create_app(
         description=(
             "AI-native cyber-physical resilience twin. Correlates world events against an "
             "organisation's dependency graph to compute blast radius, business impact and "
-            "response options. The enterprise estate in this deployment (AtlasPay) is "
-            "synthetic demonstration data."
+            "response options. Every workspace states its own provenance: the built-in "
+            "AtlasPay estate is synthetic demonstration data, and an imported cloud estate "
+            "is read-only inventory WorldGraph has changed nothing in."
         ),
         lifespan=lifespan,
     )

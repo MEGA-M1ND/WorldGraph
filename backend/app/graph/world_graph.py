@@ -355,7 +355,10 @@ class WorldGraph:
         """
         results: list[tuple[str, int]] = []
         for entity in self._entities.values():
-            if entity.business.redundancy > 1:
+            # `None` redundancy means undeclared, which is a coverage gap rather than a
+            # finding. Reporting it as a single point of failure would assert something
+            # nobody told us (docs/REALITY_PASS_AUDIT.md, B3).
+            if entity.business.is_single_point_of_failure is not True:
                 continue
             reach = self.traverse_dependents([entity.id])
             downstream = len(reach.steps) - 1

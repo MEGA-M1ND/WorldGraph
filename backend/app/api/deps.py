@@ -7,32 +7,84 @@ on ``app.state`` rather than in a module global so tests can build an isolated a
 
 from __future__ import annotations
 
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import Depends, HTTPException, Query, Request, status
 
 from ..config import Settings, get_settings
+from ..models.workspace import Workspace
 from ..security.ratelimit import RateLimiter
+from ..services.workspaces import WorkspaceError, WorkspaceRegistry
 from ..services.world_state import WorldState
 
 
-def get_state(request: Request) -> WorldState:
-    """The process-wide world state."""
-    state: WorldState | None = getattr(request.app.state, "world", None)
-    if state is None:
+def get_registry(request: Request) -> WorkspaceRegistry:
+    """The workspace registry."""
+    registry: WorkspaceRegistry | None = getattr(request.app.state, "workspaces", None)
+    if registry is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="WorldGraph is still starting up.",
         )
-    return state
+    return registry
 
 
-def get_analyst(request: Request):
-    """The configured analyst backend."""
-    analyst = getattr(request.app.state, "analyst", None)
-    if analyst is None:
+def get_workspace(
+    request: Request,
+    workspace: str | None = Query(
+        default=None,
+        max_length=64,
+        description=(
+            "Which estate to answer about. Omitted means the default demo workspace. An "
+            "unknown or unloaded id is an error, never a silent fallback."
+        ),
+    ),
+) -> Workspace:
+    """The workspace a request is addressed to."""
+    registry = get_registry(request)
+    try:
+        return registry.get(workspace)
+    except WorkspaceError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(error)
+        ) from error
+
+
+def get_state(
+    request: Request, selected: Workspace = Depends(get_workspace)
+) -> WorldState:
+    """The world for the requested workspace.
+
+    A workspace that exists but is not loaded is a 409 with the reason, never a fallback
+    to the default. Answering a question about an Azure subscription with data from a demo
+    fixture would be the single most damaging bug this product could ship.
+    """
+    registry = get_registry(request)
+    try:
+        return registry.state(selected.id)
+    except WorkspaceError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=str(error)
+        ) from error
+
+
+def get_analyst(request: Request, state: WorldState = Depends(get_state)):
+    """The analyst bound to the requested workspace's world.
+
+    Built once per workspace and cached. Each analyst's tools read only its own world, so
+    a question asked of one estate cannot be answered from another's graph.
+    """
+    from ..ai.analyst import build_analyst
+
+    analysts: dict | None = getattr(request.app.state, "analysts", None)
+    if analysts is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="The analyst is still starting up.",
         )
+    key = state.workspace.id
+    analyst = analysts.get(key)
+    if analyst is None:
+        analyst = build_analyst(state, get_settings())
+        analysts[key] = analyst
     return analyst
 
 

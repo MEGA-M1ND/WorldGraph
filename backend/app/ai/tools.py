@@ -26,6 +26,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from ..analysis.business_impact import is_customer_facing
 from ..analysis.correlation import (
     attack_paths,
     find_assets_near_event,
@@ -210,6 +211,17 @@ class ToolContext:
 # -- handlers ---------------------------------------------------------------------------
 
 
+def _tri_state(value: bool | None) -> str:
+    """Render a tri-state for a model. ``None`` becomes an explicit UNKNOWN.
+
+    A bare ``null`` in a tool result is routinely read as "no" or as zero. The word cannot
+    be, which is the whole point of the Reality Pass changes.
+    """
+    if value is None:
+        return "UNKNOWN"
+    return "YES" if value else "NO"
+
+
 def _entity_row(state: WorldState, entity_id: str) -> dict[str, Any]:
     entity = state.entity(entity_id)
     if entity is None:
@@ -222,8 +234,15 @@ def _entity_row(state: WorldState, entity_id: str) -> dict[str, Any]:
         "health": entity.health.value,
         "region": entity.business.region,
         "location": entity.location.model_dump() if entity.location else None,
-        "traffic_share": entity.business.traffic_share,
-        "redundancy": entity.business.redundancy,
+        # Explicit "UNKNOWN" rather than a bare null: a model reading `null` may render it
+        # as 0, and 0 is a measurement. The string cannot be mistaken for one.
+        "traffic_share": entity.business.traffic_share
+        if entity.business.has_traffic
+        else "UNKNOWN",
+        "redundancy": entity.business.redundancy
+        if entity.business.redundancy is not None
+        else "UNKNOWN",
+        "customer_facing": _tri_state(is_customer_facing(entity)),
         "internet_facing": entity.exposure.internet_facing,
         "software": [c.name for c in entity.software],
         "mode": entity.source.mode.value,

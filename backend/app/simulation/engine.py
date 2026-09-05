@@ -188,15 +188,37 @@ def build_deltas(
     ``direction`` is computed from the numbers rather than assumed, so a scenario that
     *improves* something (removing a bad dependency, say) is coloured honestly.
     """
-    rows: list[MetricDelta] = [
-        MetricDelta(
-            key="availability",
-            label="Availability",
-            baseline=f"{baseline.availability * 100:.2f}%",
-            simulated=f"{simulated.availability * 100:.2f}%",
-            direction=_direction(baseline.availability, simulated.availability, higher_is_better=True),
+    rows: list[MetricDelta] = []
+
+    # Customer-experienced availability only appears when the estate can support it. An
+    # imported inventory with no customer regions gets the infrastructure row instead —
+    # printing "100.00% → 100.00%" from a null would be the exact fabrication the Reality
+    # Pass removed (docs/REALITY_PASS_AUDIT.md, B1).
+    if baseline.availability is not None or simulated.availability is not None:
+        rows.append(
+            MetricDelta(
+                key="availability",
+                label="Customer availability",
+                baseline=_percent(baseline.availability),
+                simulated=_percent(simulated.availability),
+                direction=_direction_optional(
+                    baseline.availability, simulated.availability, higher_is_better=True
+                ),
+            )
         )
-    ]
+    rows.append(
+        MetricDelta(
+            key="infrastructure_availability",
+            label="Infrastructure availability",
+            baseline=_percent(baseline.infrastructure_availability),
+            simulated=_percent(simulated.infrastructure_availability),
+            direction=_direction(
+                baseline.infrastructure_availability,
+                simulated.infrastructure_availability,
+                higher_is_better=True,
+            ),
+        )
+    )
 
     for region in sorted(set(baseline.regional_capacity) | set(simulated.regional_capacity)):
         base_value = baseline.regional_capacity.get(region, 1.0)
@@ -240,9 +262,9 @@ def build_deltas(
             MetricDelta(
                 key="customers_affected",
                 label="Customers affected",
-                baseline=f"{baseline.customers_affected:,}",
-                simulated=f"{simulated.customers_affected:,}",
-                direction=_direction(
+                baseline=_count(baseline.customers_affected),
+                simulated=_count(simulated.customers_affected),
+                direction=_direction_optional(
                     baseline.customers_affected,
                     simulated.customers_affected,
                     higher_is_better=False,
@@ -253,7 +275,7 @@ def build_deltas(
                 label="Revenue at risk / hour",
                 baseline=_money(baseline.revenue_at_risk_per_hour),
                 simulated=_money(simulated.revenue_at_risk_per_hour),
-                direction=_direction(
+                direction=_direction_optional(
                     baseline.revenue_at_risk_per_hour,
                     simulated.revenue_at_risk_per_hour,
                     higher_is_better=False,
@@ -289,8 +311,35 @@ def _risk_rank(severity) -> int:
     return order.index(severity.value) if severity.value in order else 0
 
 
-def _money(value: float) -> str:
+def _direction_optional(
+    baseline: float | int | None,
+    simulated: float | int | None,
+    *,
+    higher_is_better: bool,
+) -> str:
+    """Direction when either side may be unknown.
+
+    An unknown cannot be compared, so it reads as ``same`` — never as an improvement.
+    Colouring a missing measurement green would be the worst possible reading of it.
+    """
+    if baseline is None or simulated is None:
+        return "same"
+    return _direction(baseline, simulated, higher_is_better=higher_is_better)
+
+
+def _percent(value: float | None) -> str:
+    """Percentage cell, or UNKNOWN. Never a number standing in for a missing one."""
+    return "UNKNOWN" if value is None else f"{value * 100:.2f}%"
+
+
+def _count(value: int | None) -> str:
+    return "UNKNOWN" if value is None else f"{value:,}"
+
+
+def _money(value: float | None) -> str:
     """Compact currency for a comparison cell. Always a modelled figure."""
+    if value is None:
+        return "UNKNOWN"
     if value >= 1_000_000:
         return f"${value / 1_000_000:.2f}M"
     if value >= 1_000:
@@ -298,7 +347,7 @@ def _money(value: float) -> str:
     return f"${value:,.0f}"
 
 
-def _is_customer_facing(entity) -> bool:
+def _is_customer_facing(entity) -> bool | None:
     from ..analysis.business_impact import is_customer_facing
 
     return is_customer_facing(entity)

@@ -47,6 +47,8 @@ from ..models.core import (
     WorldEvent,
     utcnow,
 )
+from ..models.workspace import ImportSummary, Workspace
+from ..services.workspaces import WorkspaceError, WorkspaceRegistry
 from ..services.world_state import WorldState
 from ..simulation.engine import (
     SimulationError,
@@ -55,7 +57,7 @@ from ..simulation.engine import (
     override_for_health,
     touch,
 )
-from .deps import get_analyst, get_state, rate_limit
+from .deps import get_analyst, get_registry, get_state, get_workspace, rate_limit
 
 logger = logging.getLogger("worldgraph.api")
 
@@ -159,6 +161,79 @@ def health(state: WorldState = Depends(get_state)) -> dict[str, Any]:
         ],
         "at": utcnow().isoformat(),
     }
+
+
+# --------------------------------------------------------------------------------------
+# Workspaces
+# --------------------------------------------------------------------------------------
+
+
+class WorkspaceListResponse(BaseModel):
+    """Every estate this deployment knows about, and which one is the default."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    workspaces: list[Workspace]
+    default_id: str
+
+
+@router.get("/workspaces", response_model=WorkspaceListResponse, tags=["workspaces"])
+def list_workspaces(
+    registry: WorkspaceRegistry = Depends(get_registry),
+) -> WorkspaceListResponse:
+    """List the workspaces, including ones that failed to load.
+
+    A workspace whose credentials are unavailable stays in the list with an UNAVAILABLE
+    status and a reason. Hiding it would make a configuration problem look like an estate
+    that simply has nothing in it.
+    """
+    return WorkspaceListResponse(
+        workspaces=registry.list(), default_id=registry.default_id
+    )
+
+
+@router.get("/workspaces/current", tags=["workspaces"])
+def current_workspace(
+    selected: Workspace = Depends(get_workspace),
+    registry: WorkspaceRegistry = Depends(get_registry),
+) -> dict[str, Any]:
+    """One workspace, with its data disclaimer and — if imported — its coverage report."""
+    summary = registry.summary(selected.id)
+    return {
+        "workspace": selected.model_dump(mode="json"),
+        "disclaimer": selected.data_disclaimer(),
+        "loaded": registry.is_loaded(selected.id),
+        "import_summary": summary.model_dump(mode="json") if summary else None,
+    }
+
+
+@router.post(
+    "/workspaces/{workspace_id}/import",
+    response_model=ImportSummary,
+    tags=["workspaces"],
+    dependencies=[analysis_limit],
+)
+async def import_workspace(
+    workspace_id: str,
+    force: bool = Query(
+        default=False,
+        description="Re-read the source even if this workspace is already loaded.",
+    ),
+    registry: WorkspaceRegistry = Depends(get_registry),
+) -> ImportSummary:
+    """Import (or re-import) an inventory workspace.
+
+    Read-only end to end. This endpoint queries a source and builds a graph; it holds no
+    write permission against the source and there is no code path from here that could
+    change anything in it.
+    """
+    try:
+        return await registry.load_import(workspace_id, force=force)
+    except WorkspaceError as error:
+        # 409, not 500: the request was well-formed and the reason is actionable — bad
+        # credentials, an unreachable subscription, or a demo workspace that cannot be
+        # imported at all.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
 
 
 @router.get("/config", tags=["meta"])

@@ -15,6 +15,7 @@ from __future__ import annotations
 from ..graph.world_graph import WorldGraph
 from ..models.analysis import Confidence, RiskScore, ScoreContribution
 from ..models.core import (
+    CRITICALITY_ORDER,
     Criticality,
     DataMode,
     Severity,
@@ -66,21 +67,19 @@ def score_impact(
     impacted = [entity for entity in impacted if entity is not None]
 
     # 1. Asset criticality — the most critical thing actually degraded.
-    if impacted:
-        worst = min(
-            impacted,
-            key=lambda e: [
-                Criticality.CRITICAL,
-                Criticality.HIGH,
-                Criticality.MEDIUM,
-                Criticality.LOW,
-            ].index(e.criticality),
-        )
+    #    Entities whose criticality was never declared are excluded outright: an
+    #    undeclared criticality is not a low one, and scoring it would be WorldGraph
+    #    grading infrastructure on a judgement nobody made
+    #    (docs/REALITY_PASS_AUDIT.md, B4).
+    declared = [e for e in impacted if e.criticality is not Criticality.UNKNOWN]
+    if declared:
+        worst = min(declared, key=lambda e: CRITICALITY_ORDER.index(e.criticality))
         weight = {
             Criticality.CRITICAL: 1.0,
             Criticality.HIGH: 0.7,
             Criticality.MEDIUM: 0.4,
             Criticality.LOW: 0.15,
+            Criticality.UNKNOWN: 0.0,
         }[worst.criticality]
         # Scale by how badly the asset was actually hurt. A CRITICAL asset that lost 5% of
         # its availability is not the same event as one that is gone, and a flat "a
@@ -101,7 +100,8 @@ def score_impact(
 
     # 2. Customer-facing service degraded — the difference between an internal wobble and
     #    an outage a merchant sees.
-    customer_facing = [e for e in impacted if is_customer_facing(e)]
+    # Only an explicit declaration counts. `None` (nobody said) must not score.
+    customer_facing = [e for e in impacted if is_customer_facing(e) is True]
     if customer_facing:
         worst_availability = min(
             state.availability.get(e.id, 1.0) for e in customer_facing
@@ -117,10 +117,13 @@ def score_impact(
         )
 
     # 3. Single point of failure on the impact path.
+    # A declared redundancy of 1 is a single point of failure. An *undeclared* one is a
+    # coverage gap, not a finding, so it does not score.
     spof = [
         e
         for e in impacted
-        if e.business.redundancy <= 1 and state.availability.get(e.id, 1.0) < 0.5
+        if e.business.is_single_point_of_failure is True
+        and state.availability.get(e.id, 1.0) < 0.5
     ]
     if spof:
         worst_spof_loss = 1.0 - min(state.availability.get(e.id, 1.0) for e in spof)
@@ -166,7 +169,7 @@ def score_impact(
     from .business_impact import business_impact  # local import avoids a cycle
 
     impact = business_impact(graph, state)
-    if impact.traffic_impact > 0:
+    if impact.traffic_impact is not None and impact.traffic_impact > 0:
         contributions.append(
             ScoreContribution(
                 code="customer_exposure",
@@ -193,7 +196,9 @@ def score_impact(
     #    lower for the same event and the model must be able to say so.
     origins = [graph.entity(oid) for oid in origin_ids]
     redundant_origins = [
-        e for e in origins if e is not None and e.business.redundancy >= 2
+        e
+        for e in origins
+        if e is not None and e.business.redundancy is not None and e.business.redundancy >= 2
     ]
     if redundant_origins:
         contributions.append(
@@ -296,13 +301,41 @@ def assess_confidence(
             uncertain.append(f"{entity.name} has no health telemetry")
             score -= 0.05
 
-    uncertain.append("enterprise estate is synthetic demo data (AtlasPay)")
+    # Derived from the data, never asserted. Stating "this estate is synthetic demo data"
+    # about a live cloud import was a falsehood in the one field whose entire job is
+    # honesty (docs/REALITY_PASS_AUDIT.md, B7).
+    uncertain.extend(_estate_provenance_notes(graph))
+
+    # Undeclared business metadata is a real limit on any conclusion drawn here, and the
+    # operator can act on knowing which dimension is missing.
+    undeclared_criticality = sum(
+        1 for entity in graph.entities if entity.criticality is Criticality.UNKNOWN
+    )
+    if undeclared_criticality:
+        uncertain.append(
+            f"{undeclared_criticality} of {len(graph.entities)} entities have no declared "
+            "criticality, so business severity is not fully modelled"
+        )
+        score -= 0.05
 
     return Confidence(
         score=round(max(0.05, min(0.99, score)), 2),
         strong_evidence=_dedupe(strong),
         uncertainties=_dedupe(uncertain),
     )
+
+
+def _estate_provenance_notes(graph: WorldGraph) -> list[str]:
+    """Describe what kind of data this estate actually is, from the records themselves."""
+    modes = {entity.source.mode for entity in graph.entities}
+    notes: list[str] = []
+    if DataMode.SYNTHETIC in modes:
+        notes.append("part of this estate is synthetic demonstration data")
+    if DataMode.SIMULATED in modes:
+        notes.append("part of this estate is a simulated world state")
+    if DataMode.LIVE in modes and len(modes) > 1:
+        notes.append("this estate mixes live inventory with non-live records")
+    return notes
 
 
 def _dedupe(values: list[str]) -> list[str]:

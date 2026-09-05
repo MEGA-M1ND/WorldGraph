@@ -79,15 +79,22 @@ _REACH = re.compile(r"\b(reach\w*|attack paths?|internet.facing|compromis\w*)\b"
 _CUSTOMERS = re.compile(r"\b(customers?|which customers|customer impact)\b", re.IGNORECASE)
 _WHY = re.compile(r"\b(why|explain|justify|reason)\b", re.IGNORECASE)
 
-#: Region keywords mapped to the entity most operators mean by them.
-_REGION_HINTS: dict[str, str] = {
-    "singapore": "cloud-region-singapore",
-    "mumbai": "cloud-region-mumbai",
-    "frankfurt": "cloud-region-frankfurt",
-    "virginia": "cloud-region-virginia",
-    "tokyo": "cloud-region-tokyo",
-    "taiwan": "supplier-taiwan-hardware",
-}
+#: Entity types a bare place name most likely refers to, in preference order. A person
+#: who says "Singapore" during an incident means the site, not a microservice that happens
+#: to run there.
+#:
+#: This replaces a hardcoded map of six fixture entity ids
+#: (docs/REALITY_PASS_AUDIT.md, B10). Place names are now resolved against whatever
+#: estate is loaded, so "Southeast Asia" finds an Azure region for an imported workspace
+#: and "Singapore" still finds the demo's region for AtlasPay.
+_PLACE_TYPE_PREFERENCE: tuple[str, ...] = (
+    "CLOUD_REGION",
+    "DATACENTER",
+    "SUPPLIER",
+    "FACTORY",
+    "OFFICE",
+    "NETWORK_NODE",
+)
 
 
 class IntentRouter:
@@ -103,7 +110,7 @@ class IntentRouter:
         """Route one operator message."""
         text = (message or "").strip()
         if not text:
-            return RouterResult(answer="Ask me about AtlasPay's infrastructure, an event, or a what-if scenario.", matched=False)
+            return RouterResult(answer="Ask me about this workspace's infrastructure, an event, or a what-if scenario.", matched=False)
 
         try:
             for matcher in (
@@ -160,7 +167,7 @@ class IntentRouter:
         risks = status["material_risks"]
         dashboard = status["dashboard"]
         lines = [
-            f"{len(risks)} standing material risks against AtlasPay "
+            f"{len(risks)} standing material risks against {dashboard['organization']} "
             f"(modelled availability {dashboard['availability'] * 100:.2f}%, "
             f"{dashboard['active_incidents']} active incidents).",
             "",
@@ -192,7 +199,7 @@ class IntentRouter:
                 near = proximity.get("assets_in_radius", 0)
                 lines.append(
                     f"  [{event['mode']}] {event['severity']} — {event['title']}"
-                    + (f" ({near} AtlasPay assets in radius)" if near else "")
+                    + (f" ({near} assets in radius)" if near else "")
                 )
         else:
             lines.append("  No new world events were ingested.")
@@ -216,7 +223,7 @@ class IntentRouter:
             args["event_id"] = self.ctx.selected_event_id
         elif not self.ctx.state.recent_analyses(limit=1):
             # Asked cold, with nothing selected and nothing analysed. Rather than refusing,
-            # plan against the most severe incident that actually correlates with AtlasPay
+            # plan against the most severe incident that actually correlates with the estate
             # — which is what an operator opening the product means by the question.
             candidate = self._most_severe_incident()
             if candidate is not None:
@@ -243,7 +250,7 @@ class IntentRouter:
         return RouterResult(answer="\n".join(lines))
 
     def _most_severe_incident(self) -> str | None:
-        """The highest-severity event that correlates with AtlasPay, if any."""
+        """The highest-severity event that correlates with the loaded estate, if any."""
         order = ["CRITICAL", "HIGH", "MODERATE", "LOW", "INFO"]
         candidates = [
             event
@@ -323,7 +330,7 @@ class IntentRouter:
         if exposure["count"] == 0:
             return RouterResult(answer=f"{cve_id}: {exposure['note']}")
         lines = [
-            f"{cve_id} — {exposure['count']} AtlasPay assets run the affected software, "
+            f"{cve_id} — {exposure['count']} assets run the affected software, "
             f"{exposure['internet_facing_count']} of them internet-facing.",
             "",
         ]
@@ -342,7 +349,24 @@ class IntentRouter:
         if not _REACH.search(text) or re.search(r"blast radius", text, re.IGNORECASE):
             return None
         targets = self._resolve_targets(text)
-        target_id = targets[0] if targets else "payments-api"
+        if not targets:
+            # No fixture-id fallback. Without a named target, ask about the whole reachable
+            # surface rather than silently answering about a resource from another estate
+            # (docs/REALITY_PASS_AUDIT.md, B11).
+            paths = self._call("get_attack_paths")
+            if paths["count"] == 0:
+                return RouterResult(
+                    answer=(
+                        "No internet-facing entity in this workspace declares a path to "
+                        "anything else. Name a target to check a specific asset."
+                    )
+                )
+            lines = [f"{paths['count']} reachability paths from the public internet:", ""]
+            for path in paths["paths"][:5]:
+                lines.append("  " + " → ".join(path["names"]))
+            lines.extend(["", paths["note"]])
+            return RouterResult(answer="\n".join(lines))
+        target_id = targets[0]
         paths = self._call("get_attack_paths", to_entity_id=target_id)
         if paths["count"] == 0:
             return RouterResult(
@@ -513,7 +537,7 @@ class IntentRouter:
         if not _CRITICAL.search(text):
             return None
         result = self._call("search_entities", criticality="CRITICAL", limit=40)
-        lines = [f"{result['count']} CRITICAL AtlasPay entities:", ""]
+        lines = [f"{result['count']} CRITICAL entities in this workspace:", ""]
         for entity in result["entities"]:
             location = entity["region"] or "—"
             lines.append(f"  {entity['name']}  [{entity['type']}]  {location}")
@@ -650,10 +674,39 @@ class IntentRouter:
         if found:
             return _dedupe(found)
 
-        for keyword, entity_id in _REGION_HINTS.items():
-            if re.search(rf"\b{keyword}\b", lowered) and entity_id in self.ctx.state.graph:
-                found.append(entity_id)
+        # Place-name fallback, derived from the loaded estate rather than tabulated.
+        # Region labels and site names are matched as whole words, and a site-shaped
+        # entity wins over a workload that merely lives there.
+        for preference in _PLACE_TYPE_PREFERENCE:
+            for entity in entities:
+                if entity.type.value != preference:
+                    continue
+                for token in self._place_tokens(entity):
+                    if re.search(rf"\b{re.escape(token)}\b", lowered):
+                        found.append(entity.id)
+                        break
+            if found:
+                return _dedupe(found)
         return _dedupe(found)
+
+    @staticmethod
+    def _place_tokens(entity) -> list[str]:
+        """Words that plausibly name this entity's *place*, lowercased.
+
+        Drawn from the declared region and from the significant words of the name, so an
+        Azure ``southeastasia`` region and an AtlasPay ``AWS ap-southeast-1 (Singapore)``
+        are both findable by the words an operator would actually say.
+        """
+        tokens: set[str] = set()
+        region = (entity.business.region or "").strip().lower()
+        if len(region) >= 4:
+            tokens.add(region)
+        for word in re.split(r"[^a-z0-9]+", entity.name.lower()):
+            # Four characters filters out "aws", "the", "sea" and similar noise while
+            # keeping real place names.
+            if len(word) >= 5 and not word.isdigit():
+                tokens.add(word)
+        return sorted(tokens)
 
     def _resolve_event(self, text: str) -> str | None:
         """Find the event a message refers to."""
@@ -662,22 +715,19 @@ class IntentRouter:
         for event in events:
             if event.id.lower() in lowered:
                 return event.id
-        keywords = [
-            ("taiwan", "earthquake"),
-            ("earthquake", ""),
-            ("quake", ""),
-            ("singapore", "outage"),
-            ("region", "outage"),
-            ("cve", ""),
-            ("vulnerab", ""),
-        ]
-        for primary, secondary in keywords:
-            if primary not in lowered:
-                continue
-            for event in events:
-                haystack = f"{event.title} {event.category.value}".lower()
-                if primary in haystack and (not secondary or secondary in haystack):
-                    return event.id
+        # Score every loaded event by how many of its own significant words the operator
+        # used. Derived from the events actually present rather than from a fixture
+        # keyword table (docs/REALITY_PASS_AUDIT.md, B12), so this works for any feed.
+        best_id: str | None = None
+        best_score = 0
+        for event in events:
+            haystack = f"{event.title} {event.category.value}".lower()
+            words = {w for w in re.split(r"[^a-z0-9]+", haystack) if len(w) >= 4}
+            score = sum(1 for word in words if re.search(rf"\b{re.escape(word)}\b", lowered))
+            if score > best_score:
+                best_score, best_id = score, event.id
+        if best_id is not None:
+            return best_id
         return self.ctx.selected_event_id
 
     def _name(self, entity_id: str) -> str:
