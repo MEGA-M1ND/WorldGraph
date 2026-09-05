@@ -24,7 +24,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..models.core import HealthState
+from ..models.core import EntityType, HealthState
 from .tools import ToolContext, ToolError, run_tool
 
 
@@ -69,6 +69,42 @@ _DEPENDS = re.compile(
     re.IGNORECASE,
 )
 _CRITICAL = re.compile(r"\b(critical infrastructure|critical (services|assets)|show me our)\b", re.IGNORECASE)
+#: What the analyst says instead of a number it does not have.
+#:
+#: The deterministic router formats figures straight out of the analysis payload, and
+#: several of those are ``None`` for an estate that declares no business metadata. Before
+#: the Reality Pass this code multiplied them by 100 — which crashed the endpoint on an
+#: imported estate, and would have printed a fabricated percentage if it had not.
+UNKNOWN = "UNKNOWN"
+
+
+def _pct(value: float | None, *, decimals: int = 0) -> str:
+    """A percentage, or UNKNOWN. Never a placeholder that reads like a measurement."""
+    if value is None:
+        return UNKNOWN
+    return f"{value * 100:.{decimals}f}%"
+
+
+def _availability_phrase(payload: dict) -> str:
+    """How to state availability for an estate that may not declare customers.
+
+    Prefers the customer-experienced figure and falls back to the infrastructure one,
+    *relabelled* — reporting an infrastructure number as a customer number would be the
+    same lie in a different sentence.
+    """
+    customer = payload.get("availability")
+    if customer is not None:
+        return f"modelled availability {_pct(customer, decimals=2)}"
+    infrastructure = payload.get("infrastructure_availability")
+    if infrastructure is not None:
+        return (
+            f"modelled infrastructure availability {_pct(infrastructure, decimals=2)}; "
+            "customer-experienced availability is UNKNOWN because this estate declares "
+            "no customer regions or traffic shares"
+        )
+    return "availability UNKNOWN"
+
+
 _THREATS = re.compile(
     r"\b(what can hurt us|what.s (our )?risk|material risks?|biggest risks?|worried|threats?)\b",
     re.IGNORECASE,
@@ -95,6 +131,20 @@ _PLACE_TYPE_PREFERENCE: tuple[str, ...] = (
     "OFFICE",
     "NETWORK_NODE",
 )
+
+#: Words that describe *what a thing is*, never *where it is*.
+#:
+#: Derived from the entity-type vocabulary itself rather than hand-listed, so it stays
+#: correct as types are added. Without this, "Tell me about our Reykjavik quantum
+#: datacenter" matched the word "datacenter" inside "Singapore Datacenter Partner" and the
+#: analyst confidently described a facility on the other side of the planet — the exact
+#: fabrication the deterministic router exists to make impossible.
+_TYPE_VOCABULARY: frozenset[str] = frozenset(
+    word
+    for entity_type in EntityType
+    for word in entity_type.value.lower().split("_")
+    if len(word) >= 4
+) | frozenset({"datacentre", "partner", "primary", "secondary", "shared"})
 
 
 class IntentRouter:
@@ -168,7 +218,7 @@ class IntentRouter:
         dashboard = status["dashboard"]
         lines = [
             f"{len(risks)} standing material risks against {dashboard['organization']} "
-            f"(modelled availability {dashboard['availability'] * 100:.2f}%, "
+            f"({_availability_phrase(dashboard)}, "
             f"{dashboard['active_incidents']} active incidents).",
             "",
         ]
@@ -606,10 +656,13 @@ class IntentRouter:
             )
         lines.append("")
         lines.append(
-            f"Modelled availability {impact['availability'] * 100:.2f}%, "
+            f"{_availability_phrase(impact).capitalize()}, "
             f"{impact['critical_services_impacted']} critical services impacted. "
             f"{impact['disclaimer']}."
         )
+        for reason in impact.get("unknown_reasons", [])[:3]:
+            # Naming the missing input is the difference between a gap and a mystery.
+            lines.append(f"  ? {reason}")
         confidence = result["confidence"]
         lines.append("")
         lines.append(f"Confidence {confidence['score'] * 100:.0f}%")
@@ -699,12 +752,13 @@ class IntentRouter:
         """
         tokens: set[str] = set()
         region = (entity.business.region or "").strip().lower()
-        if len(region) >= 4:
+        if len(region) >= 4 and region not in _TYPE_VOCABULARY:
             tokens.add(region)
         for word in re.split(r"[^a-z0-9]+", entity.name.lower()):
-            # Four characters filters out "aws", "the", "sea" and similar noise while
-            # keeping real place names.
-            if len(word) >= 5 and not word.isdigit():
+            # Five characters filters out "aws", "the", "sea" and similar noise while
+            # keeping real place names; the type vocabulary filters out the words that
+            # say what a thing is rather than where it is.
+            if len(word) >= 5 and not word.isdigit() and word not in _TYPE_VOCABULARY:
                 tokens.add(word)
         return sorted(tokens)
 

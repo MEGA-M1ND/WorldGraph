@@ -479,3 +479,59 @@ class TestAtlasPayRegression:
             e.id for e in atlaspay_graph.entities if e.criticality is Criticality.UNKNOWN
         ]
         assert undeclared == []
+
+
+class TestAnalystOnAnUndeclaredEstate:
+    """The deterministic router formats figures it may not have.
+
+    Both bugs below were found by driving the real UI against an imported Azure estate,
+    not by review: the router crashed the /ai/ask endpoint outright, and the entity
+    resolver invented a facility. Neither was visible from the AtlasPay fixture, because
+    AtlasPay declares everything.
+    """
+
+    def test_threats_answer_does_not_crash_without_customer_metadata(self):
+        from app.ai.router import _availability_phrase
+
+        # dashboard["availability"] is None for an estate with no customer regions. This
+        # used to be multiplied by 100.
+        phrase = _availability_phrase(
+            {"availability": None, "infrastructure_availability": 0.8}
+        )
+        assert "80.00%" in phrase
+        assert "UNKNOWN" in phrase
+        assert "infrastructure" in phrase
+
+    def test_customer_availability_is_preferred_when_it_exists(self):
+        from app.ai.router import _availability_phrase
+
+        phrase = _availability_phrase(
+            {"availability": 0.9, "infrastructure_availability": 0.5}
+        )
+        assert "90.00%" in phrase
+        assert "50" not in phrase
+
+    def test_availability_with_nothing_declared_is_unknown_not_a_number(self):
+        from app.ai.router import _availability_phrase
+
+        assert _availability_phrase({}) == "availability UNKNOWN"
+
+    def test_percentage_helper_never_invents_a_figure(self):
+        from app.ai.router import UNKNOWN, _pct
+
+        assert _pct(None) == UNKNOWN
+        # A real zero is a measurement and must survive as one.
+        assert _pct(0.0) == "0%"
+
+    def test_a_generic_type_word_is_not_a_place_name(self):
+        """"Reykjavik quantum datacenter" must not resolve to a datacenter in Singapore."""
+        from app.ai.router import _TYPE_VOCABULARY
+
+        for word in ("datacenter", "cluster", "region", "service", "database", "partner"):
+            assert word in _TYPE_VOCABULARY, word
+
+    def test_real_place_names_survive_the_filter(self):
+        from app.ai.router import _TYPE_VOCABULARY
+
+        for word in ("singapore", "frankfurt", "westeurope", "jurong", "taiwan"):
+            assert word not in _TYPE_VOCABULARY, word

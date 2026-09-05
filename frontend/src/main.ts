@@ -59,6 +59,15 @@ class WorldGraphApp {
   private dockTab: DockTab = 'timeline';
   private clockTimer = 0;
   private pollTimer = 0;
+  /**
+   * The share state the *user* arrived with.
+   *
+   * Captured before anything else runs, because the app writes to the same URL: the globe
+   * persists its camera on idle, and if that lands before the share state is read back,
+   * WorldGraph mistakes its own bookkeeping for a link somebody sent — and skips the
+   * first-run launcher on a plain visit.
+   */
+  private arrivalShareState = readShareState();
 
   async start(): Promise<void> {
     this.installStaticHandlers();
@@ -650,7 +659,7 @@ class WorldGraphApp {
   }
 
   private async restoreShareLinkOrOfferMissions(): Promise<void> {
-    const shared = readShareState();
+    const shared = this.arrivalShareState;
 
     if (shared === null) {
       // Malformed link. Say so rather than silently showing a default view the sender

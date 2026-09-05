@@ -334,6 +334,12 @@ button {
   background: var(--bg-panel);
   min-height: 0;
 }
+
+/* `display: flex` above outranks the UA's `[hidden] { display: none }`, so a panel
+   toggled with `el.hidden` would stay on screen. Restore the attribute's meaning. */
+.panel[hidden] {
+  display: none;
+}
 .panel--grow {
   flex: 1;
   min-height: 0;
@@ -376,6 +382,13 @@ button {
 .panel__body--scroll {
   overflow-y: auto;
   flex: 1;
+}
+
+/* A panel that must not grow without limit inside a shared rail. The coverage report is
+   as long as the estate's gaps are, and left unbounded it pushed the risks and event
+   feed off the screen entirely. */
+.panel__body--capped {
+  max-height: 34vh;
 }
 
 /* ---------------------------------------------------------------------------------- */
