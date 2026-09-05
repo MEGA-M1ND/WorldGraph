@@ -373,7 +373,9 @@ class WorldGraphApp {
             : {},
       );
       store.update({ plan });
-      this.setDockTab('timeline');
+      // Deliberately does NOT move the dock. The plan renders in the right rail; yanking
+      // the operator away from the simulation table they are reading is disruptive and
+      // unrelated to what they asked for.
       await this.refreshTimeline();
     } catch (error) {
       if (!isSuperseded(error)) this.reportError('plan', error);
@@ -426,6 +428,13 @@ class WorldGraphApp {
       }
 
       await this.applyDirectives(response.directives);
+
+      // A response plan read as monospace transcript loses the per-action urgency badges
+      // and the rationale layout. When the analyst generated one, render it structurally
+      // in the detail panel too — regeneration is deterministic, so the two agree.
+      if (response.tool_calls.some((call) => call.tool === 'generate_response_plan')) {
+        await this.generatePlan();
+      }
       await this.refreshTimeline();
     } catch (error) {
       if (isSuperseded(error)) return;

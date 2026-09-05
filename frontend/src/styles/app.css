@@ -494,10 +494,13 @@ button {
   align-items: center;
   gap: var(--space-3);
   padding: var(--space-2) var(--space-3);
-  background: var(--simulation-bg);
-  border: 1px solid color-mix(in srgb, var(--simulation) 45%, transparent);
+  /* An opaque panel ground, not a translucent tint. This banner is the product's most
+     important honesty affordance — "you are looking at a hypothetical" — and it sits over
+     the globe, where bright imagery washed the translucent version out to near-illegible. */
+  background: color-mix(in srgb, var(--bg-panel) 94%, var(--simulation));
+  border: 1px solid color-mix(in srgb, var(--simulation) 70%, transparent);
   border-radius: var(--radius);
-  backdrop-filter: blur(12px);
+  box-shadow: var(--shadow-panel);
   font-size: var(--text-sm);
 }
 .sim-banner[hidden] {
@@ -512,6 +515,11 @@ button {
 .sim-banner span[data-bind] {
   color: var(--text-secondary);
   font-size: var(--text-xs);
+  display: block;
+  max-width: 46ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .sim-banner__dot {
   width: 7px;
@@ -538,12 +546,12 @@ button {
      is where the two overlays first come close to colliding. */
   max-width: 340px;
   padding: var(--space-2) var(--space-3);
-  background: color-mix(in srgb, var(--bg-panel) 82%, transparent);
+  background: color-mix(in srgb, var(--bg-panel) 94%, transparent);
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  backdrop-filter: blur(12px);
+  box-shadow: var(--shadow-panel);
   font-size: var(--text-xs);
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 .legend__item {
   display: flex;

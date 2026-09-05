@@ -170,6 +170,21 @@ test.describe('WorldGraph hero demo', () => {
     expect(answer).toMatch(/Why:/);
     expect(answer.toLowerCase()).toContain('executes nothing');
 
+    // The same plan also renders structurally, with per-action urgency and rationale.
+    await expect(page.locator('[data-bind="detail-title"]')).toHaveText('Response plan', {
+      timeout: 30_000,
+    });
+    const actions = page.locator('.plan__action');
+    await expect(actions.first()).toBeVisible();
+    expect(await actions.count()).toBeGreaterThanOrEqual(3);
+    for (const rationale of await page.locator('.plan__rationale').allInnerTexts()) {
+      expect(rationale.trim().length).toBeGreaterThan(0);
+    }
+    // Every row states that nothing ran.
+    for (const note of await page.locator('.plan__footnote').allInnerTexts()) {
+      expect(note).toContain('not executed');
+    }
+
     await page.screenshot({ path: `${SHOTS}/07-response-plan.png` });
   });
 

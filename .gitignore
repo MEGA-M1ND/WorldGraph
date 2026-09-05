@@ -32,3 +32,6 @@ frontend/.playwright/
 # Artifacts
 screenshots/
 *.log
+
+# Playwright browser override used by the local E2E runner
+.playwright-env
