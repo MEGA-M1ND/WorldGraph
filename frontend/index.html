@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="WorldGraph — AI-native cyber-physical resilience twin. What is happening in the world that can affect us, what is exposed, and what should we do about it."
+    />
+    <title>WorldGraph — AtlasPay Global Operations</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='none' stroke='%234da3ff' stroke-width='2'/%3E%3Cpath d='M3 16h26M16 3c5 6 5 20 0 26M16 3c-5 6-5 20 0 26' fill='none' stroke='%234da3ff' stroke-width='1.2' opacity='.7'/%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <div id="app" class="app" data-view-mode="executive">
+      <!-- Top bar ------------------------------------------------------------------ -->
+      <header class="topbar" role="banner">
+        <div class="topbar__brand">
+          <span class="topbar__mark" aria-hidden="true"></span>
+          <span class="topbar__name">WORLDGRAPH</span>
+        </div>
+        <div class="topbar__org">
+          <span class="topbar__org-name" data-bind="org-name">AtlasPay</span>
+          <span class="badge badge--synthetic" title="The enterprise estate is synthetic demonstration data.">SYNTHETIC ESTATE</span>
+        </div>
+        <div class="topbar__stats" data-bind="headline-stats"></div>
+        <div class="topbar__right">
+          <div class="mode-switch" role="group" aria-label="View mode">
+            <button type="button" class="mode-switch__button is-active" data-view="executive">Executive</button>
+            <button type="button" class="mode-switch__button" data-view="engineer">Engineer</button>
+          </div>
+          <span class="chip" data-bind="run-mode">DEMO</span>
+          <time class="topbar__clock" data-bind="clock">--:-- UTC</time>
+          <button type="button" class="icon-button" data-action="share" title="Copy a link to this view">
+            Share
+          </button>
+        </div>
+      </header>
+
+      <!-- Notices ------------------------------------------------------------------ -->
+      <div class="notices" data-bind="notices" role="status" aria-live="polite"></div>
+
+      <!-- Main ---------------------------------------------------------------------- -->
+      <main class="workspace">
+        <!-- Left rail: events, risks, feeds -->
+        <aside class="rail rail--left" aria-label="World events and risks">
+          <section class="panel" data-panel="risks">
+            <h2 class="panel__title">
+              Material risks
+              <span class="panel__count" data-bind="risk-count">0</span>
+            </h2>
+            <div class="panel__body" data-bind="risk-list"></div>
+          </section>
+
+          <section class="panel panel--grow" data-panel="events">
+            <h2 class="panel__title">
+              Event feed
+              <span class="panel__count" data-bind="event-count">0</span>
+            </h2>
+            <div class="panel__body panel__body--scroll" data-bind="event-list"></div>
+          </section>
+
+          <section class="panel panel--compact" data-panel="feeds">
+            <h2 class="panel__title">Data sources</h2>
+            <div class="panel__body" data-bind="feed-list"></div>
+          </section>
+        </aside>
+
+        <!-- Centre: the globe -->
+        <section class="stage" aria-label="Global operations view">
+          <div id="globe" class="globe"></div>
+
+          <div class="globe__overlay globe__overlay--top-left">
+            <div class="sim-banner" data-bind="simulation-banner" hidden>
+              <span class="sim-banner__dot" aria-hidden="true"></span>
+              <div>
+                <strong>SIMULATION MODE</strong>
+                <span data-bind="simulation-summary"></span>
+              </div>
+              <button type="button" class="link-button" data-action="exit-simulation">Exit</button>
+            </div>
+          </div>
+
+          <div class="globe__overlay globe__overlay--bottom-left">
+            <div class="legend" data-bind="legend"></div>
+          </div>
+
+          <div class="globe__overlay globe__overlay--bottom-right">
+            <button type="button" class="ghost-button" data-action="toggle-dependencies">
+              Dependencies: on
+            </button>
+            <button type="button" class="ghost-button" data-action="reset-view">Reset view</button>
+          </div>
+
+          <div class="globe__loading" data-bind="globe-loading">
+            <span class="spinner" aria-hidden="true"></span>
+            <span data-bind="globe-loading-text">Initialising world model…</span>
+          </div>
+        </section>
+
+        <!-- Right rail: analyst, entity, impact -->
+        <aside class="rail rail--right" aria-label="AI analyst and impact analysis">
+          <section class="panel panel--grow" data-panel="analyst">
+            <h2 class="panel__title">
+              AI Analyst
+              <span class="panel__badge" data-bind="analyst-engine">deterministic</span>
+            </h2>
+            <div class="panel__body panel__body--scroll" data-bind="transcript"></div>
+            <form class="command-bar" data-bind="command-form" autocomplete="off">
+              <input
+                type="text"
+                class="command-bar__input"
+                data-bind="command-input"
+                placeholder="Ask WorldGraph…"
+                aria-label="Ask WorldGraph"
+                maxlength="500"
+              />
+              <button type="submit" class="command-bar__send" data-bind="command-send">Ask</button>
+            </form>
+            <div class="suggestions" data-bind="suggestions"></div>
+          </section>
+
+          <section class="panel panel--grow" data-panel="detail">
+            <h2 class="panel__title" data-bind="detail-title">Details</h2>
+            <div class="panel__body panel__body--scroll" data-bind="detail-body">
+              <p class="empty-state">
+                Select an entity or an event on the globe, or run a scenario from the
+                first-run menu.
+              </p>
+            </div>
+          </section>
+        </aside>
+      </main>
+
+      <!-- Bottom dock: timeline + simulation ---------------------------------------- -->
+      <footer class="dock">
+        <nav class="dock__tabs" role="tablist" aria-label="Workspace">
+          <button type="button" class="dock__tab is-active" role="tab" data-tab="timeline">Timeline</button>
+          <button type="button" class="dock__tab" role="tab" data-tab="simulation">Simulation</button>
+          <button type="button" class="dock__tab" role="tab" data-tab="dependencies">Dependencies</button>
+        </nav>
+        <div class="dock__body" data-bind="dock-body"></div>
+      </footer>
+    </div>
+
+    <!-- First run ------------------------------------------------------------------- -->
+    <dialog class="first-run" data-bind="first-run">
+      <div class="first-run__inner">
+        <header class="first-run__header">
+          <h1>WorldGraph</h1>
+          <p>
+            A living model of AtlasPay's infrastructure, suppliers and customers, connected
+            to real-world and cyber events. Pick a starting point.
+          </p>
+        </header>
+        <div class="first-run__missions" data-bind="missions"></div>
+        <footer class="first-run__footer">
+          <p class="first-run__disclaimer" data-bind="first-run-disclaimer"></p>
+          <button type="button" class="ghost-button" data-action="dismiss-first-run">
+            Explore on my own
+          </button>
+        </footer>
+      </div>
+    </dialog>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

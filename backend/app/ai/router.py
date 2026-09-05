@@ -450,12 +450,11 @@ class IntentRouter:
             return None
         event_id = self._resolve_event(text)
         if event_id is None:
-            return RouterResult(
-                answer=(
-                    "I could not tell which event to investigate. Select one in the event feed, "
-                    "or name it — for example \"investigate the Taiwan earthquake\"."
-                )
-            )
+            # "Tell me about X" is an investigate phrase, but X may be an entity rather
+            # than an event. Decline this route so entity lookup gets its turn — and if
+            # nothing matches at all, the capability list is a more honest answer than
+            # "which event did you mean?" about a question that named no event.
+            return None
         self._call("focus_event", event_id=event_id)
         result = self._call("calculate_blast_radius", event_id=event_id)
         return RouterResult(answer=self._format_blast(result))

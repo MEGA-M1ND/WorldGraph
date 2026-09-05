@@ -1,0 +1,30 @@
+{
+  "name": "worldgraph-frontend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "WorldGraph — AI-native cyber-physical resilience twin. Command-center UI.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --import tsx tests/*.test.ts",
+    "test:e2e": "playwright test"
+  },
+  "dependencies": {
+    "cesium": "^1.135.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.56.0",
+    "@types/node": "^24.13.3",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vite": "^7.1.9",
+    "vite-plugin-static-copy": "^3.1.4"
+  }
+}

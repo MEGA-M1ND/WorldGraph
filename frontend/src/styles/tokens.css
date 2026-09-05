@@ -1,0 +1,116 @@
+/**
+ * Design tokens.
+ *
+ * The whole visual language in one file: dark, high-contrast, restrained. Colour is
+ * reserved for severity, so an estate with nothing wrong reads as calm and any colour on
+ * screen means something actually happened.
+ *
+ * Deliberately not: neon, scanlines, terminal green, reticles. WorldGraph is enterprise
+ * operations software in the lineage of Linear and Datadog, not a military simulator.
+ */
+
+:root {
+  /* -- surface ------------------------------------------------------------------ */
+  --bg-void: #05070d;
+  --bg-base: #090c14;
+  --bg-panel: #0d1119;
+  --bg-panel-raised: #121724;
+  --bg-input: #0a0e17;
+  --bg-hover: rgba(255, 255, 255, 0.04);
+  --bg-active: rgba(77, 163, 255, 0.12);
+
+  /* -- lines -------------------------------------------------------------------- */
+  --line-subtle: rgba(255, 255, 255, 0.06);
+  --line: rgba(255, 255, 255, 0.1);
+  --line-strong: rgba(255, 255, 255, 0.18);
+
+  /* -- text --------------------------------------------------------------------- */
+  --text-primary: #e8ecf5;
+  --text-secondary: #a3adc2;
+  --text-muted: #6b7690;
+  --text-faint: #4c5568;
+
+  /* -- severity ----------------------------------------------------------------- */
+  --sev-critical: #ff4d5e;
+  --sev-high: #ff8a3d;
+  --sev-moderate: #ffc247;
+  --sev-low: #4da3ff;
+  --sev-info: #8b93a7;
+  --ok: #3ddc97;
+
+  /* Tinted backgrounds for severity chips — the hue at low alpha, never a flat block. */
+  --sev-critical-bg: rgba(255, 77, 94, 0.13);
+  --sev-high-bg: rgba(255, 138, 61, 0.13);
+  --sev-moderate-bg: rgba(255, 194, 71, 0.13);
+  --sev-low-bg: rgba(77, 163, 255, 0.13);
+  --sev-info-bg: rgba(139, 147, 167, 0.13);
+  --ok-bg: rgba(61, 220, 151, 0.12);
+
+  /* -- accent ------------------------------------------------------------------- */
+  --accent: #4da3ff;
+  --accent-dim: rgba(77, 163, 255, 0.4);
+  --simulation: #b57bff;
+  --simulation-bg: rgba(181, 123, 255, 0.14);
+
+  /* -- typography --------------------------------------------------------------- */
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "SF Mono", ui-monospace, "Cascadia Code", monospace;
+
+  --text-xs: 10.5px;
+  --text-sm: 12px;
+  --text-base: 13px;
+  --text-md: 15px;
+  --text-lg: 19px;
+  --text-xl: 26px;
+
+  /* -- spacing ------------------------------------------------------------------ */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+
+  --radius-sm: 4px;
+  --radius: 7px;
+  --radius-lg: 12px;
+
+  /* -- layout ------------------------------------------------------------------- */
+  --topbar-height: 52px;
+  --dock-height: 208px;
+  --rail-width: 336px;
+
+  --shadow-panel: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 28px rgba(0, 0, 0, 0.35);
+  --shadow-float: 0 12px 48px rgba(0, 0, 0, 0.6);
+
+  --transition: 140ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Severity is expressed as a data attribute so one rule set colours chips, borders and
+   text everywhere, and adding a severity never means touching six selectors. */
+[data-severity="CRITICAL"] { --sev: var(--sev-critical); --sev-bg: var(--sev-critical-bg); }
+[data-severity="HIGH"]     { --sev: var(--sev-high);     --sev-bg: var(--sev-high-bg); }
+[data-severity="MODERATE"] { --sev: var(--sev-moderate); --sev-bg: var(--sev-moderate-bg); }
+[data-severity="LOW"]      { --sev: var(--sev-low);      --sev-bg: var(--sev-low-bg); }
+[data-severity="INFO"]     { --sev: var(--sev-info);     --sev-bg: var(--sev-info-bg); }
+
+/* Feed and provenance states get the same treatment. */
+[data-state="LIVE"]        { --state: var(--ok);           --state-bg: var(--ok-bg); }
+[data-state="SIMULATED"]   { --state: var(--simulation);   --state-bg: var(--simulation-bg); }
+[data-state="REPLAY"]      { --state: var(--sev-low);      --state-bg: var(--sev-low-bg); }
+[data-state="SYNTHETIC"]   { --state: var(--sev-info);     --state-bg: var(--sev-info-bg); }
+[data-state="STALE"]       { --state: var(--sev-moderate); --state-bg: var(--sev-moderate-bg); }
+[data-state="DEGRADED"]    { --state: var(--sev-high);     --state-bg: var(--sev-high-bg); }
+[data-state="FALLBACK"]    { --state: var(--sev-moderate); --state-bg: var(--sev-moderate-bg); }
+[data-state="UNAVAILABLE"] { --state: var(--sev-critical); --state-bg: var(--sev-critical-bg); }
+[data-state="LOADING"]     { --state: var(--text-muted);   --state-bg: var(--sev-info-bg); }
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
