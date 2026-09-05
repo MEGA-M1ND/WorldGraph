@@ -50,7 +50,6 @@ from ..models.analysis import (
     WorldSnapshotMetrics,
 )
 from ..models.core import (
-    DataMode,
     FeedStatus,
     Severity,
     WorldEntity,
@@ -95,7 +94,7 @@ class WorldState:
             await adapter.initialize()
             try:
                 await adapter.start()
-            except Exception as error:  # noqa: BLE001 — a dead feed must not stop startup
+            except Exception as error:
                 logger.warning("adapter_start_failed adapter=%s error=%s", adapter.id, error)
             self._ingest_from(adapter)
 
@@ -355,7 +354,6 @@ class WorldState:
     def _empty_analysis(self, event: WorldEvent) -> BlastRadiusResult:
         """A no-impact analysis that states why nothing was found."""
         from ..models.analysis import (
-            BusinessImpact,
             Confidence,
             RiskScore,
         )

@@ -78,15 +78,18 @@ def earthquake_exposure_radius_km(magnitude: float, depth_km: float = 10.0) -> f
     motion prediction equation (a GMPE needs site conditions and a regional attenuation
     model that a synthetic estate cannot supply):
 
-        radius_km = 10 * 10 ** (0.5 * (M - 4))      capped to [10, 900]
+        radius_km = 10 * 10 ** (0.4 * (M - 4))      capped to [10, 900]
         deep quakes (>70 km) shed 25 % of that radius
 
-    It reproduces the right orders of magnitude — M4 ≈ 10 km, M6.8 ≈ 79 km,
-    M7.5 ≈ 178 km — and it is monotonic in magnitude, which is the property the
-    correlation and risk layers actually rely on. Documented in ``docs/IMPACT_MODEL.md``.
+    It reproduces the right orders of magnitude for *infrastructure disruption* —
+    M4 ≈ 10 km, M5 ≈ 25 km, M6 ≈ 63 km, M6.8 ≈ 132 km, M7.5 ≈ 251 km, M8 ≈ 398 km — and it
+    is monotonic in magnitude, which is the property the correlation and risk layers
+    actually rely on. The 0.4 exponent is a judgement: 0.5 produces radii roughly twice as
+    wide, which sweeps in assets an operator would not accept as exposed.
+    Documented in ``docs/IMPACT_MODEL.md``.
     """
     magnitude = max(0.0, float(magnitude))
-    radius = 10.0 * (10.0 ** (0.5 * (magnitude - 4.0)))
+    radius = 10.0 * (10.0 ** (0.4 * (magnitude - 4.0)))
     if depth_km > 70.0:
         # Deep-focus events shake a wider area more weakly; for *infrastructure
         # disruption* the net effect in this model is a smaller damage footprint.

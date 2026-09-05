@@ -25,6 +25,9 @@ from ..models.core import Criticality, EntityType, Severity
 #: Availability below which an entity is considered "in trouble" for planning purposes.
 _TROUBLE = 0.9
 
+#: Customer traffic impact below which notifying customers is noise, not a response.
+_NOTIFY_THRESHOLD = 0.02
+
 #: Availability floor for a peer to be worth failing over to at all.
 _HEALTHY_PEER = 0.80
 
@@ -182,9 +185,15 @@ def generate_response_plan(
         )
 
     # --- 5. Notify affected customer regions -----------------------------------------
-    if result.customer_exposure:
-        worst = result.customer_exposure[0]
-        regions = ", ".join(row.region for row in result.customer_exposure[:3])
+    # Only above a materiality floor. Propagation surfaces exposure down to fractions of a
+    # percent, and recommending that an operator email customers over a 0.2% modelled
+    # impact is how a response plan trains people to ignore it.
+    material_exposure = [
+        row for row in result.customer_exposure if row.traffic_impact >= _NOTIFY_THRESHOLD
+    ]
+    if material_exposure:
+        worst = material_exposure[0]
+        regions = ", ".join(row.region for row in material_exposure[:3])
         actions.append(
             ResponseAction(
                 action=f"Notify affected enterprise customers ({regions}).",
@@ -193,7 +202,7 @@ def generate_response_plan(
                     f"availability, affecting {worst.customer_count:,} modelled customers. "
                     "Proactive notice is a contractual expectation at TIER-0 and TIER-1."
                 ),
-                affected_entities=[row.entity_id for row in result.customer_exposure],
+                affected_entities=[row.entity_id for row in material_exposure],
                 urgency=Urgency.NOW if worst.traffic_impact > 0.2 else Urgency.SOON,
                 confidence=round(result.confidence.score, 2),
             )
@@ -299,7 +308,7 @@ def _objectives(result: BlastRadiusResult) -> list[str]:
     return objectives
 
 
-def _availability(impacted: dict[str, "object"], entity_id: str) -> float:
+def _availability(impacted: dict[str, object], entity_id: str) -> float:
     """Modelled availability of an entity, defaulting to healthy when unimpacted."""
     record = impacted.get(entity_id)
     return record.availability if record is not None else 1.0  # type: ignore[union-attr]

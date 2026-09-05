@@ -117,7 +117,7 @@ class ModelAnalyst:
         )
         try:
             answer, calls = await self._run_loop(ctx, message)
-        except Exception as error:  # noqa: BLE001 — always degrade to something useful
+        except Exception as error:
             reason = _describe_model_error(error)
             logger.warning("analyst_model_failed reason=%s", reason)
             fallback = await self._fallback.ask(

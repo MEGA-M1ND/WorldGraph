@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import time
 import uuid
-from typing import Iterable, Literal
+from collections.abc import Iterable
+from typing import Literal
 
 from ..graph.world_graph import (
     DEFAULT_MAX_DEPTH,
@@ -73,7 +74,7 @@ def calculate_blast_radius(
     if not origins:
         raise KeyError("no known origin entities supplied to the blast-radius engine")
 
-    pinned = {oid: 0.0 for oid in origins}
+    pinned = dict.fromkeys(origins, 0.0)
     pinned.update(initial_availability or {})
     # Only keep pins that name a real entity — an unknown pin would silently do nothing.
     pinned = {eid: value for eid, value in pinned.items() if eid in graph}

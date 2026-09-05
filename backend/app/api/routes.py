@@ -400,7 +400,7 @@ def blast_radius(
         max_depth=body.max_depth,
     )
     state.repository.save_analysis(result)
-    state._analyses[result.id] = result  # noqa: SLF001 — same-package cache write
+    state._analyses[result.id] = result
     return result
 
 

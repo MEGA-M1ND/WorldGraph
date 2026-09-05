@@ -20,10 +20,11 @@ import json
 import sqlite3
 import threading
 from abc import ABC, abstractmethod
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Iterator, TypeVar
+from typing import TypeVar
 
 from pydantic import BaseModel
 

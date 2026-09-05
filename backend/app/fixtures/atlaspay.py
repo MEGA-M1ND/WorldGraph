@@ -14,7 +14,7 @@ right; the *facilities* at those coordinates are invented.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from ..models.core import (
     BusinessProfile,
@@ -33,7 +33,7 @@ from ..models.core import (
 
 #: Fixed clock for the fixture. A synthetic estate with a moving ``updated_at`` would make
 #: snapshot tests flap and make "what changed in the last hour" meaningless.
-FIXTURE_EPOCH = datetime(2026, 9, 1, 0, 0, 0, tzinfo=timezone.utc)
+FIXTURE_EPOCH = datetime(2026, 9, 1, 0, 0, 0, tzinfo=UTC)
 
 ORG_ID = "atlaspay"
 
@@ -749,6 +749,8 @@ def build_edges() -> list[DependencyEdge]:
 
         # network & interconnect
         e("edge-network-apac", "cloud-region-singapore", D.CONNECTS_TO, criticality=0.7, redundancy=0.5),
+        e("edge-network-apac", "cloud-region-tokyo", D.CONNECTS_TO, criticality=0.2, redundancy=0.9,
+          note="Secondary APAC PoP; carries overflow only."),
         e("edge-network-emea", "cloud-region-frankfurt", D.CONNECTS_TO, criticality=0.7, redundancy=0.5),
         e("card-network-apac", "dc-singapore-partner", D.HOSTED_IN, criticality=1.0, redundancy=0.1),
         e("dc-singapore-partner", "supplier-singapore-datacenter", D.SUPPLIED_BY,

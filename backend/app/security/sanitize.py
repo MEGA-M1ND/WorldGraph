@@ -106,11 +106,17 @@ def contains_injection_attempt(value: str) -> bool:
 def sanitize_identifier(value: object, *, max_length: int = 128) -> str:
     """Reduce an untrusted string to a safe slug for use as an id.
 
-    Rejects rather than truncates on grammar violation is not possible here — feed ids are
-    arbitrary — so unsafe characters are replaced with ``-`` and the result is bounded.
+    Feed ids are arbitrary strings, so rejecting on grammar is not an option here the way
+    it is for share-link tokens — unsafe characters are replaced and the result is bounded.
+
+    Path traversal is handled explicitly rather than relying on the character class: a dot
+    is legitimate inside an id (``2.5_day``), but a ``..`` run is only ever useful for
+    escaping a path, and these ids reach URLs and provenance links.
     """
     text = sanitize_text(value, max_length=max_length * 2, strip_injection=False)
-    cleaned = re.sub(r"[^A-Za-z0-9._:-]+", "-", text).strip("-")
+    cleaned = re.sub(r"[^A-Za-z0-9._:-]+", "-", text)
+    cleaned = re.sub(r"\.{2,}", ".", cleaned)  # collapse traversal runs
+    cleaned = cleaned.strip("-._:")
     return cleaned[:max_length] or "unknown"
 
 

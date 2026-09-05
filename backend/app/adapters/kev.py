@@ -11,7 +11,7 @@ the raw catalog would just be another CVE dashboard.
 
 from __future__ import annotations
 
-from datetime import datetime, time, timezone
+from datetime import UTC, datetime, time
 
 from ..models.core import (
     DataMode,
@@ -50,7 +50,7 @@ def normalize_vulnerability(
     added_raw = entry.get("dateAdded")
     try:
         added = datetime.combine(
-            datetime.strptime(str(added_raw), "%Y-%m-%d").date(), time.min, tzinfo=timezone.utc
+            datetime.strptime(str(added_raw), "%Y-%m-%d").date(), time.min, tzinfo=UTC
         )
     except (TypeError, ValueError):
         added = utcnow()

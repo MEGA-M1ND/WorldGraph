@@ -1,0 +1,24 @@
+line-length = 100
+target-version = "py311"
+
+[lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4", "RUF"]
+ignore = [
+    # The domain deliberately uses long, explanatory comment lines; wrapping prose at 100
+    # columns hurts readability more than it helps.
+    "E501",
+    # Pydantic Field(...) in defaults is the framework's idiom, not a mutable default bug.
+    "B008",
+    # `zip(strict=)` is not universally clearer in this codebase's short pair loops.
+    "B905",
+    # Non-ASCII characters are deliberate throughout: → in impact paths, × and ≈ in the
+    # model documentation, — in prose, and a fullwidth payload that a prompt-injection
+    # test must carry verbatim to prove NFKC folding works.
+    "RUF001",
+    "RUF002",
+    "RUF003",
+]
+
+[lint.per-file-ignores]
+# Tests reach into internals through documented seams and assert on private state.
+"tests/*" = ["SLF001"]

@@ -19,9 +19,10 @@ Consequences that fall out of the rule:
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any, Callable
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -31,7 +32,6 @@ from ..analysis.correlation import (
     match_vulnerable_assets,
     proximity_summary,
 )
-from ..models.analysis import OverrideKind, SimulationOverride
 from ..models.core import HealthState
 from ..services.world_state import WorldState
 from ..simulation.engine import (
@@ -170,7 +170,7 @@ class Tool:
     name: str
     description: str
     args_model: type[BaseModel]
-    handler: Callable[["ToolContext", BaseModel], dict[str, Any]]
+    handler: Callable[[ToolContext, BaseModel], dict[str, Any]]
     #: ``read`` tools never change anything. ``write`` tools may edit a *scenario*, and
     #: nothing else. There is no ``execute`` class, by design.
     kind: str = "read"
@@ -410,7 +410,7 @@ def _calculate_blast_radius(ctx: ToolContext, args: BlastRadiusArgs) -> dict[str
     if unknown:
         raise ToolError(f"Unknown entities: {', '.join(unknown)}.")
     result = compute(ctx.state.graph, origin_ids=ids, origin_kind="ENTITY")
-    ctx.state._analyses[result.id] = result  # noqa: SLF001 — same-package cache write
+    ctx.state._analyses[result.id] = result
     return _blast_result_row(result)
 
 
@@ -879,6 +879,6 @@ def run_tool(ctx: ToolContext, name: str, raw_args: dict[str, Any] | None) -> di
         raise ToolError(f"{name} could not find {error}.") from error
     except SimulationError as error:
         raise ToolError(str(error)) from error
-    except Exception as error:  # noqa: BLE001 — a tool bug must not leak internals
+    except Exception as error:
         logger.exception("ai_tool_failed tool=%s", name)
         raise ToolError(f"{name} failed: {type(error).__name__}.") from error

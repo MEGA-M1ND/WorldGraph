@@ -46,9 +46,9 @@ from dataclasses import dataclass, field
 
 from ..graph.world_graph import WorldGraph
 from ..models.core import (
+    FAILURE_PROPAGATING_TYPES,
     DependencyEdge,
     DependencyType,
-    FAILURE_PROPAGATING_TYPES,
     HealthState,
     health_from_value,
 )

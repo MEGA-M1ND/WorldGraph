@@ -17,8 +17,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ..graph.world_graph import WorldGraph
 from ..geo.spatial import bearing_degrees, compass_point, haversine_km, proximity_factor
+from ..graph.world_graph import WorldGraph
 from ..models.core import (
     DependencyType,
     EventCategory,
@@ -206,9 +206,7 @@ def match_vulnerable_assets(
     for entity in graph.entities:
         for component in entity.software:
             hit = False
-            if cve and cve in {c.upper() for c in component.cve_ids}:
-                hit = True
-            elif wanted_products and component.name.lower() in wanted_products:
+            if (cve and cve in {c.upper() for c in component.cve_ids}) or (wanted_products and component.name.lower() in wanted_products):
                 hit = True
             if not hit:
                 continue

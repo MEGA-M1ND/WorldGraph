@@ -214,6 +214,13 @@ class IntentRouter:
             args["scenario_id"] = self.ctx.active_scenario_id
         elif self.ctx.selected_event_id:
             args["event_id"] = self.ctx.selected_event_id
+        elif not self.ctx.state.recent_analyses(limit=1):
+            # Asked cold, with nothing selected and nothing analysed. Rather than refusing,
+            # plan against the most severe incident that actually correlates with AtlasPay
+            # — which is what an operator opening the product means by the question.
+            candidate = self._most_severe_incident()
+            if candidate is not None:
+                args["event_id"] = candidate
         plan = self._call("generate_response_plan", **args)
         lines = ["RESPONSE PLAN", "", plan["summary"], ""]
         for index, action in enumerate(plan["actions"], start=1):
@@ -234,6 +241,19 @@ class IntentRouter:
             lines.append("")
         lines.append(plan["note"])
         return RouterResult(answer="\n".join(lines))
+
+    def _most_severe_incident(self) -> str | None:
+        """The highest-severity event that correlates with AtlasPay, if any."""
+        order = ["CRITICAL", "HIGH", "MODERATE", "LOW", "INFO"]
+        candidates = [
+            event
+            for event in self.ctx.state.events(limit=50)
+            if self.ctx.state._correlates(event)
+        ]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda e: (order.index(e.severity.value), -e.occurred_at.timestamp()))
+        return candidates[0].id
 
     def _route_compare(self, text: str) -> RouterResult | None:
         if not _COMPARE.search(text):

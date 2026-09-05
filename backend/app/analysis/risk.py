@@ -22,7 +22,7 @@ from ..models.core import (
     severity_from_score,
 )
 from .business_impact import is_customer_facing
-from .propagation import IMPACT_THRESHOLD, PropagationState
+from .propagation import PropagationState
 
 #: Maximum points each component can contribute. Chosen so that no single dimension can
 #: push a score into CRITICAL alone: reaching 75 needs at least three of them.

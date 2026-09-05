@@ -11,7 +11,7 @@ normalization into :class:`WorldEvent`.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from ..geo.spatial import exposure_radius_for
 from ..models.core import (
@@ -97,7 +97,7 @@ def normalize_feature(feature: object, *, mode: DataMode = DataMode.LIVE) -> Wor
 
     time_ms = properties.get("time")
     try:
-        occurred_at = datetime.fromtimestamp(float(time_ms) / 1000.0, tz=timezone.utc)
+        occurred_at = datetime.fromtimestamp(float(time_ms) / 1000.0, tz=UTC)
     except (TypeError, ValueError, OSError, OverflowError):
         return None
 

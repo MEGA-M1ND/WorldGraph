@@ -1,0 +1,325 @@
+"""WorldGraph V1 Impact Model — propagation, business impact, risk boundaries."""
+
+from __future__ import annotations
+
+import pytest
+
+from app.analysis.business_impact import business_impact, regional_capacity, snapshot_metrics
+from app.analysis.propagation import (
+    IMPACT_THRESHOLD,
+    edge_transfer,
+    propagate,
+)
+from app.analysis.risk import WEIGHTS, assess_confidence, score_impact
+from app.graph.world_graph import WorldGraph
+from app.models.core import (
+    HEALTH_VALUES,
+    Criticality,
+    DependencyType,
+    HealthState,
+    Severity,
+    health_from_value,
+    severity_from_score,
+)
+
+from .test_graph import edge, entity
+
+
+class TestEdgeTransfer:
+    def test_healthy_dependency_transfers_nothing(self):
+        assert edge_transfer(1.0, coupling=1.0, redundancy=0.0) == 1.0
+
+    def test_hard_unredundant_dependency_takes_dependent_down(self):
+        assert edge_transfer(0.0, coupling=1.0, redundancy=0.0) == 0.0
+
+    def test_redundancy_absorbs_proportionally(self):
+        # 100% loss × full criticality, 55% absorbed by failover → 45% lost, 55% remains.
+        assert edge_transfer(0.0, coupling=1.0, redundancy=0.55) == pytest.approx(0.55)
+
+    def test_full_redundancy_makes_a_dependency_harmless(self):
+        assert edge_transfer(0.0, coupling=1.0, redundancy=1.0) == 1.0
+
+    def test_partial_criticality_scales_the_loss(self):
+        assert edge_transfer(0.0, coupling=0.3, redundancy=0.0) == pytest.approx(0.7)
+
+    def test_result_is_always_bounded(self):
+        assert edge_transfer(-5.0, coupling=2.0, redundancy=-1.0) == 0.0
+        assert edge_transfer(5.0, coupling=1.0, redundancy=0.0) == 1.0
+
+
+class TestHealthRoundTrip:
+    @pytest.mark.parametrize("state", list(HealthState))
+    def test_health_value_maps_back_to_itself(self, state: HealthState):
+        if state is HealthState.UNKNOWN:
+            # UNKNOWN is deliberately optimistic-but-imperfect; it reads back as HEALTHY.
+            assert health_from_value(HEALTH_VALUES[state]) is HealthState.HEALTHY
+            return
+        assert health_from_value(HEALTH_VALUES[state]) is state
+
+
+class TestPropagation:
+    def test_healthy_world_is_fully_available(self, atlaspay_graph: WorldGraph):
+        state = propagate(atlaspay_graph)
+        assert all(value >= IMPACT_THRESHOLD for value in state.availability.values())
+        assert all(value >= IMPACT_THRESHOLD for value in state.capacity.values())
+
+    def test_pinned_entity_is_not_healed_by_its_dependencies(self):
+        """'Singapore is DOWN' must not quietly become 'Singapore is mostly up'."""
+        graph = WorldGraph([entity("a"), entity("b")], [edge("a", "b")])
+        state = propagate(graph, initial_availability={"a": 0.0})
+        assert state.availability["a"] == 0.0
+
+    def test_failure_propagates_through_a_chain(self):
+        graph = WorldGraph(
+            [entity("a"), entity("b"), entity("c")],
+            [edge("b", "a"), edge("c", "b")],
+        )
+        state = propagate(graph, initial_availability={"a": 0.0})
+        assert state.availability["b"] == 0.0
+        assert state.availability["c"] == 0.0
+
+    def test_redundancy_dampens_along_the_chain(self):
+        graph = WorldGraph(
+            [entity("a"), entity("b")], [edge("b", "a", redundancy=0.5)]
+        )
+        state = propagate(graph, initial_availability={"a": 0.0})
+        assert state.availability["b"] == pytest.approx(0.5)
+
+    def test_converges_on_a_cycle(self):
+        graph = WorldGraph(
+            [entity("a"), entity("b"), entity("c")],
+            [edge("b", "a"), edge("c", "b"), edge("a", "c")],
+        )
+        state = propagate(graph, initial_availability={"a": 0.0})
+        assert state.converged is True
+        assert all(0.0 <= value <= 1.0 for value in state.availability.values())
+
+    def test_capacity_and_availability_diverge_for_supply_chains(
+        self, atlaspay_graph: WorldGraph
+    ):
+        """The whole point of capacity_impact.
+
+        Losing the hardware supplier must constrain APAC capacity substantially while
+        leaving most traffic still flowing. A model that collapsed the two would report a
+        fictional outage.
+        """
+        state = propagate(atlaspay_graph, initial_availability={"supplier-taiwan-hardware": 0.0})
+        cluster = "payments-k8s-singapore"
+        assert state.availability[cluster] > 0.85, "traffic should still be flowing"
+        assert state.capacity[cluster] < 0.5, "replacement capacity should be badly hit"
+
+    def test_capacity_override_caps_availability(self):
+        """A cluster that can serve 40% of load cannot answer more than 40% of requests."""
+        graph = WorldGraph([entity("a")])
+        state = propagate(graph, capacity_overrides={"a": 0.4})
+        assert state.availability["a"] == pytest.approx(0.4)
+
+    def test_disabling_an_edge_severs_propagation(self):
+        graph = WorldGraph([entity("a"), entity("b")], [edge("b", "a")])
+        state = propagate(
+            graph,
+            initial_availability={"a": 0.0},
+            disabled_edge_ids=frozenset({"a--DEPENDS_ON->b", "b--DEPENDS_ON->a"}),
+        )
+        assert state.availability["b"] == 1.0
+
+    def test_unknown_pin_is_ignored_rather_than_crashing(self, atlaspay_graph: WorldGraph):
+        state = propagate(atlaspay_graph, initial_availability={"ghost": 0.0})
+        assert "ghost" not in state.availability
+
+    def test_replica_failure_does_not_hurt_the_primary(self, atlaspay_graph: WorldGraph):
+        state = propagate(
+            atlaspay_graph, initial_availability={"postgres-frankfurt-replica": 0.0}
+        )
+        assert state.availability["postgres-singapore"] >= IMPACT_THRESHOLD
+
+    def test_dominant_cause_names_the_worst_dependency(self):
+        graph = WorldGraph(
+            [entity("svc"), entity("big"), entity("small")],
+            [edge("svc", "big", criticality=1.0), edge("svc", "small", criticality=0.1)],
+        )
+        state = propagate(graph, initial_availability={"big": 0.0, "small": 0.0})
+        assert state.dominant_cause["svc"][0] == "big"
+
+
+class TestBusinessImpact:
+    def test_healthy_world_has_no_impact(self, atlaspay_graph: WorldGraph):
+        impact = business_impact(atlaspay_graph, propagate(atlaspay_graph))
+        assert impact.availability == 1.0
+        assert impact.customers_affected == 0
+        assert impact.revenue_at_risk_per_hour == 0.0
+        assert impact.critical_services_impacted == 0
+
+    def test_disclaimer_is_always_present(self, atlaspay_graph: WorldGraph):
+        """Schema-enforced, so a careless serializer cannot drop it."""
+        impact = business_impact(atlaspay_graph, propagate(atlaspay_graph))
+        assert impact.disclaimer == "MODELLED ESTIMATE"
+        assert impact.model_dump()["disclaimer"] == "MODELLED ESTIMATE"
+
+    def test_region_outage_hits_customers_and_revenue(self, atlaspay_graph: WorldGraph):
+        state = propagate(atlaspay_graph, initial_availability={"cloud-region-singapore": 0.0})
+        impact = business_impact(atlaspay_graph, state)
+        assert impact.availability < 0.5
+        assert impact.customers_affected > 0
+        assert impact.revenue_at_risk_per_hour > 0
+        assert impact.critical_services_impacted >= 3
+        assert impact.sla_breaches, "TIER-0 services should breach in a region outage"
+
+    def test_regional_capacity_uses_the_capacity_solve(self, atlaspay_graph: WorldGraph):
+        baseline = regional_capacity(atlaspay_graph, propagate(atlaspay_graph))
+        assert baseline["APAC"] == pytest.approx(1.0, abs=1e-6)
+        constrained = regional_capacity(
+            atlaspay_graph,
+            propagate(atlaspay_graph, initial_availability={"supplier-taiwan-hardware": 0.0}),
+        )
+        assert constrained["APAC"] < 0.8
+        assert constrained["EMEA"] == pytest.approx(1.0, abs=1e-6), "EMEA is unaffected"
+
+    def test_snapshot_metrics_carry_the_disclaimer(self, atlaspay_graph: WorldGraph):
+        metrics = snapshot_metrics(atlaspay_graph, propagate(atlaspay_graph))
+        assert metrics.disclaimer == "MODELLED ESTIMATE"
+        assert metrics.material_risk is Severity.LOW
+
+
+class TestRiskBands:
+    """Band boundaries are a documented contract; these pin them."""
+
+    @pytest.mark.parametrize(
+        ("score", "expected"),
+        [
+            (0.0, Severity.LOW),
+            (24.9, Severity.LOW),
+            (25.0, Severity.MODERATE),
+            (49.9, Severity.MODERATE),
+            (50.0, Severity.HIGH),
+            (74.9, Severity.HIGH),
+            (75.0, Severity.CRITICAL),
+            (100.0, Severity.CRITICAL),
+        ],
+    )
+    def test_band_boundaries(self, score: float, expected: Severity):
+        assert severity_from_score(score) is expected
+
+    def test_out_of_range_scores_are_clamped(self):
+        assert severity_from_score(-10.0) is Severity.LOW
+        assert severity_from_score(500.0) is Severity.CRITICAL
+
+
+class TestRiskScoring:
+    def test_healthy_world_scores_zero(self, atlaspay_graph: WorldGraph):
+        risk = score_impact(
+            atlaspay_graph, propagate(atlaspay_graph), origin_ids=["payments-api"]
+        )
+        assert risk.score == 0.0
+        assert risk.severity is Severity.LOW
+
+    def test_every_contribution_is_named_and_signed(self, atlaspay_graph: WorldGraph):
+        state = propagate(atlaspay_graph, initial_availability={"cloud-region-singapore": 0.0})
+        risk = score_impact(
+            atlaspay_graph, state, origin_ids=["cloud-region-singapore"], max_depth_reached=4
+        )
+        assert risk.contributions, "a score with no derivation is not shippable"
+        for item in risk.contributions:
+            assert item.code
+            assert item.label
+        assert risk.score == pytest.approx(
+            max(0.0, min(100.0, sum(c.points for c in risk.contributions))), abs=0.05
+        )
+
+    def test_score_scales_with_severity_of_loss(self, atlaspay_graph: WorldGraph):
+        """A critical asset nicked must not score like a critical asset destroyed."""
+        mild = score_impact(
+            atlaspay_graph,
+            propagate(atlaspay_graph, initial_availability={"supplier-taiwan-hardware": 0.9}),
+            origin_ids=["supplier-taiwan-hardware"],
+        )
+        severe = score_impact(
+            atlaspay_graph,
+            propagate(atlaspay_graph, initial_availability={"supplier-taiwan-hardware": 0.0}),
+            origin_ids=["supplier-taiwan-hardware"],
+        )
+        assert severe.score > mild.score
+
+    def test_redundancy_earns_a_negative_contribution(self, atlaspay_graph: WorldGraph):
+        """A resilient estate must be able to score lower for the same event."""
+        state = propagate(atlaspay_graph, initial_availability={"cloud-region-mumbai": 0.0})
+        risk = score_impact(atlaspay_graph, state, origin_ids=["cloud-region-mumbai"])
+        credits = [c for c in risk.contributions if c.points < 0]
+        assert credits, "cloud regions have redundancy 3 and should earn a credit"
+        assert credits[0].points == WEIGHTS["redundancy_credit"]
+
+    def test_stale_observation_reduces_the_score(self, atlaspay_graph: WorldGraph):
+        state = propagate(atlaspay_graph, initial_availability={"cloud-region-singapore": 0.0})
+        fresh = score_impact(atlaspay_graph, state, origin_ids=["cloud-region-singapore"])
+        stale = score_impact(
+            atlaspay_graph,
+            state,
+            origin_ids=["cloud-region-singapore"],
+            stale_seconds=48 * 3600,
+        )
+        assert stale.score < fresh.score
+
+    def test_score_never_leaves_zero_to_one_hundred(self, atlaspay_graph: WorldGraph):
+        state = propagate(
+            atlaspay_graph,
+            initial_availability={
+                "cloud-region-singapore": 0.0,
+                "cloud-region-mumbai": 0.0,
+                "cloud-region-frankfurt": 0.0,
+            },
+        )
+        risk = score_impact(
+            atlaspay_graph,
+            state,
+            origin_ids=["cloud-region-singapore", "cloud-region-mumbai"],
+            proximity=1.0,
+            max_depth_reached=8,
+        )
+        assert 0.0 <= risk.score <= 100.0
+
+    def test_as_text_renders_the_breakdown(self, atlaspay_graph: WorldGraph):
+        state = propagate(atlaspay_graph, initial_availability={"cloud-region-singapore": 0.0})
+        text = score_impact(
+            atlaspay_graph, state, origin_ids=["cloud-region-singapore"]
+        ).as_text()
+        assert "+" in text or "-" in text
+
+
+class TestConfidence:
+    def test_names_its_uncertainties(self, atlaspay_graph: WorldGraph):
+        state = propagate(atlaspay_graph, initial_availability={"supplier-taiwan-hardware": 0.0})
+        confidence = assess_confidence(
+            atlaspay_graph,
+            state,
+            event=None,
+            origin_ids=["supplier-taiwan-hardware"],
+            truncated=False,
+        )
+        assert 0.0 < confidence.score <= 1.0
+        assert any("synthetic" in item for item in confidence.uncertainties)
+        assert any("operating status" in item for item in confidence.uncertainties)
+
+    def test_truncation_lowers_confidence(self, atlaspay_graph: WorldGraph):
+        state = propagate(atlaspay_graph, initial_availability={"cloud-region-singapore": 0.0})
+        whole = assess_confidence(
+            atlaspay_graph, state, event=None, origin_ids=["cloud-region-singapore"], truncated=False
+        )
+        cut = assess_confidence(
+            atlaspay_graph, state, event=None, origin_ids=["cloud-region-singapore"], truncated=True
+        )
+        assert cut.score < whole.score
+        assert any("truncated" in item for item in cut.uncertainties)
+
+
+class TestCriticalityWeights:
+    def test_all_criticalities_have_weights(self):
+        from app.models.core import CRITICALITY_WEIGHTS
+
+        for level in Criticality:
+            assert level in CRITICALITY_WEIGHTS
+
+    def test_failure_propagating_types_exclude_serves_and_replicates(self):
+        from app.models.core import FAILURE_PROPAGATING_TYPES
+
+        assert DependencyType.SERVES not in FAILURE_PROPAGATING_TYPES
+        assert DependencyType.REPLICATES_TO not in FAILURE_PROPAGATING_TYPES

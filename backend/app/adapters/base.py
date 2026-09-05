@@ -20,6 +20,7 @@ normalized records and stops.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import random
 from abc import ABC, abstractmethod
@@ -104,10 +105,10 @@ class WorldDataAdapter(ABC):
         self._running = False
         if self._task is not None:
             self._task.cancel()
-            try:
+            # Shutdown must not raise. A poll task can be mid-fetch when cancelled, and a
+            # failing feed is not a reason to fail the whole shutdown path.
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001 — shutdown path
-                pass
             self._task = None
 
     async def refresh(self) -> None:
@@ -120,7 +121,7 @@ class WorldDataAdapter(ABC):
         self._last_attempt = utcnow()
         try:
             events, entities = await self.fetch()
-        except Exception as error:  # noqa: BLE001 — adapters must not crash the app
+        except Exception as error:
             message = self._describe_error(error)
             logger.warning("feed_refresh_failed adapter=%s reason=%s", self.id, message)
             if self._events or self._entities:
@@ -223,7 +224,7 @@ class WorldDataAdapter(ABC):
                             f"({len(response.content) / 1_048_576:.1f} MB)"
                         )
                     return response.json()
-            except Exception as error:  # noqa: BLE001 — retried below
+            except Exception as error:
                 last_error = error
                 if attempt == max_retries - 1:
                     break

@@ -16,8 +16,8 @@ arithmetic that no generic algorithm knows about.
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
-from typing import Iterable, Iterator
 
 import networkx as nx
 
@@ -282,7 +282,7 @@ class WorldGraph:
                 if next_id in current.path:
                     # A cycle. Record it once and do not follow it — otherwise
                     # availability would be multiplied down forever.
-                    cycle = current.path[current.path.index(next_id):] + [next_id]
+                    cycle = [*current.path[current.path.index(next_id):], next_id]
                     if cycle not in cycles:
                         cycles.append(cycle)
                     continue
@@ -367,7 +367,7 @@ class WorldGraph:
     def iter_entities(self) -> Iterator[WorldEntity]:
         return iter(self._entities.values())
 
-    def clone(self) -> "WorldGraph":
+    def clone(self) -> WorldGraph:
         """A deep-enough copy for simulation.
 
         Entity models are copied (the simulation mutates health and capacity); edges are
