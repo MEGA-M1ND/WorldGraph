@@ -35,6 +35,7 @@ import type {
   ResponsePlan,
   SimulationComparison,
   TimelineEntry,
+  WorkspaceDetail,
   WorldEvent,
 } from '../types.ts';
 
@@ -61,15 +62,28 @@ export function renderHeadlineStats(state: AppState): HTMLElement[] {
   // In simulation mode the headline numbers show the *simulated* world, badged, so the
   // top bar can never quietly display a hypothetical as the current state.
   const live = simulationActive && comparison ? comparison.simulated : metrics;
-  const availability = live?.availability ?? dashboard.availability;
   const risk = live?.material_risk ?? 'LOW';
+
+  // Two different availabilities, and which one is shown says something. The
+  // customer-experienced figure exists only for an estate that declares customers and
+  // traffic; an imported cloud estate does not, so the bar falls back to the
+  // infrastructure figure and *relabels itself* rather than printing an infrastructure
+  // number under a customer heading. (docs/REALITY_PASS_AUDIT.md, C1.)
+  const customerAvailability = live ? live.availability : dashboard.availability;
+  const infrastructure = live
+    ? live.infrastructure_availability
+    : dashboard.infrastructure_availability;
+  const availabilityStat: [string, string] =
+    customerAvailability === null
+      ? ['Infra availability', percent(infrastructure)]
+      : ['Availability', percent(customerAvailability)];
 
   const stats: [string, string, string?][] = [
     ['Critical services', count(dashboard.critical_services)],
     ['Infrastructure', count(dashboard.infrastructure_assets)],
     ['Active incidents', count(dashboard.active_incidents)],
     ['Material risks', count(dashboard.material_risks)],
-    ['Availability', percent(availability)],
+    availabilityStat,
     ['Risk', risk, risk],
   ];
 
@@ -156,6 +170,99 @@ export function renderEvents(state: AppState, actions: PanelActions): HTMLElemen
     row.addEventListener('click', () => actions.selectEvent(event.id));
     container.append(row);
   }
+  return container;
+}
+
+// ------------------------------------------------------------------------------------
+// Graph coverage
+// ------------------------------------------------------------------------------------
+
+/**
+ * What WorldGraph knows about the current estate, dimension by dimension.
+ *
+ * Never collapsed into one confidence percentage. Averaging "complete hosting topology"
+ * with "nothing at all about business services" produces a number that looks precise and
+ * carries no information; the operator needs the *shape* of the gap, because that is what
+ * tells them which tag to add.
+ *
+ * Renders nothing for a workspace that was not imported — the demo fixture declares
+ * everything by construction, so a coverage report there would be decoration.
+ */
+export function renderCoverage(detail: WorkspaceDetail | null): HTMLElement | null {
+  const summary = detail?.import_summary;
+  if (!detail || !summary) return null;
+
+  const container = el('div');
+
+  container.append(
+    keyValue([
+      ['Source', humanize(summary.source)],
+      ['Resources read', count(summary.resources_discovered)],
+      ['Modelled', count(summary.resources_supported)],
+      ['Not modelled', count(summary.resources_unsupported)],
+      ['Entities', count(summary.entities_created)],
+      // Split deliberately: an edge Azure proved and an edge a human asserted are
+      // different kinds of claim and must not be added together into one total.
+      ['Edges from inventory', count(summary.explicit_edges)],
+      ['Edges from tags', count(summary.declared_edges)],
+      ['Regions', count(summary.regions)],
+    ]),
+  );
+
+  const dimensions = el('div', { class: 'coverage' });
+  for (const dimension of summary.coverage) {
+    dimensions.append(
+      el(
+        'div',
+        { class: 'coverage__row', 'data-level': dimension.level },
+        el(
+          'div',
+          { class: 'coverage__head' },
+          el('span', { class: 'coverage__label', text: dimension.label }),
+          badge(dimension.level, dimension.level),
+        ),
+        el('p', { class: 'coverage__detail', text: dimension.detail }),
+        ...(dimension.remedy
+          ? [el('p', { class: 'coverage__remedy', text: dimension.remedy })]
+          : []),
+      ),
+    );
+  }
+  container.append(section('What WorldGraph knows', dimensions));
+
+  if (Object.keys(summary.unsupported_types).length > 0) {
+    // Reporting these is not an apology. It is the product telling the operator where the
+    // edge of the graph is, so they do not read it as complete.
+    container.append(
+      section(
+        'Resource types not modelled',
+        keyValue(
+          Object.entries(summary.unsupported_types)
+            .slice(0, 12)
+            .map(([type, n]) => [type, count(n)] as [string, string]),
+        ),
+      ),
+    );
+  }
+
+  if (summary.rejected_tags.length > 0) {
+    const list = el('ul', { class: 'unknowns__list' });
+    for (const rejection of summary.rejected_tags.slice(0, 20)) {
+      list.append(el('li', { text: rejection }));
+    }
+    container.append(
+      section(
+        `Tags rejected (${summary.rejected_tags.length})`,
+        list,
+        disclaimer(
+          'WorldGraph never guesses what a malformed tag meant. These values were read, ' +
+            'rejected and reported.',
+        ),
+      ),
+    );
+  }
+
+  container.append(disclaimer(detail.disclaimer));
   return container;
 }
 
@@ -353,20 +460,50 @@ export function renderAnalysis(
     );
   }
 
-  container.append(
-    section(
-      'Business impact',
-      keyValue([
-        ['Availability', percent(impact.availability)],
-        ['Traffic impacted', roundPercent(impact.traffic_impact)],
-        ['Customers', count(impact.customers_affected)],
-        ['Revenue at risk', `${money(impact.revenue_at_risk_per_hour)}/hr`],
-        ['Critical services', count(impact.critical_services_impacted)],
-        ['SLA breaches', count(impact.sla_breaches.length)],
-      ]),
-      disclaimer(`${impact.disclaimer} — WorldGraph V1 Impact Model over synthetic data`),
-    ),
+  // Rows that need no business metadata come first, because for an imported estate they
+  // are the only ones that will carry a number. The customer rows are omitted entirely
+  // rather than printed as UNKNOWN when nothing about the estate could ever fill them —
+  // a wall of UNKNOWN teaches the operator to stop reading the panel.
+  const impactRows: [string, string][] = [
+    ['Infra availability', percent(impact.infrastructure_availability)],
+    ['Entities impacted', count(impact.impacted_entity_count)],
+    ['Critical services', count(impact.critical_services_impacted)],
+    ['SLA breaches', count(impact.sla_breaches.length)],
+  ];
+  if (impact.availability !== null) {
+    impactRows.unshift(['Customer availability', percent(impact.availability)]);
+  }
+  if (impact.traffic_impact !== null) {
+    impactRows.push(['Traffic impacted', roundPercent(impact.traffic_impact)]);
+  }
+  if (impact.customers_affected !== null) {
+    impactRows.push(['Customers', count(impact.customers_affected)]);
+  }
+  if (impact.revenue_at_risk_per_hour !== null) {
+    impactRows.push(['Revenue at risk', `${money(impact.revenue_at_risk_per_hour)}/hr`]);
+  }
+
+  const impactSection = section(
+    'Business impact',
+    keyValue(impactRows),
+    disclaimer(`${impact.disclaimer} — WorldGraph V1 Impact Model`),
   );
+  if (impact.unknown_reasons.length > 0) {
+    // Naming the missing input turns a gap into something the operator can close.
+    impactSection.append(
+      el(
+        'div',
+        { class: 'unknowns' },
+        el('p', { class: 'unknowns__head', text: 'Not computed, and why' }),
+        el(
+          'ul',
+          { class: 'unknowns__list' },
+          ...impact.unknown_reasons.map((reason) => el('li', { text: reason })),
+        ),
+      ),
+    );
+  }
+  container.append(impactSection);
 
   container.append(
     section(

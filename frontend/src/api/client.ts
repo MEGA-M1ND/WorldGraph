@@ -7,8 +7,11 @@
  *    racing to overwrite the panel. Every keyed request aborts its predecessor.
  * 2. **Honest errors.** The backend returns a specific `detail` for every failure; this
  *    surfaces it verbatim rather than replacing it with "something went wrong".
- * 3. **Nothing else.** No caching layer, no retry policy, no state. The backend owns
- *    freshness and the store owns state.
+ * 3. **Workspace scoping.** Every request carries the active workspace, set once here
+ *    rather than threaded through a hundred call sites. Forgetting it on one endpoint
+ *    would show one estate's data inside another's, so it must not be per-call.
+ * 4. **Nothing else.** No caching layer, no retry policy, no state beyond that scope.
+ *    The backend owns freshness and the store owns state.
  */
 
 import type {
@@ -26,11 +29,45 @@ import type {
   SimulationComparison,
   SimulationScenario,
   TimelineEntry,
+  WorkspaceDetail,
+  WorkspaceListResponse,
+  ImportSummary,
   WorldEvent,
   WorldResponse,
 } from '../types.ts';
 
 const API_BASE = '/api';
+
+/** In-flight requests keyed by caller-supplied slot, so a newer one cancels an older one. */
+const inFlight = new Map<string, AbortController>();
+
+/**
+ * The estate every subsequent request is about.
+ *
+ * `null` means the backend's default. Held here, in one place, because a request that
+ * forgot the workspace would silently answer with the wrong estate's data — and the whole
+ * point of workspaces is that this cannot happen.
+ */
+let activeWorkspace: string | null = null;
+
+export function setActiveWorkspace(workspaceId: string | null): void {
+  activeWorkspace = workspaceId;
+  // Anything still in flight was asked about the previous estate. Cancel it rather than
+  // letting a late response paint the new workspace's panels with old data.
+  for (const controller of inFlight.values()) controller.abort();
+  inFlight.clear();
+}
+
+export function getActiveWorkspace(): string | null {
+  return activeWorkspace;
+}
+
+/** Append the active workspace to a path, preserving any query string it already has. */
+function scoped(path: string): string {
+  if (!activeWorkspace) return path;
+  const separator = path.includes('?') ? '&' : '?';
+  return `${path}${separator}workspace=${encodeURIComponent(activeWorkspace)}`;
+}
 
 /** A failure the UI can explain to the operator, carrying the backend's own message. */
 export class ApiError extends Error {
@@ -50,15 +87,14 @@ export class ApiError extends Error {
   }
 }
 
-/** In-flight requests keyed by caller-supplied slot, so a newer one cancels an older one. */
-const inFlight = new Map<string, AbortController>();
-
 interface RequestOptions {
   method?: 'GET' | 'POST' | 'DELETE';
   body?: unknown;
   /** Cancellation slot. Two requests with the same key never overlap. */
   key?: string;
   timeoutMs?: number;
+  /** Skip workspace scoping. Only for endpoints that are about the deployment itself. */
+  unscoped?: boolean;
 }
 
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
@@ -72,7 +108,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const response = await fetch(`${API_BASE}${path}`, {
+    const response = await fetch(`${API_BASE}${options.unscoped ? path : scoped(path)}`, {
       method,
       headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
       body: body === undefined ? undefined : JSON.stringify(body),
@@ -119,7 +155,19 @@ export function isSuperseded(error: unknown): boolean {
 }
 
 export const api = {
-  config: () => request<AppConfig>('/config'),
+  config: () => request<AppConfig>('/config', { unscoped: true }),
+
+  workspaces: () => request<WorkspaceListResponse>('/workspaces', { unscoped: true }),
+  currentWorkspace: () => request<WorkspaceDetail>('/workspaces/current', { key: 'workspace' }),
+  importWorkspace: (id: string) =>
+    request<ImportSummary>(`/workspaces/${encodeURIComponent(id)}/import`, {
+      method: 'POST',
+      unscoped: true,
+      // An import reads a whole subscription. It is the one call that legitimately takes
+      // longer than an interaction.
+      timeoutMs: 120_000,
+    }),
+
   dashboard: () => request<Dashboard>('/dashboard', { key: 'dashboard' }),
   feeds: () => request<FeedStatus[]>('/feeds', { key: 'feeds' }),
   refreshFeeds: () => request<FeedStatus[]>('/feeds/refresh', { method: 'POST' }),

@@ -72,6 +72,10 @@ export const CRITICALITY_SIZE: Record<Criticality, number> = {
   HIGH: 11,
   MEDIUM: 9,
   LOW: 7,
+  // Undeclared. Drawn at the LOW size because it has to be drawn at *some* size, but it
+  // is deliberately not smaller: an entity nobody has classified is not known to be
+  // unimportant, and shrinking it out of view would be a judgement the data cannot support.
+  UNKNOWN: 7,
 };
 
 /** Entity types shown by default. Customer regions and the org node are aggregates that

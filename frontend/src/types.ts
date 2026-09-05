@@ -20,7 +20,14 @@ export type FeedState =
 
 export type Severity = 'CRITICAL' | 'HIGH' | 'MODERATE' | 'LOW' | 'INFO';
 
-export type Criticality = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
+/**
+ * How much the business cares about an entity.
+ *
+ * `UNKNOWN` is the default for anything nobody has declared — an imported cloud estate
+ * starts entirely UNKNOWN, and treating that as LOW would be a judgement WorldGraph has
+ * no basis for.
+ */
+export type Criticality = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW' | 'UNKNOWN';
 
 export type HealthState =
   | 'HEALTHY'
@@ -102,6 +109,8 @@ export interface WorldEntity {
   location: GeoPoint | null;
   health: HealthState;
   criticality: Criticality;
+  /** `null` when undeclared. An imported estate declares this only through a tag. */
+  customer_facing: boolean | null;
   business: BusinessProfile;
   exposure: ExposureProfile;
   software: SoftwareComponent[];
@@ -150,14 +159,25 @@ export interface FeedStatus {
   source_url: string | null;
 }
 
+/**
+ * Headline numbers for one world state.
+ *
+ * The nullable fields are the ones an estate has to *declare* before WorldGraph can
+ * compute them. `null` means unknown and must render as UNKNOWN — never as 0, 100 % or a
+ * dash that reads like a zero. `infrastructure_availability` needs only the graph, so it
+ * is always a number and is what an imported cloud estate can actually show.
+ */
 export interface WorldSnapshotMetrics {
-  availability: number;
+  availability: number | null;
+  infrastructure_availability: number;
   regional_capacity: Record<string, number>;
   critical_services_impacted: number;
   customer_regions_impacted: number;
-  customers_affected: number;
-  revenue_at_risk_per_hour: number;
+  customers_affected: number | null;
+  revenue_at_risk_per_hour: number | null;
   material_risk: Severity;
+  /** One line per figure WorldGraph could not compute, naming the missing input. */
+  unknown_reasons: string[];
   disclaimer: 'MODELLED ESTIMATE';
 }
 
@@ -190,7 +210,8 @@ export interface ImpactedEntity {
   availability_delta: number;
   projected_health: HealthState;
   path: ImpactPath;
-  customer_facing: boolean;
+  /** `null` when nothing declares whether customers can see this. Not the same as false. */
+  customer_facing: boolean | null;
 }
 
 export interface CustomerExposure {
@@ -203,13 +224,18 @@ export interface CustomerExposure {
 }
 
 export interface BusinessImpact {
-  availability: number;
-  traffic_impact: number;
-  customers_affected: number;
-  revenue_at_risk_per_hour: number;
+  /** Availability as customers experience it. `null` when nothing declares customers. */
+  availability: number | null;
+  traffic_impact: number | null;
+  customers_affected: number | null;
+  revenue_at_risk_per_hour: number | null;
+  /** Availability of the infrastructure itself. Always computable from the graph alone. */
+  infrastructure_availability: number;
   sla_breaches: string[];
   critical_services_impacted: number;
   customer_regions_impacted: number;
+  impacted_entity_count: number;
+  unknown_reasons: string[];
   disclaimer: 'MODELLED ESTIMATE';
 }
 
@@ -334,17 +360,95 @@ export interface MaterialRisk {
 }
 
 export interface Dashboard {
+  workspace_id: string;
+  workspace_name: string;
+  workspace_kind: WorkspaceKind;
+  read_only: boolean;
   organization: string;
   critical_services: number;
   infrastructure_assets: number;
   active_incidents: number;
   material_risks: number;
-  availability: number;
+  /** Customer-experienced availability. `null` when the estate declares no customers. */
+  availability: number | null;
+  /** Availability of the infrastructure itself. Always computable from the graph. */
+  infrastructure_availability: number;
+  unknown_reasons: string[];
   entities: number;
   edges: number;
   events: number;
   mode: 'LIVE' | 'DEMO' | 'OFFLINE';
   data_disclaimer: string;
+}
+
+export type WorkspaceKind = 'DEMO' | 'REAL';
+export type InventorySourceKind = 'FIXTURE' | 'AZURE' | 'SNAPSHOT';
+export type WorkspaceStatus = 'READY' | 'NOT_LOADED' | 'UNAVAILABLE' | 'LOADING';
+
+/** One isolated estate. Its own graph, its own events, its own everything. */
+export interface Workspace {
+  id: string;
+  name: string;
+  kind: WorkspaceKind;
+  source: InventorySourceKind;
+  status: WorkspaceStatus;
+  mode: DataMode;
+  organization: string;
+  description: string;
+  /** Why a workspace could not be loaded. Specific, never "unavailable". */
+  message: string | null;
+  read_only: boolean;
+  entity_count: number;
+  edge_count: number;
+  last_refreshed_at: string | null;
+}
+
+export interface WorkspaceListResponse {
+  workspaces: Workspace[];
+  default_id: string;
+}
+
+/**
+ * What WorldGraph knows about an estate, one dimension at a time.
+ *
+ * Deliberately not a single confidence percentage: averaging "complete hosting topology"
+ * with "no business mapping" produces a number that looks precise and means nothing.
+ */
+export interface GraphCoverage {
+  dimension: string;
+  label: string;
+  level: 'HIGH' | 'PARTIAL' | 'LOW' | 'NONE';
+  detail: string;
+  remedy: string;
+}
+
+export interface ImportSummary {
+  workspace_id: string;
+  source: InventorySourceKind;
+  subscription_label: string;
+  resources_discovered: number;
+  resources_supported: number;
+  resources_unsupported: number;
+  unsupported_types: Record<string, number>;
+  entities_created: number;
+  /** Edges the source itself proved, e.g. an explicit resource reference. */
+  explicit_edges: number;
+  /** Edges a human declared through WorldGraph tags. */
+  declared_edges: number;
+  regions: number;
+  /** Tag values that were rejected, with why. Never silently ignored. */
+  rejected_tags: string[];
+  coverage: GraphCoverage[];
+  mode: DataMode;
+  refreshed_at: string;
+  duration_ms: number;
+}
+
+export interface WorkspaceDetail {
+  workspace: Workspace;
+  disclaimer: string;
+  loaded: boolean;
+  import_summary: ImportSummary | null;
 }
 
 export interface AnalystStatus {

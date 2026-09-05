@@ -263,7 +263,13 @@ class WorldState:
             ),
             "active_incidents": len(active_incidents),
             "material_risks": len(risks),
+            # Two availabilities, deliberately. The customer-experienced figure is None
+            # for an estate that declares no customers, and the infrastructure figure is
+            # always computable from the graph — so the top bar can show a real number
+            # without either inventing a customer view or going blank.
             "availability": impact.availability,
+            "infrastructure_availability": impact.infrastructure_availability,
+            "unknown_reasons": impact.unknown_reasons,
             "entities": len(self.graph),
             "edges": len(self.graph.edges),
             "events": len(self._events),
