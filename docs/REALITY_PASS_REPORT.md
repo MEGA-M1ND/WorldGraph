@@ -21,8 +21,8 @@ what they cost, and the section that matters most is [§9](#9-what-is-still-not-
 | Claim | Evidence | Status |
 |---|---|---|
 | Inventory imports into the existing domain model | 96 tests in `backend/tests/test_azure_inventory.py` against a hand-authored Resource Graph fixture | **Verified** |
-| The existing engines run on imported entities unchanged | Blast radius, risk, material risk, simulation and the analyst all exercised on the imported estate | **Verified** |
-| Workspaces cannot contaminate each other | 33 tests in `backend/tests/test_workspaces.py`, both directions, at graph / repository / API / analysis layers | **Verified** |
+| The existing engines run on imported entities unchanged | Blast radius, risk, material risk, the full what-if flow and the analyst all exercised on the imported estate | **Verified** |
+| Workspaces cannot contaminate each other | 35 tests in `backend/tests/test_workspaces.py`, both directions, at graph / repository / API / analysis layers | **Verified** |
 | No dependency is fabricated | Explicit tests for shared resource group, shared region, shared naming prefix; every edge carries provenance | **Verified** |
 | No secret escapes into an entity, a snapshot, or a log | Fixture contains a password, a connection string, a Key Vault secret and a service-principal secret; asserted absent from all three | **Verified** |
 | Key Vault contents are never read | Secret child resources refused at normalization; vault itself inventoried | **Verified** |
@@ -32,7 +32,7 @@ what they cost, and the section that matters most is [§9](#9-what-is-still-not-
 | Import scales to 5 000 resources | Performance budgets at 100 / 1 000 / 5 000 | **Verified** |
 | **The live Azure connector works against a real subscription** | — | **NOT VERIFIED — see §2** |
 
-Totals: **476 backend tests, 30 frontend unit tests, 15 end-to-end tests.** All green.
+Totals: **483 backend tests, 30 frontend unit tests, 15 end-to-end tests.** All green.
 
 ---
 
@@ -237,10 +237,10 @@ AtlasPay does not exist in an Azure import; carrying one across would render a g
 
 ---
 
-## 7. What the browser found that review did not
+## 7. What a second estate found that review did not
 
-Three defects survived code review and 476 backend tests, and were caught only by driving
-the real UI:
+Five defects survived code review and a green backend suite, and were caught only by
+running the product against an estate that is not AtlasPay:
 
 1. **The analyst crashed on an imported estate.** The deterministic router formatted
    `dashboard['availability'] * 100` — `None` for an estate with no customer regions —
@@ -258,13 +258,36 @@ the real UI:
    WorldGraph mistook its own bookkeeping for a link somebody sent. The arrival state is
    now captured before anything else runs.
 
-Two more came from looking at the screenshots rather than the DOM: a panel toggled with
-`hidden` stayed visible because `.panel`'s `display: flex` outranks the UA rule, and the
-coverage report grew unbounded until it pushed the risks and event feed off the rail.
+4. **Simulation crashed the compare endpoint.** The timeline entry formatted
+   `baseline.availability * 100`, `None` for an estate with no customer regions. Same
+   shape as (1), one layer away, and it survived (1)'s fix because nothing had run a
+   what-if against an imported estate yet.
+
+5. **"Newly impacted" was always empty, whatever the operator failed.** The worst of the
+   five, because it did not fail loudly: the endpoint returned 200 with an empty list.
+   The filter skipped any entity already below the absolute impact threshold at baseline
+   — correct for an estate that declares health, and catastrophic for one that does not.
+   An imported estate sits at `UNKNOWN` (0.9) and inherits less through its edges, so
+   *everything* started "already degraded" and no scenario was ever credited with causing
+   anything. What-if analysis ran, looked fine, and answered nothing.
+
+   The rule is now relative: an entity is newly impacted if this scenario cost it more
+   than 0.5 % availability against its own baseline. AtlasPay is byte-identical under the
+   new rule — the same newly-impacted sets (17 / 13 / 19 entities), cascade counts,
+   availability, customers, revenue and risk band across three scenarios, verified by
+   running the probe against the stashed pre-change engine and diffing. Those counts are
+   now pinned.
+
+Two further defects came from looking at the screenshots rather than the DOM: a panel
+toggled with `hidden` stayed visible because `.panel`'s `display: flex` outranks the UA
+rule, and the coverage report grew unbounded until it pushed the risks and event feed off
+the rail.
 
 The lesson generalises: **the fixture that makes a demo good makes its tests weak.**
 AtlasPay declares everything, so it never exercises an absent-metadata path. Every one of
-these five was invisible until a second estate existed.
+these seven was invisible until a second estate existed — and three of them were found
+only after the first two were fixed, because each fix let the flow run one step further
+before failing. A suite of 483 tests over one fixture is not the same as two fixtures.
 
 ---
 
@@ -344,7 +367,7 @@ radius with walkable explanation paths, the risk score with its full derivation,
 simulation engine's never-mutate-the-baseline contract, correlation, the deterministic
 tool layer, provenance and data-mode labelling, workspace isolation, and the whole
 inventory import path. None of that references AtlasPay, and after this phase all of it
-runs correctly on an estate that declares nothing. The 476-test suite would lose its
+runs correctly on an estate that declares nothing. The 483-test suite would lose its
 fixture, not its subject.
 
 **Would need replacing — the demonstration, and it is most of what makes a viewer believe
@@ -386,7 +409,7 @@ cd frontend && npm ci && npm run build
 npm run preview -- --host 127.0.0.1 --port 5173 --strictPort
 
 # Tests
-cd backend  && python -m pytest          # 476
+cd backend  && python -m pytest          # 483
 cd frontend && npm test                  # 30
 cd frontend && npx playwright test       # 15, real browser
 ```

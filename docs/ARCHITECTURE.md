@@ -75,7 +75,7 @@ records why WorldGraph does not inherit that:
 1. **Credential custody.** Vite middleware does not survive `vite build`. WorldGraph's keys
    live in a process the browser cannot reach.
 2. **Testable engines.** Blast radius, risk and simulation are the product. In typed Python
-   next to the data they get 476 unit tests; in a browser bundle they would get screenshots.
+   next to the data they get 483 unit tests; in a browser bundle they would get screenshots.
 3. **A tool layer the client cannot drive.** If AI tools run in the browser, a compromised
    client invokes them directly. Server-side, every call is schema-validated and allowlisted.
 
