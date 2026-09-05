@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from ..graph.world_graph import WorldGraph
 from ..geo.spatial import bearing_degrees, compass_point, haversine_km, proximity_factor
 from ..models.core import (
+    DependencyType,
     EventCategory,
     HealthState,
     Severity,
@@ -224,6 +225,39 @@ def match_vulnerable_assets(
     return matches
 
 
+#: Edge types an attacker can traverse *forwards*, from a foothold to what it talks to.
+_EGRESS_TYPES = frozenset(
+    {DependencyType.DEPENDS_ON, DependencyType.CONNECTS_TO, DependencyType.HOSTED_IN}
+)
+
+
+def _attacker_successors(graph: WorldGraph, node_id: str) -> list[str]:
+    """Where an attacker sitting on ``node_id`` can go next.
+
+    Two movements, and the second is the one naive models miss:
+
+    * **Egress** — what this asset talks to. ``admin-api DEPENDS_ON internal-auth`` means
+      a foothold on ``admin-api`` can reach ``internal-auth``.
+    * **Trust** — who accepts this asset's word. ``payments-api DEPENDS_ON internal-auth``
+      means ``payments-api`` trusts ``internal-auth``, so an attacker who owns the auth
+      service can move *against the arrow* into payments. Following egress alone would
+      report the payments path as unreachable, which is exactly the wrong answer.
+
+    ``SUPPLIED_BY``, ``SERVES`` and ``REPLICATES_TO`` are excluded: a supply contract and a
+    customer relationship are not network adjacency.
+    """
+    successors: list[str] = []
+    for edge in graph.dependencies_of(node_id):
+        if edge.type in _EGRESS_TYPES:
+            successors.append(edge.target_entity_id)
+    for edge in graph.dependents_of(node_id):
+        # Trust flows to whoever declared the dependency, but a shared host is not a trust
+        # relationship in itself, so HOSTED_IN is not followed backwards here.
+        if edge.type is DependencyType.DEPENDS_ON:
+            successors.append(edge.source_entity_id)
+    return successors
+
+
 def attack_paths(
     graph: WorldGraph,
     *,
@@ -233,31 +267,46 @@ def attack_paths(
 ) -> list[list[str]]:
     """Reachability paths from an origin (usually the internet) to sensitive assets.
 
-    Walks the *dependency* direction: ``admin-api DEPENDS_ON internal-auth`` means an
-    attacker on ``admin-api`` can talk to ``internal-auth``. The internet is modelled as
-    an entity with an exposure edge from each internet-facing service, so "what can the
-    internet reach" is an ordinary graph query rather than a special case.
+    The internet is modelled as an ordinary entity that internet-facing services declare a
+    ``CONNECTS_TO`` edge against, so "what can the internet reach" is a normal graph query
+    rather than a special case.
+
+    This is **reachability, not exploitability**. WorldGraph knows what is adjacent to what;
+    it does not test authentication, network policy or whether an exploit works. The tool
+    result says so, and the UI repeats it.
     """
     if from_entity_id not in graph:
         return []
     targets = set(to_entity_ids or [])
-    # Entry points: internet-facing assets that declare a CONNECTS_TO edge to the origin.
     entry_points = [
         edge.source_entity_id
         for edge in graph.dependents_of(from_entity_id)
-        if graph.entity(edge.source_entity_id) is not None
-        and graph.require_entity(edge.source_entity_id).exposure.internet_facing
+        if (entry := graph.entity(edge.source_entity_id)) is not None
+        and entry.exposure.internet_facing
     ]
+
     paths: list[list[str]] = []
     for entry in entry_points:
-        reach = graph.traverse_dependencies([entry], max_depth=max_depth)
-        for step in reach.steps:
-            if targets and step.entity_id not in targets:
+        # Breadth-first over attacker-traversable edges, tracking the route so the answer
+        # is a path an operator can read rather than a set of ids.
+        queue: list[list[str]] = [[entry]]
+        seen: set[str] = {entry}
+        while queue:
+            path = queue.pop(0)
+            if len(path) > max_depth:
                 continue
-            if step.entity_id == entry:
-                continue
-            paths.append([from_entity_id, *step.path])
-    paths.sort(key=len)
+            for next_id in _attacker_successors(graph, path[-1]):
+                if next_id in path or next_id == from_entity_id:
+                    continue
+                extended = [*path, next_id]
+                if not targets or next_id in targets:
+                    paths.append([from_entity_id, *extended])
+                if next_id not in seen:
+                    seen.add(next_id)
+                    queue.append(extended)
+
+    # Shortest first, then deterministic: the same graph must always yield the same order.
+    paths.sort(key=lambda path: (len(path), path))
     return paths
 
 

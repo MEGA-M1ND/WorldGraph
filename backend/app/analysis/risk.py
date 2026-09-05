@@ -82,12 +82,20 @@ def score_impact(
             Criticality.MEDIUM: 0.4,
             Criticality.LOW: 0.15,
         }[worst.criticality]
+        # Scale by how badly the asset was actually hurt. A CRITICAL asset that lost 5% of
+        # its availability is not the same event as one that is gone, and a flat "a
+        # critical thing was touched" term makes every incident look like a catastrophe —
+        # which is how a risk score stops carrying information.
+        severity_of_loss = 1.0 - state.availability.get(worst.id, 1.0)
         contributions.append(
             ScoreContribution(
                 code="asset_criticality",
                 label=f"{worst.criticality.value.lower()} asset impacted",
-                points=round(WEIGHTS["asset_criticality"] * weight, 1),
-                detail=f"{worst.name} is rated {worst.criticality.value}",
+                points=round(WEIGHTS["asset_criticality"] * weight * severity_of_loss, 1),
+                detail=(
+                    f"{worst.name} is rated {worst.criticality.value} and is modelled at "
+                    f"{state.availability.get(worst.id, 1.0) * 100:.0f}% availability"
+                ),
             )
         )
 
@@ -115,11 +123,12 @@ def score_impact(
         if e.business.redundancy <= 1 and state.availability.get(e.id, 1.0) < 0.5
     ]
     if spof:
+        worst_spof_loss = 1.0 - min(state.availability.get(e.id, 1.0) for e in spof)
         contributions.append(
             ScoreContribution(
                 code="single_point_of_failure",
                 label="single-region dependency with no failover",
-                points=WEIGHTS["single_point_of_failure"],
+                points=round(WEIGHTS["single_point_of_failure"] * worst_spof_loss, 1),
                 detail=", ".join(sorted(e.name for e in spof)[:3]),
             )
         )
