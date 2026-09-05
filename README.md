@@ -52,6 +52,38 @@ explains the result. It never computes a number and it never executes anything.
 > requirement, not a convenience: a demo that needs someone else's uptime is a demo that
 > fails in the room where it matters.
 
+### It also runs on estates that are not the demo
+
+WorldGraph imports a real Azure subscription, read-only, into the same domain model the
+demo uses — there is no Azure-specific analysis path. A cloud estate knows its topology and
+almost nothing about its business meaning, so WorldGraph reports what it can compute and
+says **UNKNOWN** to the rest, naming the missing input rather than filling the gap with a
+plausible number:
+
+```
+Infra availability            38.33%     ← needs only the graph
+Customers affected            UNKNOWN    ← no entity declares a customer count
+Revenue at risk / hour        UNKNOWN    ← no revenue metadata in this workspace
+Material risk       HIGH — Azure West Europe concentration
+```
+
+Three rules make that trustworthy, and each is enforced by tests rather than intent:
+
+- **No fabricated dependencies.** An edge exists only where the resource's own `location`,
+  an explicit resource-id reference in its configuration, or a human's
+  `worldgraph.depends_on` tag proves one. A shared resource group, region or naming prefix
+  proves nothing and produces nothing. Every edge carries its provenance.
+- **Read-only, absolutely.** One Resource Graph query, `Reader` permission, no write client
+  anywhere in the codebase — checked by CI, not asserted. Key Vaults are inventoried;
+  their contents are never read.
+- **Honest coverage.** What WorldGraph knows is reported dimension by dimension, never
+  collapsed into one confidence score, alongside every resource type it could not model and
+  every malformed tag it rejected.
+
+`docs/REALITY_PASS_REPORT.md` is the engineering record of how far that goes — including
+[§2](docs/REALITY_PASS_REPORT.md), which states plainly that the live connector has never
+been run against a real subscription, and §9, which lists what is still not real.
+
 ---
 
 ## Screenshots
@@ -283,11 +315,16 @@ figures switch to the simulated world — badged as such.
 ## Testing
 
 ```bash
-cd backend  && pytest                    # 289 tests
+cd backend && pytest                    # 483 tests
 cd frontend && npm run typecheck         # TypeScript strict
-cd frontend && npm test                  # 25 unit tests
-cd frontend && npm run test:e2e          # 9 Playwright specs (needs the backend running)
+cd frontend && npm test                  # 30 unit tests
+cd frontend && npm run test:e2e          # 15 Playwright specs (needs the backend running)
 ```
+
+Every push runs all three in CI, plus a security workflow that builds the frontend with
+decoy credentials in the environment and fails if any reaches the bundle, greps the backend
+for write-capable cloud clients, and proves the app installs and passes with no cloud SDK
+present at all.
 
 | Suite | Covers |
 |---|---|
@@ -298,12 +335,25 @@ cd frontend && npm run test:e2e          # 9 Playwright specs (needs the backend
 | `test_adapters.py` | Normalization, malformed-record rejection, **feed-state honesty**, error messages that leak nothing |
 | `test_ai.py` | Tool allowlist, argument validation, refusal to invent infrastructure, **six prompt-injection shapes**, every hero phrase routed |
 | `test_api.py` | The API surface, rate limiting, and **`TestHeroFlow` — the 16-point Definition of Done end to end** |
+| `test_unknowns.py` | **Absent is not zero** — every figure the engines used to invent, plus exact-value AtlasPay regression pins |
+| `test_azure_inventory.py` | Normalization, **no fabricated edges**, secret redaction, the Key Vault rule, tag validation, **prompt injection via tags** |
+| `test_workspaces.py` | Isolation in both directions at every layer, import failure modes, performance at 100 / 1 000 / 5 000 resources |
 | `hero-demo.spec.ts` | The real UI in a real browser: first run, analysis, simulation, response plan, share links, console cleanliness |
+| `workspaces.spec.ts` | Switching estates in a real browser: state cleared, coverage reported, no number invented, no leakage between workspaces |
 
-The suites are load-bearing. Five real defects were found and fixed during development
-rather than tested around — an orphaned graph node, an earthquake radius twice too wide, a
-path-traversal sequence surviving id sanitization, a response plan recommending customer
-notification over a 0.2 % impact, and a dependency arc that rendered through the planet.
+The suites are load-bearing. Five real defects were found and fixed during initial
+development rather than tested around — an orphaned graph node, an earthquake radius twice
+too wide, a path-traversal sequence surviving id sanitization, a response plan recommending
+customer notification over a 0.2 % impact, and a dependency arc that rendered through the
+planet.
+
+The Reality Pass found sixteen more, all sharing one root cause: absent and zero shared a
+representation, so an estate that declared nothing summed to a confident zero. The worst
+had WorldGraph reporting 100 % availability and $0 at risk for an estate it had just
+modelled as entirely down. Three further defects surfaced only by driving the real UI
+against a second estate — including an analyst that crashed on missing metadata and one
+that described a datacenter in Singapore when asked about a fictional one in Reykjavik.
+`docs/REALITY_PASS_AUDIT.md` and `docs/REALITY_PASS_REPORT.md` have the full accounting.
 
 ---
 
@@ -322,20 +372,28 @@ notification over a 0.2 % impact, and a dependency arc that rendered through the
 
 **V1 is complete** for the workflow above. Next, in order:
 
-1. **Time.** The impact model has no MTTR, no recovery curve, no lead-time simulation.
+1. **Run the Azure connector against a real subscription.** The import path is built,
+   tested and validated against a recorded fixture; the ~20 lines that actually call Azure
+   have never executed. Everything else on this list is less important than closing that
+   gap. (`docs/REALITY_PASS_REPORT.md` §2.)
+2. **Runtime dependencies.** Inventory cannot see a call graph, so an imported blast radius
+   reaches only what hosting and explicit configuration prove — narrower than reality. A
+   tracing source, or wider `worldgraph.depends_on` adoption, is what closes it.
+3. **Health telemetry for imported estates.** Resource Graph reports existence, not health.
+   Without Azure Monitor every imported entity is `UNKNOWN` health.
+4. **Time.** The impact model has no MTTR, no recovery curve, no lead-time simulation.
    "Supplier down" is a state, not a schedule — and a supply-chain product should model the
    14 weeks.
-2. **Real inventory.** One adapter that imports a genuine estate (Kubernetes, cloud tags, or
-   a CMDB export) turns AtlasPay from the product into a demo of the product.
-3. **Authentication.** V1 has none. It is a single-tenant demonstration; anything beyond that
-   needs identity in front of it.
+5. **Authentication.** V1 has none. It is a single-operator tool; anything beyond that needs
+   identity in front of it.
 
 Then: partial traffic-shift simulation, correlated-failure modelling, more feeds behind the
 existing adapter contract, and Postgres behind the existing repository interface.
 
-**Deliberate non-goals for now:** full CMDB/ServiceNow/Datadog/cloud inventory sync,
+**Deliberate non-goals for now:** CMDB/ServiceNow/Datadog integration, AWS and GCP,
 production remediation execution, Neo4j, enterprise RBAC, billing, multi-tenancy, mobile.
-The extension points are designed; the integrations are not built.
+The extension points are designed; those integrations are not built. Azure is the one
+inventory source that is — read-only, one subscription per workspace.
 
 ---
 

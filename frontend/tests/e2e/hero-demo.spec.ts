@@ -58,7 +58,8 @@ test.describe('WorldGraph hero demo', () => {
 
     await expect(page.locator('[data-bind="org-name"]')).toHaveText('AtlasPay');
     // The synthetic badge is in the top bar, permanently.
-    await expect(page.locator('.badge--synthetic')).toBeVisible();
+    // The badge's tone is derived from the loaded workspace, not a fixed class.
+    await expect(page.locator('[data-bind="workspace-badge"][data-tone="synthetic"]')).toBeVisible();
 
     const stats = page.locator('[data-bind="headline-stats"] .stat');
     await expect(stats).toHaveCount(6);
@@ -143,7 +144,11 @@ test.describe('WorldGraph hero demo', () => {
 
     const compare = page.locator('.compare');
     await expect(compare).toBeVisible();
-    await expect(compare).toContainText('Availability');
+    // Two availabilities, kept apart: what customers would experience, and the state of
+    // the infrastructure itself. Collapsing them into one row is what let an estate with
+    // no customer metadata report 100% (docs/REALITY_PASS_AUDIT.md, B1).
+    await expect(compare).toContainText('Customer availability');
+    await expect(compare).toContainText('Infrastructure availability');
     await expect(compare).toContainText('APAC capacity');
     await expect(compare).toContainText('Material risk');
     await page.screenshot({ path: `${SHOTS}/05-simulation-one-failure.png` });

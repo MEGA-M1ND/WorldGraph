@@ -67,6 +67,25 @@ class Settings(BaseSettings):
     #: product, and requiring it would make the demo unreproducible.
     google_maps_api_key: str | None = None
 
+    #: Azure subscription ids (or names) to offer as importable workspaces. Empty by
+    #: default: WorldGraph must run fully with no cloud account at all.
+    #:
+    #: No credential appears here. Authentication goes through ``DefaultAzureCredential``,
+    #: which reads ``az login``, managed identity or the standard environment variables —
+    #: WorldGraph never holds, stores or forwards an Azure secret, and nothing in this
+    #: section is exposed by :meth:`public_config`.
+    azure_subscriptions: list[str] = Field(default_factory=list)
+
+    #: Path to a sanitized Azure inventory snapshot to replay from disk. Lets the Azure
+    #: path be developed, tested and demonstrated with no subscription — and the workspace
+    #: it produces is labelled REPLAY, never LIVE, because a recording is not a live view.
+    azure_snapshot_path: str | None = None
+
+    @property
+    def azure_configured(self) -> bool:
+        """Whether any Azure workspace is declared. Never says whether it *works*."""
+        return bool(self.azure_subscriptions or self.azure_snapshot_path)
+
     @property
     def ai_enabled(self) -> bool:
         """Whether a model-backed analyst is available at all."""

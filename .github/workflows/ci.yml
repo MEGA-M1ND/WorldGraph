@@ -142,6 +142,11 @@ jobs:
         working-directory: backend
         env:
           WORLDGRAPH_DATABASE_PATH: ":memory:"
+          # A second, non-AtlasPay workspace, so the E2E run actually exercises the
+          # workspace switch. Without it those tests skip, and a skipped check is worth
+          # nothing. The snapshot is a hand-authored fixture with no real subscription
+          # behind it.
+          WORLDGRAPH_AZURE_SNAPSHOT_PATH: tests/fixtures/azure_snapshot.json
         run: |
           nohup uvicorn app.main:app --host 127.0.0.1 --port 8000 > "$RUNNER_TEMP/backend.log" 2>&1 &
           # Poll rather than sleep: a fixed sleep is either flaky or wasteful, and the

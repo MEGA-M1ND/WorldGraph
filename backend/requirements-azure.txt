@@ -1,0 +1,12 @@
+# Optional dependencies for the live Azure inventory connector.
+#
+# Deliberately NOT in requirements.txt. WorldGraph must install, run, test and demo with
+# no cloud account and no cloud SDK; the Azure adapter degrades to a clear "SDK not
+# installed" message rather than failing at import. Snapshot replay needs none of this.
+#
+# Both packages are read-only in the way WorldGraph uses them: azure-identity obtains a
+# token from `az login`, managed identity or the environment (WorldGraph never sees or
+# stores a secret itself), and only the Resource Graph *query* API is called — no
+# management-plane write client is installed or imported anywhere in this codebase.
+azure-identity==1.19.0
+azure-mgmt-resourcegraph==8.0.0

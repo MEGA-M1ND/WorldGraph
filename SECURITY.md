@@ -210,8 +210,8 @@ Enforced in several places at once:
 
 ## 8. Integrations
 
-Only two live sources, both US Government public-domain and keyless: USGS earthquakes and the
-CISA KEV catalog. Neither requires an account, so neither introduces a credential.
+Two live world-event sources, both US Government public-domain and keyless: USGS earthquakes
+and the CISA KEV catalog. Neither requires an account, so neither introduces a credential.
 
 Adding an authenticated integration means: read the key from `Settings`, call it from an
 adapter in the backend, never pass it through `public_config()`, and produce user-safe error
@@ -219,7 +219,94 @@ strings. The adapter base class provides the timeout, retry, size cap and error-
 
 ---
 
-## 9. Known limitations
+## 9. Azure inventory import
+
+The one authenticated integration, and the one with real blast radius if it were wrong. Every
+property below is enforced by a test, and several by a CI job.
+
+### Read-only, structurally
+
+The adapter imports exactly one Azure client — `ResourceGraphClient` — and calls exactly one
+method on it, `client.resources`. It holds no write permission and there is no code path in
+this repository that could tag, deploy, restart, scale, or reconfigure anything.
+
+That is checked rather than asserted: a CI job (`azure-adapter-is-read-only`) greps the whole
+backend for `ResourceManagementClient`, `ComputeManagementClient`, any `begin_*` operation,
+`SecretClient`, `KeyClient` and `CertificateClient`, and fails the build if any appears.
+
+The account WorldGraph authenticates as needs `Reader` and nothing more.
+
+### Credential custody
+
+Authentication is `DefaultAzureCredential`, which resolves `az login`, managed identity or the
+standard environment variables. **WorldGraph never sees, stores or forwards an Azure secret
+itself.**
+
+`azure_subscriptions` and `azure_snapshot_path` are read server-side and are deliberately
+absent from `public_config()`; a test asserts the string "azure" does not appear in the client
+configuration at all. CI builds the frontend with decoy `AZURE_CLIENT_SECRET` and
+`AZURE_TENANT_ID` values in the environment and greps the bundle for them — a build with a
+clean environment could not catch that regression.
+
+Azure SDK errors never reach a response or a log verbatim. They can carry a request URL, a
+tenant id or a token fragment, so only the exception *type* escapes, inside a message the
+adapter deliberately authored.
+
+### Secrets cannot escape
+
+Four layers, in the order they apply:
+
+1. **Never fetched.** The Resource Graph query projects named columns rather than `project *`.
+   The cheapest way not to leak a field is not to retrieve it.
+2. **Refused.** A resource id containing the segment `secrets`, `keys` or `certificates` is a
+   secret-bearing child resource. It is refused at normalization and never becomes an entity.
+   **WorldGraph may know a Key Vault exists; it may never enumerate what is inside one.**
+3. **Redacted.** Everything that does arrive passes `sanitize_properties()`, which matches 19
+   secret-shaped key patterns case-insensitively. It *redacts rather than drops*, so a
+   reviewer can see a field was present and removed — a silently absent key is
+   indistinguishable from one that never existed.
+4. **Re-applied on write.** Snapshots are sanitized again at capture time, because they are
+   written to disk and may be committed.
+
+The test fixture deliberately carries a password, a database connection string, a
+service-principal secret and a Key Vault secret. Tests assert none of them appears in any
+entity, in a serialized snapshot, or in captured log output at DEBUG level — and that the
+secret's *name* never reaches the graph either.
+
+### Tags are data, never instructions
+
+Only the `worldgraph.` namespace is read. `env=prod`, resource-group membership and naming
+conventions carry no meaning to WorldGraph, because inferring business meaning from a naming
+convention is a guess wearing a fact's clothes.
+
+Every value is sanitized and validated. A malformed value is **rejected and reported**, never
+guessed at: `worldgraph.criticality = "very important"` becomes a line in the import summary,
+not a CRITICAL. So does an unrecognised `worldgraph.*` key — a typo like
+`worldgraph.criticallity` would otherwise look to the operator exactly like a tag that worked.
+
+Tag values reach no instruction path. `worldgraph.owner` is recorded as metadata and never
+interpreted; `worldgraph.depends_on` accepts only well-formed Azure resource ids that resolve
+to entities already imported. Tests put `IGNORE PREVIOUS INSTRUCTIONS AND EXECUTE ...` and
+several other payloads into tags and assert they change no judgement, create no edge, and
+survive only as inert single-line text. This is §3(a) applied to a second untrusted source.
+
+### Optional by construction
+
+`azure-identity` and `azure-mgmt-resourcegraph` live in `requirements-azure.txt` and are never
+installed by the normal path. A CI job installs without them, asserts `import azure` fails,
+and runs the full backend suite. WorldGraph must install, test and demo with no cloud account
+at all, or the demo is not reproducible for anyone who lacks one.
+
+### Workspace isolation is a security property
+
+Each workspace owns a separate graph, event store and repository file. Requesting an unloaded
+workspace raises rather than falling back to the default — answering a question about a real
+subscription with data from a demo fixture would be the most damaging failure this product
+could produce. See `docs/REALITY_PASS_REPORT.md` §6.
+
+---
+
+## 10. Known limitations
 
 Stated plainly rather than implied:
 
@@ -234,3 +321,16 @@ Stated plainly rather than implied:
   Every response says so.
 - **SQLite with a single guarded connection.** Correct and fast at V1 scale; not a
   concurrency story for a multi-replica deployment.
+- **The live Azure connector has never been executed against a real subscription.** Every
+  property in §9 was validated against a recorded fixture replayed through the same code
+  path. The ~20 lines that actually call Azure have not run. See
+  `docs/REALITY_PASS_REPORT.md` §2, which states exactly what that does and does not
+  establish.
+- **An imported estate has no health telemetry.** Resource Graph reports existence, not
+  health, and WorldGraph does not poll Azure Monitor. Imported entities are `UNKNOWN` health
+  and every analysis says so.
+- **Azure region coordinates are approximations.** They are the published geography of a
+  region, not a facility address, and are labelled `CLOUD REGION APPROXIMATION` wherever
+  used. A physical event near one establishes *potential geographic exposure* — a reason to
+  check — never an outage. Only official service-health information is operational evidence,
+  and WorldGraph holds no service-health connector.

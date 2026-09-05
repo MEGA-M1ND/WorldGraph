@@ -54,23 +54,37 @@ export function bindAll<T extends Element = HTMLElement>(
 // ------------------------------------------------------------------------------------
 
 /** `99.97%` — availability and traffic figures, always to two decimals. */
-export function percent(value: number, decimals = 2): string {
+/**
+ * The word every formatter below returns for a missing measurement.
+ *
+ * `null` from the backend means WorldGraph could not compute a figure, and the Reality
+ * Pass found the UI rendering exactly that case as `0`, `$0` and `100.00%` — numbers that
+ * read as reassurance about an estate WorldGraph knew nothing about. A missing
+ * measurement has to look missing.
+ */
+export const UNKNOWN = 'UNKNOWN';
+
+export function percent(value: number | null | undefined, decimals = 2): string {
+  if (value === null || value === undefined) return UNKNOWN;
   return `${(value * 100).toFixed(decimals)}%`;
 }
 
 /** `63%` — capacity and impact figures, where a decimal point is false precision. */
-export function roundPercent(value: number): string {
+export function roundPercent(value: number | null | undefined): string {
+  if (value === null || value === undefined) return UNKNOWN;
   return `${Math.round(value * 100)}%`;
 }
 
 /** Compact currency. Always a modelled figure, never presented as accounting. */
-export function money(value: number): string {
+export function money(value: number | null | undefined): string {
+  if (value === null || value === undefined) return UNKNOWN;
   if (value >= 1_000_000) return `$${(value / 1_000_000).toFixed(2)}M`;
   if (value >= 1_000) return `$${Math.round(value / 1_000)}K`;
   return `$${Math.round(value).toLocaleString('en-US')}`;
 }
 
-export function count(value: number): string {
+export function count(value: number | null | undefined): string {
+  if (value === null || value === undefined) return UNKNOWN;
   return value.toLocaleString('en-US');
 }
 

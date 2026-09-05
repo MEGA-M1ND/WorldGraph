@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timedelta
 
 from ..adapters.base import WorldDataAdapter
@@ -50,12 +51,14 @@ from ..models.analysis import (
     WorldSnapshotMetrics,
 )
 from ..models.core import (
+    DependencyEdge,
     FeedStatus,
     Severity,
     WorldEntity,
     WorldEvent,
     utcnow,
 )
+from ..models.workspace import Workspace, atlaspay_workspace
 from ..simulation.engine import compare as compare_scenario
 from ..storage.repository import Repository, SqliteRepository
 
@@ -65,12 +68,45 @@ logger = logging.getLogger("worldgraph.state")
 TIMELINE_MEMORY_LIMIT = 500
 
 
+def _availability_move(
+    baseline: WorldSnapshotMetrics, simulated: WorldSnapshotMetrics
+) -> str:
+    """"availability 100.00% → 90.45%", against whichever figure the estate supports.
+
+    Prefers the customer-experienced availability and falls back to the infrastructure
+    one, *relabelled* — reporting an infrastructure number under a customer heading is the
+    same fabrication in a different sentence.
+    """
+    if baseline.availability is not None and simulated.availability is not None:
+        return (
+            f"availability {baseline.availability * 100:.2f}% → "
+            f"{simulated.availability * 100:.2f}%"
+        )
+    return (
+        f"infrastructure availability "
+        f"{baseline.infrastructure_availability * 100:.2f}% → "
+        f"{simulated.infrastructure_availability * 100:.2f}% "
+        "(customer-experienced availability UNKNOWN for this workspace)"
+    )
+
+
 class WorldState:
     """The live world model."""
 
-    def __init__(self, settings: Settings, repository: Repository | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        repository: Repository | None = None,
+        *,
+        workspace: Workspace | None = None,
+        estate_loader: Callable[[], tuple[list[WorldEntity], list[DependencyEdge]]] | None = None,
+    ) -> None:
         self.settings = settings
         self.repository = repository or SqliteRepository(settings.database_path)
+        # A world belongs to exactly one workspace. Defaulting to the demo keeps every
+        # existing caller working; the registry always passes one explicitly.
+        self.workspace = workspace or atlaspay_workspace()
+        self._estate_loader = estate_loader or build_atlaspay
         self.graph = WorldGraph()
         self._events: dict[str, WorldEvent] = {}
         self._scenarios: dict[str, SimulationScenario] = {}
@@ -101,7 +137,7 @@ class WorldState:
         self._record_timeline(
             stage="ingest",
             message=(
-                f"WorldGraph online in {self.settings.run_mode.value} mode — "
+                f"{self.workspace.name} online in {self.settings.run_mode.value} mode — "
                 f"{len(self.graph)} entities, {len(self._events)} events."
             ),
         )
@@ -113,22 +149,33 @@ class WorldState:
         self._started = False
 
     def _load_enterprise_estate(self) -> None:
-        """Load AtlasPay, preferring anything already persisted.
+        """Load this workspace's estate, preferring anything already persisted.
 
-        The fixture is the source of truth on a fresh database; a persisted estate wins
-        afterwards so an operator's edits survive a restart.
+        The loader is the source of truth on a fresh store; a persisted estate wins
+        afterwards so an operator's edits survive a restart. Which loader runs is the
+        workspace's business, not this class's — before the Reality Pass this method
+        always built AtlasPay regardless of what was asked for
+        (docs/REALITY_PASS_AUDIT.md, B14).
         """
         stored_entities = self.repository.load_entities()
         stored_edges = self.repository.load_edges()
         if stored_entities:
             self.graph = WorldGraph(stored_entities, stored_edges)
-            logger.info("estate_loaded source=repository entities=%d", len(stored_entities))
+            logger.info(
+                "estate_loaded workspace=%s source=repository entities=%d",
+                self.workspace.id,
+                len(stored_entities),
+            )
             return
-        entities, edges = build_atlaspay()
+        entities, edges = self._estate_loader()
         self.graph = WorldGraph(entities, edges)
         self.repository.save_entities(entities)
         self.repository.save_edges(edges)
-        logger.info("estate_loaded source=fixture entities=%d", len(entities))
+        logger.info(
+            "estate_loaded workspace=%s source=loader entities=%d",
+            self.workspace.id,
+            len(entities),
+        )
 
     def _register_adapters(self) -> None:
         """Build the adapter set for the current run mode.
@@ -218,7 +265,11 @@ class WorldState:
             and self._correlates(event)
         ]
         return {
-            "organization": "AtlasPay",
+            "workspace_id": self.workspace.id,
+            "workspace_name": self.workspace.name,
+            "workspace_kind": self.workspace.kind.value,
+            "read_only": self.workspace.read_only,
+            "organization": self.workspace.organization or self.workspace.name,
             "critical_services": sum(
                 1
                 for entity in self.graph.entities
@@ -234,19 +285,22 @@ class WorldState:
             ),
             "active_incidents": len(active_incidents),
             "material_risks": len(risks),
+            # Two availabilities, deliberately. The customer-experienced figure is None
+            # for an estate that declares no customers, and the infrastructure figure is
+            # always computable from the graph — so the top bar can show a real number
+            # without either inventing a customer view or going blank.
             "availability": impact.availability,
+            "infrastructure_availability": impact.infrastructure_availability,
+            "unknown_reasons": impact.unknown_reasons,
             "entities": len(self.graph),
             "edges": len(self.graph.edges),
             "events": len(self._events),
             "mode": self.settings.run_mode.value,
-            "data_disclaimer": (
-                "AtlasPay is synthetic demonstration data. World events are labelled "
-                "LIVE, REPLAY or SYNTHETIC individually."
-            ),
+            "data_disclaimer": self.workspace.data_disclaimer(),
         }
 
     def _correlates(self, event: WorldEvent) -> bool:
-        """Whether an event touches AtlasPay at all — the filter for "active incidents"."""
+        """Whether an event touches this estate at all — the filter for "active incidents"."""
         if event.directly_named_entity_ids:
             return any(eid in self.graph for eid in event.directly_named_entity_ids)
         if event.location is not None and event.exposure_radius_km > 0:
@@ -318,7 +372,7 @@ class WorldState:
         if not matches:
             self._record_timeline(
                 stage="correlate",
-                message=f"{cve_id or event.title}: no AtlasPay asset runs the affected software.",
+                message=f"{cve_id or event.title}: no asset in this workspace runs the affected software.",
                 event_id=event.id,
             )
             return self._empty_analysis(event)
@@ -368,7 +422,7 @@ class WorldState:
             risk=RiskScore(score=0.0, severity=Severity.LOW, contributions=[]),
             business_impact=business_impact(self.graph, state),
             explanations=[
-                f"{event.title} does not correlate with any AtlasPay asset.",
+                f"{event.title} does not correlate with any asset in this workspace.",
                 (
                     "No facility lies inside the modelled exposure radius and no asset runs "
                     "affected software."
@@ -380,8 +434,8 @@ class WorldState:
                 score=round(event.source.confidence * 0.9, 2),
                 strong_evidence=["deterministic correlation found no exposed asset"],
                 uncertainties=[
-                    "AtlasPay's estate is synthetic; a real estate may contain assets this "
-                    "model does not know about."
+                    "This workspace may not contain every asset the organisation "
+                    "operates; WorldGraph can only reason about what it was given."
                 ],
             ),
             mode=event.source.mode,
@@ -397,7 +451,7 @@ class WorldState:
             self._record_timeline(
                 stage="correlate",
                 message=(
-                    f"{len(matches)} AtlasPay assets inside the "
+                    f"{len(matches)} assets inside the "
                     f"{event.exposure_radius_km:.0f} km exposure radius "
                     f"({summary['critical_facilities']} facilities, "
                     f"{summary['suppliers']} suppliers)."
@@ -418,7 +472,7 @@ class WorldState:
         else:
             self._record_timeline(
                 stage="correlate",
-                message="No AtlasPay asset correlates with this event.",
+                message="No asset in this workspace correlates with this event.",
                 event_id=event.id,
             )
 
@@ -471,10 +525,13 @@ class WorldState:
         comparison = compare_scenario(self.graph, scenario)
         self._record_timeline(
             stage="simulate",
+            # Quote whichever availability this estate can actually support. The
+            # customer-experienced figure is None wherever no customer regions are
+            # declared, and multiplying that by 100 crashed the compare endpoint on an
+            # imported estate (docs/REALITY_PASS_REPORT.md §7).
             message=(
-                f"Simulation '{scenario.name}' — availability "
-                f"{comparison.baseline.availability * 100:.2f}% → "
-                f"{comparison.simulated.availability * 100:.2f}%, "
+                f"Simulation '{scenario.name}' — "
+                f"{_availability_move(comparison.baseline, comparison.simulated)}, "
                 f"risk {comparison.simulated.material_risk.value}."
             ),
             event_id=scenario.origin_event_id,

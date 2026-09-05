@@ -77,6 +77,55 @@ jobs:
           fi
           echo "Frontend source is free of cloud SDKs and credential identifiers."
 
+  azure-adapter-is-read-only:
+    name: The Azure adapter cannot write
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assert no management-plane write client or secret client is reachable
+        run: |
+          set -euo pipefail
+          # WorldGraph imports exactly one Azure client — Resource Graph, query only. A
+          # management client or a Key Vault secret client appearing anywhere in the
+          # backend is the shape of a write capability before it becomes one, and §4 and
+          # §17 of the product brief forbid both outright.
+          if grep -rnE "ResourceManagementClient|ComputeManagementClient|begin_(create|delete|update|restart|start|deallocate)|SecretClient|KeyClient|CertificateClient" backend/app; then
+            echo "::error::A write-capable or secret-reading Azure client appears in the backend"
+            exit 1
+          fi
+          echo "Azure access is query-only: no write client, no secret client."
+
+  runs-without-cloud-sdks:
+    name: WorldGraph runs with no cloud SDK installed
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+
+      - name: Install without the optional Azure extras
+        working-directory: backend
+        # requirements-azure.txt is deliberately NOT installed. The product must start,
+        # test and demo with no cloud account and no cloud SDK; a hard dependency on
+        # azure-identity would make the demo unreproducible for anyone without one.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Assert the app imports and the suite passes anyway
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          python -c "import azure" 2>/dev/null && { echo "::error::azure is installed; this job must run without it"; exit 1; } || true
+          python -c "import app.main, app.adapters.azure_inventory, app.services.workspaces"
+          python -m pytest -q
+
   no-committed-env:
     name: No environment file is committed
     runs-on: ubuntu-latest

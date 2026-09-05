@@ -9,7 +9,41 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { age, count, humanize, money, percent, roundPercent, utcTime } from '../src/ui/dom.ts';
+import { UNKNOWN, age, count, humanize, money, percent, roundPercent, utcTime } from '../src/ui/dom.ts';
+
+/**
+ * The distinction these tests defend: a figure WorldGraph could not compute arrives as
+ * `null`, and rendering it as `0`, `$0` or `100.00%` would state a fact nobody
+ * established. The Reality Pass found the panels doing exactly that for an estate that
+ * declared no business metadata (docs/REALITY_PASS_AUDIT.md, C1).
+ */
+describe('missing measurements', () => {
+  it('renders a null availability as UNKNOWN, not 100%', () => {
+    assert.equal(percent(null), UNKNOWN);
+    assert.equal(roundPercent(null), UNKNOWN);
+  });
+
+  it('renders a null revenue as UNKNOWN, not $0', () => {
+    assert.equal(money(null), UNKNOWN);
+  });
+
+  it('renders a null count as UNKNOWN, not 0', () => {
+    assert.equal(count(null), UNKNOWN);
+  });
+
+  it('treats undefined the same as null', () => {
+    assert.equal(percent(undefined), UNKNOWN);
+    assert.equal(money(undefined), UNKNOWN);
+    assert.equal(count(undefined), UNKNOWN);
+  });
+
+  it('still renders a real zero as a zero', () => {
+    // Zero is a measurement. It must not be confused with the absence of one.
+    assert.equal(percent(0), '0.00%');
+    assert.equal(money(0), '$0');
+    assert.equal(count(0), '0');
+  });
+});
 
 describe('formatting', () => {
   it('formats availability to two decimals', () => {

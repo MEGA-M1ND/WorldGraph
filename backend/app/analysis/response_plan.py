@@ -259,11 +259,16 @@ def generate_response_plan(
     objectives = _objectives(result)
     assumptions.extend(
         [
-            "All figures are WorldGraph V1 Impact Model estimates over synthetic AtlasPay data.",
+            "All figures are WorldGraph V1 Impact Model estimates.",
             "Dependency criticality and redundancy values come from the modelled estate, "
             "not from live telemetry.",
         ]
     )
+    # Derived from the records rather than asserted about a particular fixture.
+    assumptions.extend(_estate_notes(graph))
+    # Anything the impact model could not compute is an assumption the reader is making
+    # implicitly, so it belongs in the plan rather than only in the analysis panel.
+    assumptions.extend(result.business_impact.unknown_reasons)
     if result.truncated:
         assumptions.append(
             "Dependency traversal was truncated; entities beyond the traversal bound are not "
@@ -283,11 +288,22 @@ def generate_response_plan(
 
 def _summary(result: BlastRadiusResult, scenario_name: str | None) -> str:
     prefix = f"{scenario_name}: " if scenario_name else ""
+    impact = result.business_impact
+    # Quote whichever availability the estate can support. A customer-experienced figure
+    # needs customer regions; an imported inventory has none, and printing one anyway is
+    # the fabrication this phase removed.
+    if impact.availability is not None:
+        availability = f"modelled organisation availability {impact.availability * 100:.2f}%"
+    else:
+        availability = (
+            f"modelled infrastructure availability "
+            f"{impact.infrastructure_availability * 100:.2f}%; customer-experienced "
+            "availability UNKNOWN"
+        )
     return (
         f"{prefix}{result.severity.value} material risk from {result.origin_label}. "
         f"{len(result.direct_impact)} directly affected and {len(result.indirect_impact)} "
-        f"indirectly affected entities; modelled organisation availability "
-        f"{result.business_impact.availability * 100:.2f}%. "
+        f"indirectly affected entities; {availability}. "
         f"Confidence {result.confidence.score * 100:.0f}%. "
         "Recommendations only — WorldGraph executes nothing."
     )
@@ -306,6 +322,20 @@ def _objectives(result: BlastRadiusResult) -> list[str]:
         objectives.append("Remove the single points of failure this event exposed.")
     objectives.append("Preserve an audit trail of every decision taken during the incident.")
     return objectives
+
+
+def _estate_notes(graph: WorldGraph) -> list[str]:
+    """State what kind of data this plan was derived from, from the records themselves."""
+    modes = {entity.source.mode.value for entity in graph.entities}
+    notes: list[str] = []
+    if "SYNTHETIC" in modes:
+        notes.append("Part of this estate is synthetic demonstration data.")
+    if "LIVE" in modes:
+        notes.append(
+            "Part of this estate is live imported inventory; WorldGraph has read it "
+            "read-only and has changed nothing."
+        )
+    return notes
 
 
 def _availability(impacted: dict[str, object], entity_id: str) -> float:

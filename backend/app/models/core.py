@@ -129,22 +129,45 @@ def health_from_value(value: float) -> HealthState:
 
 
 class Criticality(str, Enum):
-    """How much the business cares about this entity."""
+    """How much the business cares about this entity.
+
+    ``UNKNOWN`` is not a low criticality — it is the absence of a judgement. An imported
+    cloud inventory knows a cluster exists; it does not know whether the business would
+    notice losing it. Defaulting such an entity to ``MEDIUM`` would let WorldGraph invent
+    a business classification and then score points for it, which is exactly the
+    fabrication the Reality Pass audit found (docs/REALITY_PASS_AUDIT.md, B4).
+    """
 
     CRITICAL = "CRITICAL"
     HIGH = "HIGH"
     MEDIUM = "MEDIUM"
     LOW = "LOW"
+    UNKNOWN = "UNKNOWN"
 
 
 #: Weight used when a blast radius is scored. Multiplicative, not additive, so a long
 #: chain of LOW entities never out-scores one CRITICAL customer-facing service.
+#:
+#: ``UNKNOWN`` weighs 0: an undeclared criticality contributes nothing to a risk score.
+#: It is surfaced as a *coverage gap* instead, which is information the operator can act
+#: on, rather than a number they cannot audit.
 CRITICALITY_WEIGHTS: dict[Criticality, float] = {
     Criticality.CRITICAL: 1.0,
     Criticality.HIGH: 0.75,
     Criticality.MEDIUM: 0.45,
     Criticality.LOW: 0.2,
+    Criticality.UNKNOWN: 0.0,
 }
+
+#: Ordering for "which of these is most critical". UNKNOWN sorts last: it is not a
+#: severity, so it must never win a "worst affected" comparison against a declared one.
+CRITICALITY_ORDER: tuple[Criticality, ...] = (
+    Criticality.CRITICAL,
+    Criticality.HIGH,
+    Criticality.MEDIUM,
+    Criticality.LOW,
+    Criticality.UNKNOWN,
+)
 
 
 class DataMode(str, Enum):
@@ -324,21 +347,52 @@ class BusinessProfile(BaseModel):
 
     Every number here is an *input to a model*, never an accounting figure. The API and
     UI label all derived outputs ``MODELLED ESTIMATE``.
+
+    **``None`` means "not declared", and it is not the same as zero.** Zero revenue is a
+    measurement; unknown revenue is the absence of one. Before the Reality Pass these
+    fields defaulted to ``0``, so an adapter that knew nothing was forced to assert five
+    business facts and the engines could not tell an empty estate from a worthless one
+    (docs/REALITY_PASS_AUDIT.md, B3). A synthetic estate like AtlasPay declares all of
+    them; an imported cloud inventory declares almost none.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    #: Share of total organisation traffic this entity carries, 0-1.
-    traffic_share: float = Field(default=0.0, ge=0.0, le=1.0)
-    #: Modelled revenue attributable to this entity per hour, in the org's currency.
-    revenue_per_hour: float = Field(default=0.0, ge=0.0)
-    customer_count: int = Field(default=0, ge=0)
+    #: Share of total organisation traffic this entity carries, 0-1. ``None`` = undeclared.
+    traffic_share: float | None = Field(default=None, ge=0.0, le=1.0)
+    #: Modelled revenue attributable to this entity per hour. ``None`` = undeclared.
+    revenue_per_hour: float | None = Field(default=None, ge=0.0)
+    #: Customers served. ``None`` = undeclared.
+    customer_count: int | None = Field(default=None, ge=0)
     region: str = Field(default="", max_length=64)
     sla_tier: str = Field(default="", max_length=32)
     #: Normalized capacity headroom, 0-1. 1.0 = can absorb its own full load again.
+    #: Unlike the business fields this keeps a concrete default: capacity is a *physical*
+    #: property the propagation solver must have a value for, and "runs at its own rated
+    #: load" is the only defensible assumption for an asset that is up.
     capacity: float = Field(default=1.0, ge=0.0, le=1.0)
-    #: Number of independent replicas/sites. 1 means single point of failure.
-    redundancy: int = Field(default=1, ge=0)
+    #: Number of independent replicas/sites. ``None`` = undeclared; 1 means a single
+    #: point of failure, which is a finding, so it must not be the value we invent.
+    redundancy: int | None = Field(default=None, ge=0)
+
+    @property
+    def has_traffic(self) -> bool:
+        return self.traffic_share is not None
+
+    @property
+    def has_revenue(self) -> bool:
+        return self.revenue_per_hour is not None
+
+    @property
+    def has_customers(self) -> bool:
+        return self.customer_count is not None
+
+    @property
+    def is_single_point_of_failure(self) -> bool | None:
+        """True / False / ``None`` when redundancy was never declared."""
+        if self.redundancy is None:
+            return None
+        return self.redundancy <= 1
 
 
 # --------------------------------------------------------------------------------------
@@ -358,11 +412,20 @@ class WorldEntity(BaseModel):
 
     location: GeoPoint | None = None
     health: HealthState = HealthState.UNKNOWN
-    criticality: Criticality = Criticality.MEDIUM
+    #: UNKNOWN by default. A criticality WorldGraph chose is a business judgement it was
+    #: not entitled to make; the demo fixture declares one for every entity.
+    criticality: Criticality = Criticality.UNKNOWN
 
     business: BusinessProfile = Field(default_factory=BusinessProfile)
     exposure: ExposureProfile = Field(default_factory=ExposureProfile)
     software: list[SoftwareComponent] = Field(default_factory=list)
+
+    #: Whether users outside the organisation notice this entity failing. ``None`` means
+    #: nobody declared it. Entity *type* is not evidence: before the Reality Pass every
+    #: APPLICATION was assumed customer-facing, which silently promoted every imported
+    #: Azure App Service and was worth 25 risk points on no evidence at all
+    #: (docs/REALITY_PASS_AUDIT.md, B5).
+    customer_facing: bool | None = None
 
     #: Free-form adapter-specific detail. Never used by scoring — anything the engines
     #: read gets a typed home above, so a scoring rule is always greppable.

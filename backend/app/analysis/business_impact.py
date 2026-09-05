@@ -2,8 +2,14 @@
 
 Every figure produced here is a **MODELLED ESTIMATE**. The schema carries that literal in
 :class:`BusinessImpact.disclaimer` so it cannot be dropped by a careless serializer, and
-the UI renders it beside the numbers. WorldGraph does not have access to AtlasPay's ledger
-— it has a synthetic estate and an arithmetic model, and it says so.
+the UI renders it beside the numbers.
+
+And every figure that cannot be computed is ``None``, with a reason. The Reality Pass
+found this module returning ``availability = 1.0`` and ``revenue_at_risk = 0`` for an
+estate it had just modelled as entirely degraded, because the estate declared no customer
+regions and the arithmetic quietly fell through to its identity
+(docs/REALITY_PASS_AUDIT.md, B1/B2). Zero is a measurement. Unknown is not, and the two
+must not share a representation.
 """
 
 from __future__ import annotations
@@ -39,21 +45,35 @@ SLA_FLOORS: dict[str, float] = {
 }
 
 
-def is_customer_facing(entity: WorldEntity) -> bool:
-    """Whether users outside AtlasPay notice this entity failing."""
+def is_customer_facing(entity: WorldEntity) -> bool | None:
+    """Whether users outside the organisation notice this entity failing.
+
+    Tri-state. ``None`` means nobody said, and **entity type is not evidence**: before the
+    Reality Pass this returned ``True`` for every ``APPLICATION``, which silently promoted
+    every imported Azure App Service to customer-facing and paid it 25 risk points on no
+    evidence at all (docs/REALITY_PASS_AUDIT.md, B5).
+
+    A ``CUSTOMER_REGION`` is the one structural exception: the type *is* the declaration.
+    """
     if entity.type is EntityType.CUSTOMER_REGION:
         return True
-    if entity.metadata.get("customer_facing") is True:
-        return True
-    if entity.metadata.get("customer_facing") is False:
-        return False
-    return entity.type in {EntityType.BUSINESS_SERVICE, EntityType.APPLICATION}
+    if entity.customer_facing is not None:
+        return entity.customer_facing
+    # Legacy metadata form, still honoured because it is an explicit declaration.
+    declared = entity.metadata.get("customer_facing")
+    if isinstance(declared, bool):
+        return declared
+    return None
 
 
 def customer_exposure(
     graph: WorldGraph, state: PropagationState, *, threshold: float = IMPACT_THRESHOLD
 ) -> list[CustomerExposure]:
-    """Per-customer-region exposure, worst first."""
+    """Per-customer-region exposure, worst first.
+
+    Empty when the estate declares no customer regions — which is a true statement about
+    an imported cloud inventory, not a claim that no customers were affected.
+    """
     rows: list[CustomerExposure] = []
     for entity in graph.entities_of_type(EntityType.CUSTOMER_REGION):
         availability = state.availability.get(entity.id, 1.0)
@@ -70,7 +90,10 @@ def customer_exposure(
             CustomerExposure(
                 entity_id=entity.id,
                 region=entity.business.region or entity.name,
-                customer_count=entity.business.customer_count,
+                # A customer region with no declared count still has real exposure; the
+                # count is reported as 0 here and the aggregate reports UNKNOWN instead of
+                # summing zeros into a confident total.
+                customer_count=entity.business.customer_count or 0,
                 traffic_impact=round(min(1.0, max(0.0, 1.0 - availability)), 4),
                 projected_availability=round(availability, 4),
                 via_service_ids=sorted(set(via)),
@@ -80,44 +103,122 @@ def customer_exposure(
     return rows
 
 
+def infrastructure_availability(
+    graph: WorldGraph, state: PropagationState
+) -> float:
+    """Availability of the estate itself, independent of any business metadata.
+
+    This is the figure a cloud import *can* support: it needs only the graph. Weighted by
+    declared traffic share where one exists, and counted evenly where none does, so an
+    estate that declares nothing still gets an honest number rather than a null.
+    """
+    load_bearing = [
+        entity
+        for entity in graph.entities
+        if entity.type in SERVICE_TYPES | CAPACITY_BEARING_TYPES
+        or entity.type in {EntityType.CLOUD_REGION, EntityType.DATACENTER}
+    ]
+    if not load_bearing:
+        load_bearing = graph.entities
+    if not load_bearing:
+        return 1.0
+
+    total_weight = 0.0
+    weighted = 0.0
+    for entity in load_bearing:
+        weight = entity.business.traffic_share if entity.business.has_traffic else None
+        weight = weight if weight else 1.0
+        total_weight += weight
+        weighted += weight * state.availability.get(entity.id, 1.0)
+    return round(weighted / total_weight, 5) if total_weight else 1.0
+
+
 def business_impact(
     graph: WorldGraph, state: PropagationState, *, threshold: float = IMPACT_THRESHOLD
 ) -> BusinessImpact:
-    """Aggregate the settled state into headline business figures."""
+    """Aggregate the settled state into headline business figures.
+
+    Each aggregate is computed only where the estate supplies the evidence for it; where
+    it does not, the field is ``None`` and ``unknown_reasons`` names what is missing.
+    """
     regions = graph.entities_of_type(EntityType.CUSTOMER_REGION)
+    unknown: list[str] = []
 
-    # Organisation availability is the traffic-weighted availability seen by customers.
-    # Weighting by customer regions (not by every node) is what makes the number mean
-    # "what our users experience" rather than "how many boxes are green".
-    total_weight = sum(region.business.traffic_share for region in regions)
-    if total_weight > 0:
-        availability = sum(
-            region.business.traffic_share * state.availability.get(region.id, 1.0)
-            for region in regions
-        ) / total_weight
+    # -- customer-experienced availability ---------------------------------------------
+    # Weighted by traffic across customer regions: what users experience, not how many
+    # boxes are green. Both inputs must exist for the figure to mean anything.
+    weighted_regions = [r for r in regions if r.business.has_traffic]
+    total_weight = sum(r.business.traffic_share or 0.0 for r in weighted_regions)
+
+    availability: float | None = None
+    traffic_impact: float | None = None
+    if not regions:
+        unknown.append(
+            "Customer-experienced availability is unknown: this workspace declares no "
+            "customer regions, so there is no population to compute an experience for."
+        )
+    elif total_weight <= 0:
+        unknown.append(
+            "Customer-experienced availability is unknown: customer regions exist but "
+            "none declares a traffic share to weight them by."
+        )
     else:
-        availability = 1.0
+        availability = sum(
+            (r.business.traffic_share or 0.0) * state.availability.get(r.id, 1.0)
+            for r in weighted_regions
+        ) / total_weight
+        availability = round(max(0.0, min(1.0, availability)), 5)
+        traffic_impact = round(max(0.0, 1.0 - availability), 5)
 
-    traffic_impact = max(0.0, 1.0 - availability)
+    # -- customers affected -------------------------------------------------------------
+    impacted_regions = [r for r in regions if state.availability.get(r.id, 1.0) < threshold]
+    customers_affected: int | None = None
+    if any(r.business.has_customers for r in regions):
+        customers_affected = sum(
+            r.business.customer_count or 0 for r in impacted_regions if r.business.has_customers
+        )
+        if any(not r.business.has_customers for r in impacted_regions):
+            unknown.append(
+                "Customer count is partial: some impacted regions declare no customer "
+                "count, so the total is a lower bound."
+            )
+    else:
+        unknown.append(
+            "Customers affected is unknown: no entity in this workspace declares a "
+            "customer count."
+        )
 
-    customers_affected = sum(
-        region.business.customer_count
-        for region in regions
-        if state.availability.get(region.id, 1.0) < threshold
-    )
-    revenue_at_risk = sum(
-        region.business.revenue_per_hour * (1.0 - state.availability.get(region.id, 1.0))
-        for region in regions
-    )
+    # -- revenue --------------------------------------------------------------------------
+    revenue_at_risk: float | None = None
+    revenue_regions = [r for r in regions if r.business.has_revenue]
+    if revenue_regions:
+        revenue_at_risk = round(
+            sum(
+                (r.business.revenue_per_hour or 0.0)
+                * (1.0 - state.availability.get(r.id, 1.0))
+                for r in revenue_regions
+            ),
+            2,
+        )
+    else:
+        unknown.append(
+            "Revenue exposure is unknown: no revenue metadata is available for this "
+            "workspace."
+        )
 
-    sla_breaches: list[str] = []
-    for entity in graph.entities:
-        floor = SLA_FLOORS.get(entity.business.sla_tier)
-        if floor is None:
-            continue
-        if state.availability.get(entity.id, 1.0) < floor:
-            sla_breaches.append(entity.id)
+    # -- SLA ------------------------------------------------------------------------------
+    sla_breaches = [
+        entity.id
+        for entity in graph.entities
+        if (floor := SLA_FLOORS.get(entity.business.sla_tier)) is not None
+        and state.availability.get(entity.id, 1.0) < floor
+    ]
+    if not any(e.business.sla_tier for e in graph.entities):
+        unknown.append(
+            "SLA exposure is unknown: no entity declares an SLA tier."
+        )
 
+    # -- countable facts, which need no business metadata ---------------------------------
     critical_services = sum(
         1
         for entity in graph.entities
@@ -125,26 +226,29 @@ def business_impact(
         and entity.criticality is Criticality.CRITICAL
         and state.availability.get(entity.id, 1.0) < threshold
     )
-    regions_impacted = sum(
-        1 for region in regions if state.availability.get(region.id, 1.0) < threshold
+    impacted_count = sum(
+        1 for value in state.availability.values() if value < threshold
     )
 
     return BusinessImpact(
-        availability=round(max(0.0, min(1.0, availability)), 5),
-        traffic_impact=round(min(1.0, traffic_impact), 5),
+        availability=availability,
+        traffic_impact=traffic_impact,
         customers_affected=customers_affected,
-        revenue_at_risk_per_hour=round(revenue_at_risk, 2),
+        revenue_at_risk_per_hour=revenue_at_risk,
+        infrastructure_availability=infrastructure_availability(graph, state),
         sla_breaches=sorted(sla_breaches),
         critical_services_impacted=critical_services,
-        customer_regions_impacted=regions_impacted,
+        customer_regions_impacted=len(impacted_regions),
+        impacted_entity_count=impacted_count,
+        unknown_reasons=unknown,
     )
 
 
-#: Entity types that carry AtlasPay's own load and therefore have a meaningful
+#: Entity types that carry the organisation's own load and therefore have a meaningful
 #: "regional capacity". Cloud regions are deliberately excluded: a provider's region is
-#: not AtlasPay's capacity, and counting it dilutes the figure with infrastructure the
-#: company does not own or scale. Databases are excluded for the same reason a database
-#: is sized for its data, not for request headroom.
+#: not the customer's capacity, and counting it dilutes the figure with infrastructure the
+#: organisation neither owns nor scales. Databases are excluded for the same reason a
+#: database is sized for its data, not for request headroom.
 CAPACITY_BEARING_TYPES = frozenset(
     {
         EntityType.KUBERNETES_CLUSTER,
@@ -155,24 +259,54 @@ CAPACITY_BEARING_TYPES = frozenset(
 #: Regions that are aggregates rather than places; excluded from the per-region table.
 _AGGREGATE_REGIONS = frozenset({"GLOBAL", ""})
 
-#: Site-level region labels (from the fixture's ``SITES``) rolled up into operating
-#: regions, so the UI shows "APAC 63%" rather than four separate city rows.
-_REGION_ROLLUP: dict[str, str] = {
-    "SINGAPORE": "APAC",
-    "MUMBAI": "APAC",
-    "TOKYO": "APAC",
-    "APAC": "APAC",
-    "FRANKFURT": "EMEA",
-    "EMEA": "EMEA",
-    "VIRGINIA": "AMER",
-    "AMER": "AMER",
-    "BENGALURU": "APAC",
-}
+#: Operating regions WorldGraph knows how to group site labels into.
+#:
+#: This is *derivation*, not a lookup table of one fixture's cities. The Reality Pass
+#: found a hardcoded SINGAPORE/MUMBAI/FRANKFURT map here through which every Azure region
+#: fell straight to its own uppercase name (docs/REALITY_PASS_AUDIT.md, B6). The rules
+#: below are substring matches over geography that hold for any source; anything they do
+#: not recognise keeps its own label rather than being forced into a bucket.
+_REGION_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "APAC",
+        (
+            "SINGAPORE", "MUMBAI", "TOKYO", "BENGALURU", "APAC", "ASIA", "INDIA",
+            "JAPAN", "KOREA", "AUSTRALIA", "SYDNEY", "MELBOURNE", "HONGKONG",
+            "TAIWAN", "JIO", "PUNE", "CHENNAI",
+        ),
+    ),
+    (
+        "EMEA",
+        (
+            "FRANKFURT", "EMEA", "EUROPE", "UK", "LONDON", "FRANCE", "PARIS",
+            "GERMANY", "SWEDEN", "NORWAY", "SWITZERLAND", "ITALY", "SPAIN",
+            "POLAND", "UAE", "QATAR", "ISRAEL", "SOUTHAFRICA", "AFRICA",
+        ),
+    ),
+    (
+        "AMER",
+        (
+            "VIRGINIA", "AMER", "US", "USA", "CANADA", "BRAZIL", "MEXICO",
+            "IOWA", "TEXAS", "ARIZONA", "CALIFORNIA", "WASHINGTON", "CHILE",
+        ),
+    ),
+)
 
 
 def rollup_region(label: str) -> str:
-    """Map a site label onto its operating region, falling back to the label itself."""
-    return _REGION_ROLLUP.get(label.upper(), label.upper())
+    """Group a site or cloud-region label into an operating region.
+
+    Falls back to the label's own uppercase form when no rule matches, which is the honest
+    outcome: an unrecognised region is reported under its real name rather than guessed
+    into a continent.
+    """
+    if not label:
+        return ""
+    upper = label.upper().replace("-", "").replace("_", "").replace(" ", "")
+    for region, needles in _REGION_RULES:
+        if any(needle in upper for needle in needles):
+            return region
+    return label.upper()
 
 
 def regional_capacity(graph: WorldGraph, state: PropagationState) -> dict[str, float]:
@@ -180,8 +314,7 @@ def regional_capacity(graph: WorldGraph, state: PropagationState) -> dict[str, f
 
     Uses the *capacity* solve, not availability: this row answers "how much load could
     this region take", which is the question a supply-chain disruption actually changes.
-    Weighted by traffic share where entities declare one, so the number tracks load
-    rather than box count.
+    Weighted by traffic share where declared, evenly otherwise.
     """
     buckets: dict[str, list[tuple[float, float]]] = {}
     for entity in graph.entities:
@@ -190,7 +323,10 @@ def regional_capacity(graph: WorldGraph, state: PropagationState) -> dict[str, f
             continue
         if entity.type not in CAPACITY_BEARING_TYPES:
             continue
-        weight = entity.business.traffic_share or 0.05
+        # An undeclared traffic share weighs 1.0 — an equal vote — rather than 0, which
+        # would silently drop the entity out of its own region's figure.
+        weight = entity.business.traffic_share if entity.business.has_traffic else None
+        weight = weight if weight else 1.0
         buckets.setdefault(rollup_region(region), []).append(
             (weight, state.capacity.get(entity.id, 1.0))
         )
@@ -214,23 +350,28 @@ def snapshot_metrics(
     impact = business_impact(graph, state)
     if risk_score is None:
         # Derive a material-risk band from the impact itself when no dedicated risk score
-        # was computed: traffic loss and critical-service count are the two dimensions an
-        # operator would use to eyeball severity.
-        derived = min(
-            100.0,
-            impact.traffic_impact * 120.0 + impact.critical_services_impacted * 12.0,
+        # was computed. Prefer the customer-experienced view; fall back to infrastructure
+        # availability when the estate cannot supply one, so an imported workspace still
+        # gets a defensible band rather than a null.
+        traffic_term = (
+            impact.traffic_impact
+            if impact.traffic_impact is not None
+            else 1.0 - impact.infrastructure_availability
         )
+        derived = min(100.0, traffic_term * 120.0 + impact.critical_services_impacted * 12.0)
         material = severity_from_score(derived)
     else:
         material = severity_from_score(risk_score)
     return WorldSnapshotMetrics(
         availability=impact.availability,
+        infrastructure_availability=impact.infrastructure_availability,
         regional_capacity=regional_capacity(graph, state),
         critical_services_impacted=impact.critical_services_impacted,
         customer_regions_impacted=impact.customer_regions_impacted,
         customers_affected=impact.customers_affected,
         revenue_at_risk_per_hour=impact.revenue_at_risk_per_hour,
         material_risk=material,
+        unknown_reasons=impact.unknown_reasons,
     )
 
 

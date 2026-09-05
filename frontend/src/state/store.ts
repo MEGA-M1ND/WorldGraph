@@ -26,6 +26,8 @@ import type {
   SimulationComparison,
   SimulationScenario,
   TimelineEntry,
+  Workspace,
+  WorkspaceDetail,
   WorldEntity,
   WorldEvent,
   WorldSnapshotMetrics,
@@ -55,6 +57,13 @@ export interface AppState {
   config: AppConfig | null;
   dashboard: Dashboard | null;
   metrics: WorldSnapshotMetrics | null;
+
+  /** Every estate this deployment knows about, including ones that failed to load. */
+  workspaces: Workspace[];
+  /** The estate everything on screen is about. `null` before the first load. */
+  activeWorkspaceId: string | null;
+  /** The active workspace's disclaimer and, if it was imported, its coverage report. */
+  workspaceDetail: WorkspaceDetail | null;
 
   entities: WorldEntity[];
   entitiesById: Map<string, WorldEntity>;
@@ -98,6 +107,9 @@ function initialState(): AppState {
     config: null,
     dashboard: null,
     metrics: null,
+    workspaces: [],
+    activeWorkspaceId: null,
+    workspaceDetail: null,
     entities: [],
     entitiesById: new Map(),
     edges: [],
@@ -147,6 +159,43 @@ export class Store {
       this.state.entitiesById = new Map(patch.entities.map((entity) => [entity.id, entity]));
     }
     for (const listener of this.listeners) listener(this.state);
+  }
+
+  /** The active workspace record, if it has been listed yet. */
+  activeWorkspace(): Workspace | undefined {
+    return this.state.workspaces.find((w) => w.id === this.state.activeWorkspaceId);
+  }
+
+  /**
+   * Clear everything that belongs to one estate.
+   *
+   * Called on every workspace switch. Selections, analyses, simulations and the globe's
+   * highlights are all *about* a particular graph, and carrying any of them across would
+   * show one estate's finding against another's entities — an entity id from AtlasPay
+   * would simply not exist in an Azure import, and the panel would render a ghost.
+   */
+  clearEstateState(): void {
+    this.update({
+      entities: [],
+      edges: [],
+      events: [],
+      risks: [],
+      timeline: [],
+      metrics: null,
+      dashboard: null,
+      selectedEntityId: null,
+      selectedEntity: null,
+      selectedEventId: null,
+      selectedEvent: null,
+      analysis: null,
+      plan: null,
+      scenario: null,
+      comparison: null,
+      simulationActive: false,
+      highlightedEntityIds: [],
+      focusedPath: [],
+      transcript: [],
+    });
   }
 
   entity(id: string | null | undefined): WorldEntity | undefined {

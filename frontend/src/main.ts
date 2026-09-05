@@ -13,7 +13,7 @@
 import './styles/app.css';
 import './styles/panels.css';
 
-import { ApiError, api, isSuperseded } from './api/client.ts';
+import { ApiError, api, isSuperseded, setActiveWorkspace } from './api/client.ts';
 import { EntityLayer } from './globe/entityLayer.ts';
 import { HEALTH_COLORS, SEVERITY_COLORS } from './globe/palette.ts';
 import { createGlobe, type GlobeHandles } from './globe/viewer.ts';
@@ -22,6 +22,7 @@ import { store } from './state/store.ts';
 import { bind, bindAll, el, replaceChildren, utcClock } from './ui/dom.ts';
 import {
   renderAnalysis,
+  renderCoverage,
   renderDependencies,
   renderEntityDetail,
   renderEventDetail,
@@ -58,6 +59,15 @@ class WorldGraphApp {
   private dockTab: DockTab = 'timeline';
   private clockTimer = 0;
   private pollTimer = 0;
+  /**
+   * The share state the *user* arrived with.
+   *
+   * Captured before anything else runs, because the app writes to the same URL: the globe
+   * persists its camera on idle, and if that lands before the share state is read back,
+   * WorldGraph mistakes its own bookkeeping for a link somebody sent — and skips the
+   * first-run launcher on a plain visit.
+   */
+  private arrivalShareState = readShareState();
 
   async start(): Promise<void> {
     this.installStaticHandlers();
@@ -74,6 +84,7 @@ class WorldGraphApp {
       await this.initGlobe(null).catch(() => undefined);
     }
 
+    await this.loadWorkspaces();
     await this.loadWorld();
     this.startPolling();
     await this.restoreShareLinkOrOfferMissions();
@@ -97,6 +108,110 @@ class WorldGraphApp {
       onSelectEntity: (id) => void (id ? this.selectEntity(id) : this.clearSelection()),
       onSelectEvent: (id) => void this.selectEvent(id),
     });
+  }
+
+  /**
+   * List the workspaces and settle on one.
+   *
+   * A failure here is not fatal: the backend has a default, so the app carries on
+   * unscoped rather than refusing to start over a switcher.
+   */
+  private async loadWorkspaces(): Promise<void> {
+    try {
+      const { workspaces, default_id } = await api.workspaces();
+      const active = store.get().activeWorkspaceId ?? default_id;
+      setActiveWorkspace(active);
+      store.update({ workspaces, activeWorkspaceId: active });
+      await this.loadWorkspaceDetail();
+    } catch (error) {
+      if (isSuperseded(error)) return;
+      this.reportError('workspaces', error);
+    }
+  }
+
+  private async loadWorkspaceDetail(): Promise<void> {
+    try {
+      store.update({ workspaceDetail: await api.currentWorkspace() });
+    } catch (error) {
+      if (isSuperseded(error)) return;
+      store.update({ workspaceDetail: null });
+    }
+  }
+
+  /**
+   * Switch estates.
+   *
+   * Everything on screen belongs to the estate it came from, so the switch clears all of
+   * it before loading the new one — no selection, no analysis, no simulation and no
+   * transcript survives. Carrying any of it across would render one estate's finding
+   * against another's entities.
+   *
+   * A workspace that has not been imported yet is imported first, because the alternative
+   * — an empty graph with no explanation — looks exactly like an estate with nothing in it.
+   */
+  private async switchWorkspace(workspaceId: string): Promise<void> {
+    if (workspaceId === store.get().activeWorkspaceId) return;
+
+    const done = store.startWork('workspace');
+    const target = store.get().workspaces.find((w) => w.id === workspaceId);
+    try {
+      store.dismissNotice('workspace');
+      store.clearEstateState();
+      setActiveWorkspace(workspaceId);
+      store.update({ activeWorkspaceId: workspaceId, workspaceDetail: null });
+
+      if (target && target.status !== 'READY') {
+        store.notify({
+          id: 'workspace',
+          tone: 'info',
+          title: `Importing ${target.name}`,
+          detail: 'Reading inventory. WorldGraph reads only and changes nothing.',
+        });
+        await api.importWorkspace(workspaceId);
+        store.dismissNotice('workspace');
+      }
+
+      const { workspaces } = await api.workspaces();
+      store.update({ workspaces });
+      await this.loadWorkspaceDetail();
+      await this.loadWorld();
+      // A different estate lives in different places. Reframe rather than leaving the
+      // camera over a region the new workspace has nothing in.
+      this.frameEstate();
+    } catch (error) {
+      if (isSuperseded(error)) return;
+      // Fall back to the workspace that is guaranteed to work, and say why — an empty
+      // screen with no explanation is the one outcome that teaches the operator nothing.
+      const detail =
+        error instanceof ApiError ? error.message : 'The workspace could not be loaded.';
+      store.notify({
+        id: 'workspace',
+        tone: 'error',
+        title: `Could not open ${target?.name ?? workspaceId}`,
+        detail,
+      });
+      const fallback = store.get().workspaces.find((w) => w.status === 'READY');
+      if (fallback && fallback.id !== workspaceId) {
+        setActiveWorkspace(fallback.id);
+        store.update({ activeWorkspaceId: fallback.id });
+        await this.loadWorkspaceDetail();
+        await this.loadWorld();
+      }
+    } finally {
+      done();
+    }
+  }
+
+  /** Point the camera at wherever this estate actually is. */
+  private frameEstate(): void {
+    const positions = store
+      .get()
+      .entities.map((entity) => entity.location)
+      .filter((point): point is NonNullable<typeof point> => point !== null)
+      .map((point) => ({ lat: point.lat, lon: point.lon }));
+    // An estate with no placed entity — every region unrecognised, say — leaves the
+    // camera where it is rather than flying to a default that means nothing.
+    if (positions.length > 0) void this.globe.flyToEntities(positions);
   }
 
   private async loadWorld(): Promise<void> {
@@ -544,7 +659,7 @@ class WorldGraphApp {
   }
 
   private async restoreShareLinkOrOfferMissions(): Promise<void> {
-    const shared = readShareState();
+    const shared = this.arrivalShareState;
 
     if (shared === null) {
       // Malformed link. Say so rather than silently showing a default view the sender
@@ -615,7 +730,10 @@ class WorldGraphApp {
         const explore = el(
           'button',
           { type: 'button', class: 'mission' },
-          el('div', { class: 'mission__title', text: 'Explore AtlasPay' }),
+          el('div', {
+            class: 'mission__title',
+            text: `Explore ${store.get().dashboard?.organization ?? 'the estate'}`,
+          }),
           el('div', {
             class: 'mission__summary',
             text: 'Open the estate with no incident selected and look around.',
@@ -628,7 +746,7 @@ class WorldGraphApp {
 
     bind('first-run-disclaimer').textContent =
       dashboard?.data_disclaimer ??
-      'AtlasPay is synthetic demonstration data. World events are labelled individually.';
+      'Each workspace states its own provenance. World events are labelled individually.';
 
     if (!dialog.open) dialog.showModal();
   }
@@ -641,11 +759,70 @@ class WorldGraphApp {
     store.update({ firstRunDismissed: true });
   }
 
+  /**
+   * The estate selector and the badge that says what kind of data is on screen.
+   *
+   * Unavailable workspaces stay in the list, disabled, carrying their failure reason —
+   * removing them would make a configuration problem look like an estate that simply is
+   * not there.
+   */
+  private renderWorkspaceSwitcher(state: ReturnType<typeof store.get>): void {
+    const select = bind<HTMLSelectElement>('workspace-select');
+    const active = state.activeWorkspaceId;
+
+    replaceChildren(
+      select,
+      ...state.workspaces.map((workspace) => {
+        const suffix =
+          workspace.status === 'UNAVAILABLE'
+            ? ' (unavailable)'
+            : workspace.status === 'NOT_LOADED'
+              ? ' (not imported)'
+              : '';
+        const option = el('option', {
+          value: workspace.id,
+          text: `${workspace.name}${suffix}`,
+          title: workspace.message ?? workspace.description,
+        }) as HTMLOptionElement;
+        option.disabled = workspace.status === 'UNAVAILABLE';
+        option.selected = workspace.id === active;
+        return option;
+      }),
+    );
+    select.disabled = state.workspaces.length < 2 || store.isBusy('workspace');
+
+    const workspace = store.activeWorkspace();
+    const badge = bind('workspace-badge');
+    if (!workspace) {
+      badge.textContent = '';
+      badge.hidden = true;
+      return;
+    }
+    badge.hidden = false;
+    if (workspace.kind === 'DEMO') {
+      badge.textContent = 'SYNTHETIC ESTATE';
+      badge.dataset['tone'] = 'synthetic';
+    } else if (workspace.mode === 'REPLAY') {
+      // A recording, and it must never read as a live view.
+      badge.textContent = 'SNAPSHOT · READ ONLY';
+      badge.dataset['tone'] = 'replay';
+    } else {
+      badge.textContent = 'IMPORTED · READ ONLY';
+      badge.dataset['tone'] = 'live';
+    }
+    badge.title = state.workspaceDetail?.disclaimer ?? workspace.description;
+  }
+
   // ----------------------------------------------------------------------------------
   // Static handlers
   // ----------------------------------------------------------------------------------
 
   private installStaticHandlers(): void {
+    bind<HTMLSelectElement>('workspace-select').addEventListener('change', (event) => {
+      const target = event.target as HTMLSelectElement;
+      void this.switchWorkspace(target.value);
+    });
+
     bind<HTMLFormElement>('command-form').addEventListener('submit', (event) => {
       event.preventDefault();
       const input = bind<HTMLInputElement>('command-input');
@@ -793,8 +970,17 @@ class WorldGraphApp {
 
     // -- top bar ---------------------------------------------------------------------
     replaceChildren(bind('headline-stats'), ...renderHeadlineStats(state));
-    bind('org-name').textContent = state.dashboard?.organization ?? 'AtlasPay';
+    this.renderWorkspaceSwitcher(state);
+    bind('org-name').textContent = state.dashboard?.organization ?? '—';
     bind('run-mode').textContent = state.config?.run_mode ?? 'DEMO';
+
+    // -- graph coverage ---------------------------------------------------------------
+    const coverage = renderCoverage(state.workspaceDetail);
+    const coveragePanel = bind('coverage-panel');
+    // Hidden rather than empty for the demo estate: a fixture that declares everything
+    // has no coverage story, and an empty panel invites the reader to wonder what broke.
+    coveragePanel.hidden = coverage === null;
+    replaceChildren(bind('coverage-body'), ...(coverage ? [coverage] : []));
 
     // -- notices ---------------------------------------------------------------------
     replaceChildren(
@@ -967,7 +1153,15 @@ class WorldGraphApp {
           el('span', { text: label }),
         ),
       ),
-      el('span', { class: 'legend__item', text: 'AtlasPay estate is synthetic demo data' }),
+      el('span', {
+        class: 'legend__item',
+        // Derived, not asserted. The Reality Pass found this line calling an imported
+        // Azure subscription synthetic demo data (docs/REALITY_PASS_AUDIT.md, C6).
+        text:
+          store.activeWorkspace()?.kind === 'DEMO'
+            ? 'This estate is synthetic demo data'
+            : 'Imported read-only inventory',
+      }),
     ];
   }
 }

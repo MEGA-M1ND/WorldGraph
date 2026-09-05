@@ -75,7 +75,7 @@ records why WorldGraph does not inherit that:
 1. **Credential custody.** Vite middleware does not survive `vite build`. WorldGraph's keys
    live in a process the browser cannot reach.
 2. **Testable engines.** Blast radius, risk and simulation are the product. In typed Python
-   next to the data they get 289 unit tests; in a browser bundle they would get screenshots.
+   next to the data they get 483 unit tests; in a browser bundle they would get screenshots.
 3. **A tool layer the client cannot drive.** If AI tools run in the browser, a compromised
    client invokes them directly. Server-side, every call is schema-validated and allowlisted.
 
@@ -226,6 +226,68 @@ the experiment.
 
 ---
 
+## Workspaces and inventory import
+
+A **workspace** is a self-contained world: its own entities, edges, events, simulations and
+analyses. AtlasPay is one; an imported Azure subscription is another.
+
+Isolation is **structural rather than filtered**. Each workspace owns a separate
+`WorldState` with its own graph and its own repository file, and the registry hands out the
+right one. There is no shared collection with a `workspace_id` column, because a shared
+collection is exactly how the cross-contamination bug gets written — and a blast radius
+that leaked from a demo fixture into a real subscription is the worst failure this product
+could produce.
+
+```
+WorkspaceRegistry
+├── atlaspay-demo   → WorldState(graph, events, scenarios) → worldgraph.db
+└── azure-<sub>     → WorldState(graph, events, scenarios) → worldgraph.azure-<sub>.db
+```
+
+`registry.state(id)` **raises** for a workspace that exists but is not loaded. It never
+falls back to the default; a silent fallback would answer a question about an Azure
+subscription with data from a demo fixture. Over the API that is a 409 with the reason.
+
+Requests carry the workspace as a query parameter, resolved once in `get_state`, so every
+existing route became workspace-aware without touching its body. The analyst is built per
+workspace and cached, because an analyst is bound to a world and answering one estate's
+question with another's tools would be the same contamination bug one layer up.
+
+### The import path
+
+```
+Azure Resource Graph  →  normalize  →  WorldEntity + DependencyEdge  →  the same engines
+```
+
+There is no Azure-specific analysis path, and that is the point of the design: an Azure
+resource becomes an ordinary `WorldEntity`, and traversal, blast radius, risk, simulation
+and the AI layer operate on it unchanged.
+
+Three modules, each with one job:
+
+| Module | Responsibility |
+|---|---|
+| `adapters/azure_regions.py` | Region → approximate coordinates. Returns `None` for an unrecognised region: an entity at the wrong place on a globe is worse than one with no place, because a wrong marker invites a conclusion. |
+| `adapters/azure_tags.py` | The `worldgraph.*` namespace. Optional, explicit, validated, read-only. A malformed value is rejected and reported, never guessed at. |
+| `adapters/azure_inventory.py` | Query, sanitize, normalize, infer defensible edges, assess coverage. |
+
+**Edges only where something proves one.** A resource's `location` proves `HOSTED_IN`; an
+explicit resource-id reference in its configuration proves `CONNECTS_TO`; a human's
+`worldgraph.depends_on` tag declares `DEPENDS_ON` — the only edge inventory can never
+justify on its own. A shared resource group, region, naming prefix or creation time proves
+nothing and produces nothing. Every edge carries `{source, method, confidence}` so a reader
+can always separate what Azure proved from what a person asserted.
+
+**Coverage is reported per dimension, never as one score.** Averaging "complete hosting
+topology" with "nothing about business services" yields a number that looks precise and
+means nothing; the operator needs the shape of the gap, because that is what says which tag
+to add.
+
+See `SECURITY.md` §9 for the read-only, secret-handling and tag-trust properties, and
+`docs/REALITY_PASS_REPORT.md` for what has and has not actually been verified.
+
+---
+
 ## Extension points (designed, not built)
 
 The non-goals list is long on purpose. What exists is the seam, not the integration:
@@ -238,8 +300,11 @@ The non-goals list is long on purpose. What exists is the seam, not the integrat
 | A new AI capability | Register a `Tool` with a Pydantic schema |
 | A different impact model | Replace `propagation.py`; its interface is two dicts |
 
-Not built: CMDB/ServiceNow/Datadog/AWS/Azure/GCP inventory sync, production remediation
-execution, Neo4j, RBAC, billing, multi-tenancy.
+| An inventory source for a new provider | Return `(entities, edges, ImportSummary)`; register a `Workspace` from `Settings` |
+
+Not built: CMDB/ServiceNow/Datadog/AWS/GCP inventory sync, production remediation
+execution, Neo4j, RBAC, billing, multi-tenancy. Azure inventory import **is** built, and is
+read-only.
 
 ---
 

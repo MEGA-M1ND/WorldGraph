@@ -40,51 +40,131 @@ def material_risks(graph: WorldGraph, events: list[WorldEvent] | None = None) ->
     return risks[:MAX_RISKS]
 
 
+#: Share of an estate's hosted workloads in one region, above which the concentration is
+#: a finding even with no traffic metadata at all.
+_COUNT_CONCENTRATION_THRESHOLD = 0.4
+
+#: Minimum hosted workloads before a count-based concentration is worth reporting. Below
+#: this, "60% of your estate is in one region" describes three resources and is noise.
+_MIN_HOSTED_FOR_COUNT = 4
+
+
 def _concentration_risks(graph: WorldGraph) -> list[MaterialRisk]:
-    """Regions carrying a disproportionate share of critical traffic."""
+    """Regions carrying a disproportionate share of the estate.
+
+    Two paths, because two kinds of estate exist:
+
+    * **Declared traffic** — a modelled estate says what share of load sits where, and
+      concentration is measured in traffic.
+    * **Counted workloads** — an imported cloud inventory declares no traffic at all. The
+      Reality Pass found that this made single-region concentration *structurally
+      invisible* for exactly the estates where it is the most valuable finding
+      (docs/REALITY_PASS_AUDIT.md, B15). Counting hosted workloads needs no business
+      metadata, and "most of your estate is in one region" is a defensible statement about
+      inventory rather than an inference about revenue.
+
+    The two are never mixed into one number: each produces its own named contribution, so
+    a reader can see which kind of evidence the score rests on.
+    """
     out: list[MaterialRisk] = []
+    total_hosted = sum(
+        len(graph.hosted_entities(region.id))
+        for region in graph.entities_of_type(EntityType.CLOUD_REGION)
+    )
+
     for region in graph.entities_of_type(EntityType.CLOUD_REGION):
         hosted = graph.hosted_entities(region.id)
+        if not hosted:
+            continue
         critical = [e for e in hosted if e.criticality is Criticality.CRITICAL]
-        traffic = sum(e.business.traffic_share for e in hosted)
-        if traffic < _CONCENTRATION_THRESHOLD or not critical:
+        declared_traffic = [e for e in hosted if e.business.has_traffic]
+        traffic = sum(e.business.traffic_share or 0.0 for e in declared_traffic)
+        share_of_estate = len(hosted) / total_hosted if total_hosted else 0.0
+
+        traffic_qualifies = traffic >= _CONCENTRATION_THRESHOLD and bool(critical)
+        count_qualifies = (
+            not declared_traffic
+            and len(hosted) >= _MIN_HOSTED_FOR_COUNT
+            and share_of_estate >= _COUNT_CONCENTRATION_THRESHOLD
+        )
+        if not (traffic_qualifies or count_qualifies):
             continue
 
-        # Score the concentration: how much traffic sits here, how much of it is
-        # CRITICAL, and how far the loss would travel.
         reach = graph.traverse_dependents([region.id], max_depth=6)
         downstream = len(reach.steps) - 1
-        contributions = [
-            ScoreContribution(
-                code="traffic_concentration",
-                label=f"{traffic * 100:.0f}% of modelled traffic in one region",
-                points=round(min(45.0, traffic * 110.0), 1),
-                detail=", ".join(sorted(e.name for e in hosted)[:4]),
-            ),
-            ScoreContribution(
-                code="critical_workloads",
-                label=f"{len(critical)} critical workloads co-located",
-                points=round(min(25.0, len(critical) * 9.0), 1),
-                detail=", ".join(sorted(e.name for e in critical)[:3]),
-            ),
+        contributions: list[ScoreContribution] = []
+
+        if traffic_qualifies:
+            contributions.append(
+                ScoreContribution(
+                    code="traffic_concentration",
+                    label=f"{traffic * 100:.0f}% of modelled traffic in one region",
+                    points=round(min(45.0, traffic * 110.0), 1),
+                    detail=", ".join(sorted(e.name for e in hosted)[:4]),
+                )
+            )
+            headline = (
+                f"{traffic * 100:.0f}% of modelled traffic and {len(critical)} critical "
+                f"workloads sit in {region.name}."
+            )
+        else:
+            contributions.append(
+                ScoreContribution(
+                    code="workload_concentration",
+                    label=(
+                        f"{len(hosted)} of {total_hosted} discovered workloads "
+                        f"({share_of_estate * 100:.0f}%) in one region"
+                    ),
+                    points=round(min(40.0, share_of_estate * 60.0), 1),
+                    detail=", ".join(sorted(e.name for e in hosted)[:4]),
+                )
+            )
+            headline = (
+                f"{len(hosted)} of {total_hosted} discovered workloads "
+                f"({share_of_estate * 100:.0f}%) sit in {region.name}."
+            )
+
+        if critical:
+            contributions.append(
+                ScoreContribution(
+                    code="critical_workloads",
+                    label=f"{len(critical)} critical workloads co-located",
+                    points=round(min(25.0, len(critical) * 9.0), 1),
+                    detail=", ".join(sorted(e.name for e in critical)[:3]),
+                )
+            )
+        contributions.append(
             ScoreContribution(
                 code="downstream_reach",
                 label=f"loss reaches {downstream} downstream entities",
                 points=round(min(20.0, downstream * 1.6), 1),
-            ),
-        ]
+            )
+        )
+        if not declared_traffic:
+            # Say what the score does not rest on. Without it, a count-based finding reads
+            # as though business impact was weighed and it was not.
+            contributions.append(
+                ScoreContribution(
+                    code="no_traffic_metadata",
+                    label="no traffic metadata to weight this by",
+                    points=0.0,
+                    detail="concentration measured by workload count, not by load",
+                )
+            )
+
         score = min(100.0, sum(c.points for c in contributions))
         out.append(
             MaterialRisk(
                 id=f"risk-concentration-{region.id}",
-                title=f"{_short_region(region.name)} payments concentration",
+                title=f"{_short_region(region.name)} concentration",
                 severity=severity_from_score(score),
                 summary=(
-                    f"{traffic * 100:.0f}% of modelled traffic and {len(critical)} critical "
-                    f"workloads sit in {region.name}. Losing the region reaches "
-                    f"{downstream} downstream entities."
+                    f"{headline} Losing the region reaches {downstream} downstream entities."
                 ),
-                focus_entity_ids=[region.id, *sorted(e.id for e in critical)[:3]],
+                focus_entity_ids=[
+                    region.id,
+                    *sorted(e.id for e in (critical or hosted))[:3],
+                ],
                 contributions=contributions,
                 score=round(score, 1),
             )

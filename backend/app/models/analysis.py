@@ -89,7 +89,8 @@ class ImpactedEntity(BaseModel):
     projected_health: HealthState
     #: Shortest/worst path that explains this entity's state.
     path: ImpactPath
-    customer_facing: bool = False
+    #: Tri-state. ``None`` means nobody declared it — see business_impact.is_customer_facing.
+    customer_facing: bool | None = None
 
 
 class CustomerExposure(BaseModel):
@@ -108,23 +109,52 @@ class CustomerExposure(BaseModel):
 
 
 class BusinessImpact(BaseModel):
-    """Aggregate modelled business consequence. Always labelled as an estimate."""
+    """Aggregate modelled business consequence. Always labelled as an estimate.
+
+    **``None`` means WorldGraph does not know, and it is never rendered as a number.**
+    The Reality Pass found this class returning ``availability = 1.0`` and
+    ``revenue_at_risk = 0`` for an estate it had just modelled as entirely degraded,
+    purely because the estate declared no customer regions
+    (docs/REALITY_PASS_AUDIT.md, B1/B2). Every nullable field below is one WorldGraph used
+    to invent, and :attr:`unknown_reasons` says why each is missing.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    #: Organisation-wide availability, weighted by traffic share, 0-1.
-    availability: float = Field(ge=0.0, le=1.0)
-    #: Fraction of total organisation traffic degraded, 0-1.
-    traffic_impact: float = Field(ge=0.0, le=1.0)
-    customers_affected: int = Field(ge=0)
-    #: Modelled revenue at risk per hour while the condition holds.
-    revenue_at_risk_per_hour: float = Field(ge=0.0)
+    #: Availability *as customers experience it* — traffic-weighted across customer
+    #: regions. ``None`` when no customer regions or traffic shares are declared, because
+    #: there is then nothing to weight and no customer to speak for.
+    availability: float | None = Field(default=None, ge=0.0, le=1.0)
+    #: Fraction of total organisation traffic degraded, 0-1. ``None`` when undeclared.
+    traffic_impact: float | None = Field(default=None, ge=0.0, le=1.0)
+    customers_affected: int | None = Field(default=None, ge=0)
+    #: Modelled revenue at risk per hour while the condition holds. ``None`` when the
+    #: estate declares no revenue metadata.
+    revenue_at_risk_per_hour: float | None = Field(default=None, ge=0.0)
+
+    #: Availability of the *infrastructure itself*, weighted by declared traffic where
+    #: available and otherwise counted evenly. Always computable, because it needs only
+    #: the graph — which is precisely what a cloud import does give us.
+    infrastructure_availability: float = Field(ge=0.0, le=1.0)
+
     #: Ids of entities whose SLA tier is breached under the modelled availability.
     sla_breaches: list[str] = Field(default_factory=list)
+    #: Countable facts. These need no business metadata, so they are never ``None``.
     critical_services_impacted: int = Field(ge=0)
     customer_regions_impacted: int = Field(ge=0)
+    impacted_entity_count: int = Field(default=0, ge=0)
+
+    #: One entry per figure WorldGraph could not compute, naming the missing input.
+    #: The UI renders these beside the UNKNOWNs so a gap is actionable, not mysterious.
+    unknown_reasons: list[str] = Field(default_factory=list)
+
     #: Present on every instance; the API contract guarantees the caller sees it.
     disclaimer: Literal["MODELLED ESTIMATE"] = "MODELLED ESTIMATE"
+
+    @property
+    def has_customer_view(self) -> bool:
+        """Whether a customer-experienced availability could be computed at all."""
+        return self.availability is not None
 
 
 class Confidence(BaseModel):
@@ -252,18 +282,27 @@ class SimulationScenario(BaseModel):
 
 
 class WorldSnapshotMetrics(BaseModel):
-    """The headline numbers for one world state (baseline or simulated)."""
+    """The headline numbers for one world state (baseline or simulated).
+
+    Nullable for the same reason :class:`BusinessImpact` is: an estate with no business
+    metadata has no customer-experienced availability, and printing 100 % would be a
+    fabrication rather than a reassurance.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    availability: float = Field(ge=0.0, le=1.0)
+    #: Customer-experienced availability. ``None`` when undeclared.
+    availability: float | None = Field(default=None, ge=0.0, le=1.0)
+    #: Availability of the infrastructure itself. Always computable from the graph.
+    infrastructure_availability: float = Field(default=1.0, ge=0.0, le=1.0)
     #: Serviceable share of capacity in each named region, 0-1.
     regional_capacity: dict[str, float] = Field(default_factory=dict)
     critical_services_impacted: int = 0
     customer_regions_impacted: int = 0
-    customers_affected: int = 0
-    revenue_at_risk_per_hour: float = 0.0
+    customers_affected: int | None = None
+    revenue_at_risk_per_hour: float | None = None
     material_risk: Severity = Severity.LOW
+    unknown_reasons: list[str] = Field(default_factory=list)
     disclaimer: Literal["MODELLED ESTIMATE"] = "MODELLED ESTIMATE"
 
 
