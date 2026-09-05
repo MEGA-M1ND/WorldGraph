@@ -32,6 +32,12 @@ from ..models.analysis import (
 )
 from ..models.core import DataMode, HealthState, utcnow
 
+#: How much availability an entity must lose before a scenario is credited with causing it.
+#:
+#: Small enough to catch a real cascade, large enough that solver noise and rounding do not
+#: populate the "newly impacted" list with entities nobody touched.
+MATERIAL_DEGRADATION = 0.005
+
 
 class SimulationError(ValueError):
     """An override that cannot be applied — an unknown entity or edge."""
@@ -140,8 +146,18 @@ def compare(
 
     newly_impacted: list[ImpactedEntity] = []
     for entity_id in sim_state.impacted_ids(threshold=impact_threshold):
-        if baseline_state.availability.get(entity_id, 1.0) < impact_threshold:
-            continue  # already degraded before the scenario; not caused by it
+        baseline_availability = baseline_state.availability.get(entity_id, 1.0)
+        # "New" means *this scenario* made it worse, measured against the entity's own
+        # baseline rather than an absolute line.
+        #
+        # The absolute test — skip anything already below the threshold — is correct only
+        # for an estate that declares its health. An imported cloud estate declares none,
+        # so every entity sits at UNKNOWN (0.9) and inherits less through its edges;
+        # everything therefore started "already degraded" and *nothing* was ever reported
+        # as newly impacted, whatever the operator failed. That made what-if analysis
+        # silently useless on real inventory (docs/REALITY_PASS_REPORT.md §7).
+        if baseline_availability - sim_state.availability.get(entity_id, 1.0) < MATERIAL_DEGRADATION:
+            continue  # unchanged, or moved by less than rounding; not caused by this scenario
         entity = sim_graph.entity(entity_id)
         if entity is None:
             continue

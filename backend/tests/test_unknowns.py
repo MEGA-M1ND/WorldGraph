@@ -535,3 +535,86 @@ class TestAnalystOnAnUndeclaredEstate:
 
         for word in ("singapore", "frankfurt", "westeurope", "jurong", "taiwan"):
             assert word not in _TYPE_VOCABULARY, word
+
+
+class TestSimulationOnAnUndeclaredEstate:
+    """"Newly impacted" must mean "this scenario made it worse", not "it crossed a line".
+
+    An estate that declares no health sits at UNKNOWN (0.9) and inherits less through its
+    edges, so every entity is already below the impact threshold at baseline. Measured
+    against an absolute line, *nothing* was ever newly impacted however much a scenario
+    degraded it — what-if analysis was silently useless on real inventory.
+    """
+
+    @staticmethod
+    def _down(target: str):
+        from app.models.analysis import OverrideKind, SimulationOverride
+        from app.models.core import HealthState
+        from app.simulation.engine import new_scenario
+
+        scenario = new_scenario("region loss")
+        scenario.overrides.append(
+            SimulationOverride(
+                id="o1",
+                kind=OverrideKind.ENTITY_HEALTH,
+                target_id=target,
+                health=HealthState.DOWN,
+            )
+        )
+        return scenario
+
+    def test_everything_starts_below_the_threshold(self, imported_graph: WorldGraph):
+        from app.analysis.propagation import IMPACT_THRESHOLD
+
+        state = propagate(imported_graph)
+        # The precondition that made the old absolute test wrong.
+        assert all(value < IMPACT_THRESHOLD for value in state.availability.values())
+
+    def test_a_scenario_still_reports_what_it_degraded(self, imported_graph: WorldGraph):
+        from app.simulation.engine import compare
+
+        comparison = compare(imported_graph, self._down("region-southeastasia"))
+        impacted = {row.entity_id for row in comparison.newly_impacted}
+
+        assert "region-southeastasia" in impacted
+        # The workloads it hosts moved too, and saying so is the whole point of a what-if.
+        assert {"aks-prod", "sql-prod", "web-app"} <= impacted
+
+    def test_an_untouched_entity_is_not_reported(self, imported_graph: WorldGraph):
+        from app.simulation.engine import compare
+
+        imported_graph.add_entity(
+            imported("unrelated-app", EntityType.APPLICATION, region="eastus")
+        )
+        comparison = compare(imported_graph, self._down("region-southeastasia"))
+
+        # Nothing connects it to the failure, so the scenario gets no credit for it.
+        assert "unrelated-app" not in {r.entity_id for r in comparison.newly_impacted}
+
+    def test_customer_figures_stay_unknown_through_a_simulation(
+        self, imported_graph: WorldGraph
+    ):
+        from app.simulation.engine import compare
+
+        comparison = compare(imported_graph, self._down("region-southeastasia"))
+        assert comparison.simulated.availability is None
+        assert comparison.simulated.customers_affected is None
+        assert comparison.simulated.revenue_at_risk_per_hour is None
+        # The figure the graph alone supports is real, and it got worse.
+        assert (
+            comparison.simulated.infrastructure_availability
+            < comparison.baseline.infrastructure_availability
+        )
+
+    def test_atlaspay_newly_impacted_sets_are_unchanged(self, atlaspay_graph: WorldGraph):
+        """Pinned exactly. The rule changed; AtlasPay's answers did not."""
+        from app.simulation.engine import compare
+
+        expected = {
+            "supplier-taiwan-hardware": 17,
+            "payments-k8s-singapore": 13,
+            "cloud-region-singapore": 19,
+        }
+        for target, count in expected.items():
+            comparison = compare(atlaspay_graph, self._down(target))
+            assert len(comparison.newly_impacted) == count, target

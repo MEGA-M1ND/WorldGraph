@@ -306,6 +306,75 @@ class TestWorkspaceApi:
         assert impacted
         assert all(i["entity_id"].startswith("az.") for i in impacted)
 
+    def test_a_simulation_runs_end_to_end_on_an_imported_estate(self, multi_client):
+        """The full what-if flow, on an estate that declares no business metadata.
+
+        This is the shape of bug the Reality Pass keeps finding: every step returns 200
+        against AtlasPay, and the compare step used to 500 against an imported estate
+        because the timeline entry formatted a null availability as a percentage. Only
+        exercising the whole flow against a second estate catches it.
+        """
+        multi_client.post("/api/workspaces/azure-snapshot/import")
+        params = {"workspace": "azure-snapshot"}
+
+        scenario = multi_client.post(
+            "/api/simulation", params=params, json={"name": "region loss"}
+        ).json()
+        added = multi_client.post(
+            f"/api/simulation/{scenario['id']}/overrides",
+            params=params,
+            json={
+                "target_id": "az.region.westeurope",
+                "kind": "ENTITY_HEALTH",
+                "health": "DOWN",
+            },
+        )
+        assert added.status_code == 200
+
+        response = multi_client.get(
+            f"/api/simulation/{scenario['id']}/compare", params=params
+        )
+        assert response.status_code == 200, response.json()
+        comparison = response.json()
+
+        # The simulated world is measurably worse than the baseline on the figure this
+        # estate can actually support...
+        assert (
+            comparison["simulated"]["infrastructure_availability"]
+            < comparison["baseline"]["infrastructure_availability"]
+        )
+        # ...and the customer-facing figures stay UNKNOWN rather than becoming zero.
+        assert comparison["simulated"]["availability"] is None
+        assert comparison["simulated"]["customers_affected"] is None
+        assert comparison["simulated"]["revenue_at_risk_per_hour"] is None
+        assert comparison["newly_impacted"]
+
+    def test_the_simulation_timeline_never_formats_a_missing_figure(self, multi_client):
+        multi_client.post("/api/workspaces/azure-snapshot/import")
+        params = {"workspace": "azure-snapshot"}
+        scenario = multi_client.post(
+            "/api/simulation", params=params, json={"name": "timeline probe"}
+        ).json()
+        multi_client.post(
+            f"/api/simulation/{scenario['id']}/overrides",
+            params=params,
+            json={
+                "target_id": "az.region.westeurope",
+                "kind": "ENTITY_HEALTH",
+                "health": "DOWN",
+            },
+        )
+        multi_client.get(f"/api/simulation/{scenario['id']}/compare", params=params)
+
+        entries = multi_client.get("/api/timeline", params=params).json()
+        simulate = [e for e in entries if e["stage"] == "simulate"]
+        assert simulate
+        message = simulate[0]["message"]
+        # Relabelled, not coerced: an infrastructure number must not appear under a
+        # customer heading, and UNKNOWN must not appear as a percentage.
+        assert "infrastructure availability" in message
+        assert "UNKNOWN" in message
+
     def test_no_azure_configuration_reaches_the_client_config(self, multi_client):
         payload = multi_client.get("/api/config").json()
         assert "azure" not in json.dumps(payload).lower()

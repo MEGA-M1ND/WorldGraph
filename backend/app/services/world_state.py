@@ -68,6 +68,28 @@ logger = logging.getLogger("worldgraph.state")
 TIMELINE_MEMORY_LIMIT = 500
 
 
+def _availability_move(
+    baseline: WorldSnapshotMetrics, simulated: WorldSnapshotMetrics
+) -> str:
+    """"availability 100.00% → 90.45%", against whichever figure the estate supports.
+
+    Prefers the customer-experienced availability and falls back to the infrastructure
+    one, *relabelled* — reporting an infrastructure number under a customer heading is the
+    same fabrication in a different sentence.
+    """
+    if baseline.availability is not None and simulated.availability is not None:
+        return (
+            f"availability {baseline.availability * 100:.2f}% → "
+            f"{simulated.availability * 100:.2f}%"
+        )
+    return (
+        f"infrastructure availability "
+        f"{baseline.infrastructure_availability * 100:.2f}% → "
+        f"{simulated.infrastructure_availability * 100:.2f}% "
+        "(customer-experienced availability UNKNOWN for this workspace)"
+    )
+
+
 class WorldState:
     """The live world model."""
 
@@ -503,10 +525,13 @@ class WorldState:
         comparison = compare_scenario(self.graph, scenario)
         self._record_timeline(
             stage="simulate",
+            # Quote whichever availability this estate can actually support. The
+            # customer-experienced figure is None wherever no customer regions are
+            # declared, and multiplying that by 100 crashed the compare endpoint on an
+            # imported estate (docs/REALITY_PASS_REPORT.md §7).
             message=(
-                f"Simulation '{scenario.name}' — availability "
-                f"{comparison.baseline.availability * 100:.2f}% → "
-                f"{comparison.simulated.availability * 100:.2f}%, "
+                f"Simulation '{scenario.name}' — "
+                f"{_availability_move(comparison.baseline, comparison.simulated)}, "
                 f"risk {comparison.simulated.material_risk.value}."
             ),
             event_id=scenario.origin_event_id,
