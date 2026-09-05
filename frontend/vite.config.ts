@@ -28,14 +28,21 @@ export default defineConfig({
       })),
     }),
   ],
+  // Same-origin `/api` in dev and preview alike, so no CORS preflight and no
+  // environment-specific base URL in the client bundle.
   server: {
     port: 5173,
     strictPort: true,
-    proxy: {
-      // Same-origin `/api` in dev and prod alike, so no CORS preflight and no
-      // environment-specific base URL in the client bundle.
-      '/api': { target: BACKEND, changeOrigin: true },
-    },
+    proxy: { '/api': { target: BACKEND, changeOrigin: true } },
+  },
+  // `preview` serves the built bundle. CI drives the E2E suite against this rather than
+  // the dev server: it is what users actually get, and Vite's cold dev start has to
+  // transform ~1500 Cesium modules, which overran Playwright's webServer timeout on a
+  // runner. Testing the artifact is both faster and more truthful.
+  preview: {
+    port: 5173,
+    strictPort: true,
+    proxy: { '/api': { target: BACKEND, changeOrigin: true } },
   },
   build: {
     target: 'es2022',

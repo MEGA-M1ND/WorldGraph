@@ -128,6 +128,12 @@ jobs:
         working-directory: frontend
         run: npm ci
 
+      - name: Build frontend
+        working-directory: frontend
+        # E2E runs against the production bundle, not the dev server: it is the artifact
+        # users receive, and it starts fast enough to be worth waiting for.
+        run: npm run build
+
       - name: Install Playwright browser
         working-directory: frontend
         run: npx playwright install --with-deps chromium
@@ -150,6 +156,8 @@ jobs:
 
       - name: Run E2E suite
         working-directory: frontend
+        env:
+          WORLDGRAPH_E2E_COMMAND: "npm run preview -- --port 5173 --strictPort"
         run: npx playwright test
 
       - name: Upload Playwright report

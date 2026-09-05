@@ -47,9 +47,16 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: 'npm run dev',
+    // Locally this is the dev server (instant HMR while iterating). CI sets
+    // WORLDGRAPH_E2E_COMMAND to serve the production build instead, which is both the
+    // artifact users receive and fast enough to start inside the timeout — a cold Vite
+    // dev start transforming ~1500 Cesium modules is not.
+    command: process.env.WORLDGRAPH_E2E_COMMAND ?? 'npm run dev',
     url: 'http://127.0.0.1:5173',
-    reuseExistingServer: true,
-    timeout: 60_000,
+    reuseExistingServer: !process.env.CI,
+    // Generous even for preview: a cold runner still has to boot Node and read the bundle.
+    timeout: 180_000,
+    stdout: 'pipe',
+    stderr: 'pipe',
   },
 });
