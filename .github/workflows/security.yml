@@ -1,0 +1,124 @@
+name: Security
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  schedule:
+    # Weekly, so a dependency advisory published after merge is still caught.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  no-secrets-in-bundle:
+    name: No credentials reach the browser
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build the frontend with decoy credentials in the environment
+        working-directory: frontend
+        # The point of the decoys: if any build step ever starts inlining process.env,
+        # these strings appear in the bundle and the grep below fails. A build with a
+        # clean environment could not detect that regression.
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+          WORLDGRAPH_ANTHROPIC_API_KEY: "sk-ant-CANARY-must-never-be-bundled"
+          AZURE_CLIENT_SECRET: "azure-CANARY-must-never-be-bundled"
+          AZURE_TENANT_ID: "tenant-CANARY-must-never-be-bundled"
+        run: |
+          npm ci
+          npm run build
+
+      - name: Assert no canary or credential shape is present
+        working-directory: frontend
+        run: |
+          set -euo pipefail
+          fail=0
+          for needle in "CANARY-must-never-be-bundled" "sk-ant-" "AZURE_CLIENT_SECRET" "client_secret"; do
+            if grep -rIF -- "$needle" dist/ >/dev/null 2>&1; then
+              echo "::error::'$needle' found in the built frontend bundle"
+              grep -rIFl -- "$needle" dist/ || true
+              fail=1
+            fi
+          done
+          if [ "$fail" -ne 0 ]; then exit 1; fi
+          echo "Bundle is clean: no credential-shaped string present."
+
+  frontend-has-no-cloud-sdk:
+    name: Cloud SDKs stay server-side
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assert the frontend imports no cloud or model SDK
+        run: |
+          set -euo pipefail
+          # Azure/AWS/GCP SDKs and the Anthropic SDK belong in the backend. An import in
+          # frontend/src is the shape of a credential leak before it becomes one.
+          if grep -rnE "from ['\"]@azure/|from ['\"]@aws-sdk/|from ['\"]@google-cloud/|from ['\"]@anthropic-ai/" frontend/src; then
+            echo "::error::A cloud or model SDK is imported in the frontend"
+            exit 1
+          fi
+          # The backend owns credential custody; the client talks to same-origin /api.
+          if grep -rniE "DefaultAzureCredential|AZURE_CLIENT_SECRET|ANTHROPIC_API_KEY" frontend/src; then
+            echo "::error::A credential identifier appears in frontend source"
+            exit 1
+          fi
+          echo "Frontend source is free of cloud SDKs and credential identifiers."
+
+  no-committed-env:
+    name: No environment file is committed
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          set -euo pipefail
+          if git ls-files | grep -E '(^|/)\.env($|\.)' | grep -v '\.env\.example'; then
+            echo "::error::An environment file is tracked in git"
+            exit 1
+          fi
+          echo "No .env file is tracked."
+
+  dependency-audit:
+    name: Dependency advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Python advisories (pip-audit)
+        working-directory: backend
+        # Advisory feeds move independently of this repository, so a new advisory must not
+        # turn every unrelated PR red. Reported, not enforced; the weekly schedule is what
+        # makes it visible.
+        continue-on-error: true
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          pip-audit -r requirements.txt --strict || true
+
+      - name: npm advisories
+        working-directory: frontend
+        continue-on-error: true
+        run: npm audit --audit-level=high || true
