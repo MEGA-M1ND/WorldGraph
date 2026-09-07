@@ -64,6 +64,13 @@ MAX_ITERATIONS = 64
 #: from a partially-redundant dependency and would clutter every result.
 IMPACT_THRESHOLD = 0.999
 
+#: How much availability an entity must lose before a failure is credited with causing it.
+#:
+#: Small enough to catch a real cascade, large enough that solver noise and rounding do not
+#: attribute entities nobody touched. Shared by the blast-radius and simulation engines so
+#: the two cannot drift apart — they did, and the blast radius was the one that was wrong.
+MATERIAL_DEGRADATION = 0.005
+
 
 @dataclass(slots=True)
 class ResolvedInput:
@@ -100,8 +107,39 @@ class PropagationState:
             entity_id, 1.0
         )
 
+    def caused_ids(
+        self,
+        *,
+        threshold: float = IMPACT_THRESHOLD,
+        minimum_loss: float = MATERIAL_DEGRADATION,
+    ) -> list[str]:
+        """Entities this propagation actually *made worse*, worst first.
+
+        The difference from :meth:`impacted_ids` is attribution, and it is the whole
+        point. ``impacted_ids`` answers "what is degraded", which is the right question
+        for a dashboard. This answers "what did the thing I just failed degrade", which is
+        the only honest basis for a blast radius.
+
+        On an estate that declares its health the two nearly agree, because everything
+        starts at 1.0. On an imported estate they diverge completely: every entity starts
+        at UNKNOWN (0.9) and inherits less through its edges, so *everything* is already
+        below the threshold and ``impacted_ids`` returns the entire graph no matter what
+        failed — including entities with no edge to the origin at all.
+        """
+        hits = [
+            entity_id
+            for entity_id, value in self.availability.items()
+            if value < threshold and self.delta(entity_id) >= minimum_loss
+        ]
+        hits.sort(key=lambda entity_id: (self.availability.get(entity_id, 1.0), entity_id))
+        return hits
+
     def impacted_ids(self, *, threshold: float = IMPACT_THRESHOLD) -> list[str]:
-        """Entities whose availability sits below ``threshold``, worst first."""
+        """Entities whose availability sits below ``threshold``, worst first.
+
+        Absolute, not causal: this is "what is degraded right now", which is what a
+        dashboard wants. For "what did this failure cause", use :meth:`caused_ids`.
+        """
         hits = [
             entity_id for entity_id, value in self.availability.items() if value < threshold
         ]

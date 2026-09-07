@@ -17,7 +17,11 @@ import uuid
 
 from ..analysis.blast_radius import calculate_blast_radius
 from ..analysis.business_impact import snapshot_metrics
-from ..analysis.propagation import IMPACT_THRESHOLD, propagate
+from ..analysis.propagation import (
+    IMPACT_THRESHOLD,
+    MATERIAL_DEGRADATION,
+    propagate,
+)
 from ..graph.world_graph import WorldGraph
 from ..models.analysis import (
     ImpactedEntity,
@@ -31,12 +35,6 @@ from ..models.analysis import (
     WorldSnapshotMetrics,
 )
 from ..models.core import DataMode, HealthState, utcnow
-
-#: How much availability an entity must lose before a scenario is credited with causing it.
-#:
-#: Small enough to catch a real cascade, large enough that solver noise and rounding do not
-#: populate the "newly impacted" list with entities nobody touched.
-MATERIAL_DEGRADATION = 0.005
 
 
 class SimulationError(ValueError):
