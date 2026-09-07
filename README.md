@@ -141,12 +141,12 @@ The first-run launcher offers four starting points. Each is reproducible to the 
 2. Click **Analyze impact**. The globe reframes on Taiwan, recolours the estate, and animates
    the consequence travelling outward:
    `Taiwan Hardware Supplier → payments-k8s-singapore → payments-api → checkout-platform → Customer-facing payments → APAC customers`
-3. Read the risk — **HIGH, 73/100** — with its full derivation, not a number:
+3. Read the risk — **HIGH, 68.7/100** — with its full derivation, not a number:
    ```
-   +19  critical asset impacted        Taiwan Hardware Supplier at 40% availability
+   +18  critical asset impacted        Taiwan Hardware Supplier at 40% availability
     +3  customer-facing service degraded
-   +13  single-region dependency with no failover
-   +14  event proximity to enterprise assets
+   +12  single-region dependency with no failover
+   +13  event proximity to enterprise assets
    +11  high severity event
     +3  customer traffic exposure
    +10  deep dependency propagation
