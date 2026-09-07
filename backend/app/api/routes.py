@@ -555,18 +555,37 @@ def security_attack_paths(
         "from": from_entity_id,
         "to": to_entity_id or None,
         "count": len(paths),
+        "established_count": sum(1 for path in paths if not path.relies_on_inference),
+        "inferred_count": sum(1 for path in paths if path.relies_on_inference),
         "paths": [
             {
-                "ids": path,
+                "ids": path.nodes,
                 "names": [
-                    (entity.name if (entity := state.entity(node)) else node) for node in path
+                    (entity.name if (entity := state.entity(node)) else node)
+                    for node in path.nodes
+                ],
+                "basis": path.basis,
+                "confidence": round(path.confidence, 2),
+                "hops": [
+                    {
+                        "from": hop.from_entity_id,
+                        "to": hop.to_entity_id,
+                        "edge_type": hop.edge_type.value,
+                        "movement": hop.movement,
+                        "confidence": hop.confidence,
+                        "evidence": hop.evidence,
+                    }
+                    for hop in path.hops
                 ],
             }
             for path in paths[:20]
         ],
         "disclaimer": (
             "Reachability, not exploitability. WorldGraph models declared network adjacency; "
-            "it does not test authentication, network policy or whether an exploit works."
+            "it does not test authentication, network policy or whether an exploit works. "
+            "A path marked INFERRED relies on a hop where an operational dependency was "
+            "read as a trust relationship — real for an auth service, false for a database, "
+            "and inventory cannot tell them apart."
         ),
     }
 

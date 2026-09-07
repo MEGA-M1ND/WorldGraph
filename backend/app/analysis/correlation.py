@@ -282,36 +282,127 @@ def match_vulnerable_assets(
     return matches
 
 
-#: Edge types an attacker can traverse *forwards*, from a foothold to what it talks to.
-_EGRESS_TYPES = frozenset(
-    {DependencyType.DEPENDS_ON, DependencyType.CONNECTS_TO, DependencyType.HOSTED_IN}
-)
+#: The pseudo-entity representing the public internet. Internet-facing services declare a
+#: route to it, which makes "what can the outside reach" an ordinary graph query.
+INTERNET_ENTITY_ID = "internet"
 
 
-def _attacker_successors(graph: WorldGraph, node_id: str) -> list[str]:
-    """Where an attacker sitting on ``node_id`` can go next.
+@dataclass(slots=True)
+class AttackHop:
+    """One step of a reachability path, carrying why it is traversable."""
 
-    Two movements, and the second is the one naive models miss:
+    from_entity_id: str
+    to_entity_id: str
+    edge_type: DependencyType
+    #: EGRESS (this asset talks to that one) or INFERRED_TRUST (that one relies on this).
+    movement: str
+    confidence: float
+    evidence: str
 
-    * **Egress** — what this asset talks to. ``admin-api DEPENDS_ON internal-auth`` means
-      a foothold on ``admin-api`` can reach ``internal-auth``.
-    * **Trust** — who accepts this asset's word. ``payments-api DEPENDS_ON internal-auth``
-      means ``payments-api`` trusts ``internal-auth``, so an attacker who owns the auth
-      service can move *against the arrow* into payments. Following egress alone would
-      report the payments path as unreachable, which is exactly the wrong answer.
+    @property
+    def is_inferred(self) -> bool:
+        return self.movement == MOVEMENT_INFERRED_TRUST
 
-    ``SUPPLIED_BY``, ``SERVES`` and ``REPLICATES_TO`` are excluded: a supply contract and a
-    customer relationship are not network adjacency.
+
+@dataclass(slots=True)
+class AttackPath:
+    """A route from an origin to a target, and how much of it is established.
+
+    ``confidence`` is the weakest hop, not an average: a path is only as good as its most
+    doubtful step, and averaging lets four solid hops disguise one invented one.
     """
-    successors: list[str] = []
+
+    nodes: list[str]
+    hops: list[AttackHop]
+
+    @property
+    def confidence(self) -> float:
+        return min((hop.confidence for hop in self.hops), default=0.0)
+
+    @property
+    def relies_on_inference(self) -> bool:
+        return any(hop.is_inferred for hop in self.hops)
+
+    @property
+    def basis(self) -> str:
+        return "INFERRED" if self.relies_on_inference else "ESTABLISHED"
+
+
+#: Edge types an attacker can traverse *forwards*, from a foothold to what it talks to.
+#:
+#: ``HOSTED_IN`` is deliberately absent. Being in a datacenter is not network adjacency to
+#: the datacenter, and WorldGraph models no hypervisor, host OS or control plane through
+#: which "move into the region you run in" would mean anything. It was a hop that added
+#: nodes to paths without adding evidence.
+_EGRESS_TYPES = frozenset({DependencyType.DEPENDS_ON, DependencyType.CONNECTS_TO})
+
+#: How an attacker got from one node to the next, and how much that claim is worth.
+MOVEMENT_EGRESS = "EGRESS"
+MOVEMENT_INFERRED_TRUST = "INFERRED_TRUST"
+
+
+def _attacker_successors(graph: WorldGraph, node_id: str) -> list[tuple[str, AttackHop]]:
+    """Where an attacker on ``node_id`` can go next, and on what evidence.
+
+    Two movements, and they are not worth the same.
+
+    **Egress** is what this asset talks to. ``admin-api DEPENDS_ON internal-auth`` means a
+    foothold on ``admin-api`` can reach ``internal-auth``: the dependency itself is the
+    evidence that a route exists.
+
+    **Trust** is the reverse direction — an attacker who owns a service moving into what
+    relies on it. That is real for an authentication service and false for a database, and
+    an operational dependency edge does not distinguish them. WorldGraph cannot tell which
+    it is holding, so it still traverses the edge and marks the hop ``INFERRED_TRUST``:
+    dropping it would hide genuine identity-pivot paths, and presenting it as established
+    fact would manufacture them. Two applications that merely share a database produce such
+    a path, and the caller is told which hop made it so.
+
+    Establishing this properly needs edges inventory cannot supply — who may assume which
+    role, who accepts whose tokens, what network policy permits. Until a source for those
+    exists, an inferred hop is labelled rather than believed.
+    """
+    successors: list[tuple[str, AttackHop]] = []
     for edge in graph.dependencies_of(node_id):
         if edge.type in _EGRESS_TYPES:
-            successors.append(edge.target_entity_id)
+            successors.append(
+                (
+                    edge.target_entity_id,
+                    AttackHop(
+                        from_entity_id=node_id,
+                        to_entity_id=edge.target_entity_id,
+                        edge_type=edge.type,
+                        movement=MOVEMENT_EGRESS,
+                        confidence=0.9,
+                        evidence=(
+                            f"{node_id} declares a {edge.type.value} on "
+                            f"{edge.target_entity_id}, so a route exists."
+                        ),
+                    ),
+                )
+            )
     for edge in graph.dependents_of(node_id):
-        # Trust flows to whoever declared the dependency, but a shared host is not a trust
-        # relationship in itself, so HOSTED_IN is not followed backwards here.
+        # HOSTED_IN is not followed backwards either: a shared host is not a trust
+        # relationship, and treating it as one would make every workload in a region
+        # reachable from every other.
         if edge.type is DependencyType.DEPENDS_ON:
-            successors.append(edge.source_entity_id)
+            successors.append(
+                (
+                    edge.source_entity_id,
+                    AttackHop(
+                        from_entity_id=node_id,
+                        to_entity_id=edge.source_entity_id,
+                        edge_type=edge.type,
+                        movement=MOVEMENT_INFERRED_TRUST,
+                        confidence=0.35,
+                        evidence=(
+                            f"{edge.source_entity_id} depends on {node_id}. Whether owning "
+                            f"{node_id} yields access to {edge.source_entity_id} depends on "
+                            "a trust relationship WorldGraph has no evidence for."
+                        ),
+                    ),
+                )
+            )
     return successors
 
 
@@ -321,49 +412,85 @@ def attack_paths(
     from_entity_id: str = "internet",
     to_entity_ids: list[str] | None = None,
     max_depth: int = 6,
-) -> list[list[str]]:
-    """Reachability paths from an origin (usually the internet) to sensitive assets.
+    include_inferred: bool = True,
+) -> list[AttackPath]:
+    """Reachability paths from an origin to sensitive assets, with per-hop evidence.
 
-    The internet is modelled as an ordinary entity that internet-facing services declare a
-    ``CONNECTS_TO`` edge against, so "what can the internet reach" is a normal graph query
-    rather than a special case.
+    Two origins behave differently, and conflating them was a bug. When the origin is the
+    internet pseudo-entity, the paths start at the internet-facing services that declare a
+    route to it — "what can the outside reach". When the origin is any other entity, **that
+    entity is the foothold**: the question is "this host is owned, where can they go", and
+    it does not require the foothold to be internet-facing.
+
+    Previously the internet-facing filter was applied unconditionally, so every non-internet
+    origin returned an empty list — a silent false negative on the most common question a
+    responder asks, answered as reassurance.
 
     This is **reachability, not exploitability**. WorldGraph knows what is adjacent to what;
-    it does not test authentication, network policy or whether an exploit works. The tool
-    result says so, and the UI repeats it.
+    it does not test authentication, network policy, or whether an exploit works. Each hop
+    says whether it is established by a declared route or inferred from an operational
+    dependency, and each path is only as strong as its weakest hop.
     """
     if from_entity_id not in graph:
         return []
     targets = set(to_entity_ids or [])
-    entry_points = [
-        edge.source_entity_id
-        for edge in graph.dependents_of(from_entity_id)
-        if (entry := graph.entity(edge.source_entity_id)) is not None
-        and entry.exposure.internet_facing
-    ]
 
-    paths: list[list[str]] = []
-    for entry in entry_points:
-        # Breadth-first over attacker-traversable edges, tracking the route so the answer
-        # is a path an operator can read rather than a set of ids.
-        queue: list[list[str]] = [[entry]]
-        seen: set[str] = {entry}
+    internet_origin = from_entity_id == INTERNET_ENTITY_ID
+    if internet_origin:
+        # Entry points are the internet-facing services that declare a route to the
+        # internet node. The path is rendered as starting at the internet itself.
+        starts = [
+            (
+                edge.source_entity_id,
+                AttackHop(
+                    from_entity_id=from_entity_id,
+                    to_entity_id=edge.source_entity_id,
+                    edge_type=edge.type,
+                    movement=MOVEMENT_EGRESS,
+                    confidence=0.95,
+                    evidence=(
+                        f"{edge.source_entity_id} is internet-facing and declares a route "
+                        "to the public internet."
+                    ),
+                ),
+            )
+            for edge in graph.dependents_of(from_entity_id)
+            if (entry := graph.entity(edge.source_entity_id)) is not None
+            and entry.exposure.internet_facing
+        ]
+    else:
+        # The foothold is the origin. No entry hop, because the attacker is already there.
+        starts = [(from_entity_id, None)]
+
+    paths: list[AttackPath] = []
+    for entry_id, entry_hop in starts:
+        opening = [entry_hop] if entry_hop is not None else []
+        queue: list[tuple[list[str], list[AttackHop]]] = [
+            ([from_entity_id, entry_id] if entry_hop is not None else [entry_id], opening)
+        ]
+        seen: set[str] = {entry_id}
+
         while queue:
-            path = queue.pop(0)
-            if len(path) > max_depth:
+            nodes, hops = queue.pop(0)
+            if len(nodes) > max_depth:
                 continue
-            for next_id in _attacker_successors(graph, path[-1]):
-                if next_id in path or next_id == from_entity_id:
+            for next_id, hop in _attacker_successors(graph, nodes[-1]):
+                if next_id in nodes:
                     continue
-                extended = [*path, next_id]
+                if not include_inferred and hop.is_inferred:
+                    continue
+                extended_nodes = [*nodes, next_id]
+                extended_hops = [*hops, hop]
                 if not targets or next_id in targets:
-                    paths.append([from_entity_id, *extended])
+                    paths.append(AttackPath(nodes=extended_nodes, hops=extended_hops))
                 if next_id not in seen:
                     seen.add(next_id)
-                    queue.append(extended)
+                    queue.append((extended_nodes, extended_hops))
 
-    # Shortest first, then deterministic: the same graph must always yield the same order.
-    paths.sort(key=lambda path: (len(path), path))
+    # Established paths first, then shortest, then deterministic: an operator reading a
+    # list top-down should meet the routes that are actually proved before the speculative
+    # ones. The same graph must always yield the same order.
+    paths.sort(key=lambda p: (p.relies_on_inference, len(p.nodes), p.nodes))
     return paths
 
 

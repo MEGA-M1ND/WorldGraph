@@ -147,6 +147,34 @@ _TYPE_VOCABULARY: frozenset[str] = frozenset(
 ) | frozenset({"datacentre", "partner", "primary", "secondary", "shared"})
 
 
+def _reachability_headline(paths: dict) -> str:
+    """State established and inferred counts separately, never as one total.
+
+    A single "12 paths" invites the reader to treat all twelve as findings, when some rest
+    on a hop where an operational dependency was read as a trust relationship.
+    """
+    established = paths.get("established_count")
+    inferred = paths.get("inferred_count")
+    if established is None or inferred is None:
+        return f"{paths['count']} reachability paths from the public internet:"
+    parts = [f"{established} established"]
+    if inferred:
+        parts.append(f"{inferred} inferred")
+    return (
+        f"{paths['count']} reachability paths from the public internet "
+        f"({', '.join(parts)}):"
+    )
+
+
+def _render_path(path: dict) -> str:
+    """One path, with its basis attached rather than left to the surrounding prose."""
+    route = " → ".join(path["names"])
+    basis = path.get("basis")
+    if basis == "INFERRED":
+        return f"  [INFERRED] {route}"
+    return f"  [ESTABLISHED] {route}"
+
+
 class IntentRouter:
     """Maps operator language onto deterministic tool calls."""
 
@@ -411,9 +439,9 @@ class IntentRouter:
                         "anything else. Name a target to check a specific asset."
                     )
                 )
-            lines = [f"{paths['count']} reachability paths from the public internet:", ""]
+            lines = [_reachability_headline(paths), ""]
             for path in paths["paths"][:5]:
-                lines.append("  " + " → ".join(path["names"]))
+                lines.append(_render_path(path))
             lines.extend(["", paths["note"]])
             return RouterResult(answer="\n".join(lines))
         target_id = targets[0]
@@ -431,7 +459,7 @@ class IntentRouter:
             "",
         ]
         for path in paths["paths"][:5]:
-            lines.append("  " + " → ".join(path["names"]))
+            lines.append(_render_path(path))
         lines.append("")
         lines.append(paths["note"])
         if paths["paths"]:

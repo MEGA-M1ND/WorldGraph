@@ -674,11 +674,22 @@ def _get_attack_paths(ctx: ToolContext, args: AttackPathArgs) -> dict[str, Any]:
         "from": args.from_entity_id,
         "to": args.to_entity_id or "any reachable asset",
         "count": len(paths),
+        "established_count": sum(1 for path in paths if not path.relies_on_inference),
+        "inferred_count": sum(1 for path in paths if path.relies_on_inference),
         "paths": [
             {
-                "ids": path,
+                "ids": path.nodes,
                 "names": [
-                    graph.entity(node).name if graph.entity(node) else node for node in path
+                    graph.entity(node).name if graph.entity(node) else node
+                    for node in path.nodes
+                ],
+                # The model must not be able to present an inferred path as an established
+                # one, so the basis travels with the path rather than in a preamble it can
+                # drop.
+                "basis": path.basis,
+                "confidence": round(path.confidence, 2),
+                "inferred_hops": [
+                    hop.evidence for hop in path.hops if hop.is_inferred
                 ],
             }
             for path in paths[:10]

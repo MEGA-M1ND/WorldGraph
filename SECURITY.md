@@ -316,9 +316,26 @@ Stated plainly rather than implied:
 - **Rate limiting is per-process and in-memory.** It does not survive a restart or span
   replicas.
 - **The tile tokens are client-visible.** §1.
-- **Attack paths are reachability, not exploitability.** WorldGraph models declared network
-  adjacency; it does not test authentication, network policy, or whether an exploit works.
-  Every response says so.
+- **Attack paths are reachability, not exploitability, and half of a path may be
+  inferred.** WorldGraph models declared adjacency; it does not test authentication,
+  network policy, or whether an exploit works. Beyond that, it distinguishes two kinds of
+  hop and labels every one:
+
+  - **EGRESS** — this asset declares a route to that one. The dependency *is* the evidence.
+  - **INFERRED_TRUST** — the reverse direction, an attacker owning a service and moving
+    into what relies on it. That is real for an authentication service and false for a
+    database, and an operational dependency edge cannot distinguish them. Two applications
+    that merely share a Postgres therefore produce a path, marked `INFERRED`, at low
+    confidence, with the specific hop named.
+
+  Dropping the inferred hop would hide genuine identity pivots; presenting it as fact
+  manufactures them. Establishing it needs edges inventory cannot supply — who may assume
+  which role, who accepts whose tokens, what network policy permits. Until a source for
+  those exists, such a hop is labelled rather than believed, and a path is scored by its
+  weakest hop rather than its average.
+
+  `HOSTED_IN` is not attacker movement: WorldGraph models no hypervisor, host OS or
+  control plane through which "move into the region you run in" would mean anything.
 - **SQLite with a single guarded connection.** Correct and fast at V1 scale; not a
   concurrency story for a multi-replica deployment.
 - **The live Azure connector has never been executed against a real subscription.** Every

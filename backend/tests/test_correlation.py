@@ -216,11 +216,20 @@ class TestSecurityCorrelation:
         """
         paths = attack_paths(atlaspay_graph, to_entity_ids=["payments-api"])
         assert paths, "the payments path must be reachable"
-        shortest = paths[0]
-        assert shortest[0] == "internet"
-        assert shortest[1] == "admin-api"
-        assert "internal-auth" in shortest
-        assert shortest[-1] == "payments-api"
+        route = next(p for p in paths if "internal-auth" in p.nodes)
+        assert route.nodes[0] == "internet"
+        assert route.nodes[1] == "admin-api"
+        assert route.nodes[-1] == "payments-api"
+
+        # The trust hop is kept, because an auth-service pivot is real — and marked, because
+        # an operational dependency edge cannot distinguish that from a shared database.
+        assert route.relies_on_inference is True
+        assert route.basis == "INFERRED"
+        inferred = [hop for hop in route.hops if hop.is_inferred]
+        assert inferred and inferred[0].to_entity_id == "payments-api"
+        assert "trust relationship" in inferred[0].evidence
+        # A path is worth its weakest hop, not its average.
+        assert route.confidence == min(hop.confidence for hop in route.hops)
 
     def test_attack_paths_are_deterministic(self, atlaspay_graph: WorldGraph):
         first = attack_paths(atlaspay_graph, to_entity_ids=["payments-api"])
