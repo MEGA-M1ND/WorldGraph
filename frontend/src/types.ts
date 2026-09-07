@@ -571,10 +571,37 @@ export interface ReplayScenario {
   suggested_overrides: { target_id: string; health: string }[];
 }
 
+/** How much of a reachability path is actually established. */
+export type AttackPathBasis = 'ESTABLISHED' | 'INFERRED';
+
+export interface AttackHop {
+  from: string;
+  to: string;
+  edge_type: DependencyType;
+  /** EGRESS — this asset talks to that one. INFERRED_TRUST — that one relies on this. */
+  movement: 'EGRESS' | 'INFERRED_TRUST';
+  confidence: number;
+  evidence: string;
+}
+
+export interface AttackPathRow {
+  ids: string[];
+  names: string[];
+  /** INFERRED means at least one hop reads an operational dependency as a trust
+   *  relationship — real for an auth service, false for a database, and inventory cannot
+   *  tell them apart. */
+  basis: AttackPathBasis;
+  /** The weakest hop, not the average: a path is worth its most doubtful step. */
+  confidence: number;
+  hops: AttackHop[];
+}
+
 export interface AttackPathResponse {
   from: string;
   to: string | null;
   count: number;
-  paths: { ids: string[]; names: string[] }[];
+  established_count: number;
+  inferred_count: number;
+  paths: AttackPathRow[];
   disclaimer: string;
 }
