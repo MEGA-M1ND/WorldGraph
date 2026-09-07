@@ -194,10 +194,40 @@ export function renderCoverage(detail: WorkspaceDetail | null): HTMLElement | nu
 
   const container = el('div');
 
+  // Completeness first, and loudly when it is absent. Every ratio below describes what
+  // was retrieved, and a ratio over a fraction of an estate says nothing about the estate:
+  // a subscription of 5,000 resources that imported 1,000 once reported "7 of 7 resources
+  // placed in a region — HIGH".
+  if (!summary.collection_complete) {
+    container.append(
+      el(
+        'div',
+        { class: 'coverage__warning' },
+        el('p', { class: 'coverage__warning-head', text: 'INCOMPLETE COLLECTION' }),
+        el('p', {
+          class: 'coverage__warning-detail',
+          text:
+            summary.truncation_reason ||
+            'Not every resource the source holds was retrieved.',
+        }),
+        el('p', {
+          class: 'coverage__warning-detail',
+          text: 'Everything below describes only what was retrieved.',
+        }),
+      ),
+    );
+  }
+
   container.append(
     keyValue([
       ['Source', humanize(summary.source)],
       ['Resources read', count(summary.resources_discovered)],
+      ...(summary.resources_reported_by_source !== null
+        ? ([['Source reports', count(summary.resources_reported_by_source)]] as [
+            string,
+            string,
+          ][])
+        : []),
       ['Modelled', count(summary.resources_supported)],
       ['Not modelled', count(summary.resources_unsupported)],
       ['Entities', count(summary.entities_created)],

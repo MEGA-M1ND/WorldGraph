@@ -177,6 +177,14 @@ class ImportSummary(BaseModel):
     subscription_label: str = Field(default="", max_length=200)
 
     resources_discovered: int = 0
+    #: What the source says exists, when it says. ``None`` when unknown.
+    resources_reported_by_source: int | None = None
+    #: Whether every resource the source holds was actually retrieved. A partial estate
+    #: analysed as though it were whole is the failure mode the coverage report exists to
+    #: prevent, so it is reported first and gates every other coverage claim.
+    collection_complete: bool = True
+    #: Why collection stopped short, when it did. Empty when complete.
+    truncation_reason: str = ""
     resources_supported: int = 0
     resources_unsupported: int = 0
     #: Azure resource type → count, for the types WorldGraph does not model.

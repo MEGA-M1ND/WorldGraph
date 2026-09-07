@@ -448,6 +448,11 @@ export interface ImportSummary {
   source: InventorySourceKind;
   subscription_label: string;
   resources_discovered: number;
+  /** What the source says exists. `null` when it does not say. */
+  resources_reported_by_source: number | null;
+  /** Whether everything the source holds was retrieved. Gates every figure below it. */
+  collection_complete: boolean;
+  truncation_reason: string;
   resources_supported: number;
   resources_unsupported: number;
   unsupported_types: Record<string, number>;

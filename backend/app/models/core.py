@@ -339,7 +339,13 @@ class ExposureProfile(BaseModel):
     #: WorldGraph does not model a full network policy engine in V1.
     network_zone: str = Field(default="internal", max_length=64)
     #: Whether the asset requires authentication before reaching sensitive functions.
-    authenticated: bool = True
+    #:
+    #: Tri-state, and ``None`` is the default because for most sources it is the truth.
+    #: Cloud inventory does not report whether a workload authenticates its callers, so an
+    #: importer that set ``True`` would be asserting a security property from nothing —
+    #: and asserting it in the direction that makes an estate look safer. Establishing
+    #: this needs configuration or telemetry WorldGraph does not currently read.
+    authenticated: bool | None = None
 
 
 class BusinessProfile(BaseModel):
