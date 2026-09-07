@@ -98,7 +98,15 @@ def calculate_blast_radius(
     indirect: list[ImpactedEntity] = []
     max_depth_reached = 0
 
-    for entity_id in state.impacted_ids(threshold=impact_threshold):
+    # Attribution, not observation. An entity that sits below the threshold because
+    # nobody ever declared its health is not something this origin did — reporting it
+    # here put unconnected entities in the blast radius at depth 1 with a delta of
+    # exactly 0.0 (docs/REALITY_PASS_REPORT.md). Origins are always included: naming one
+    # is the operator asserting it failed, even if it was already down.
+    caused = state.caused_ids(threshold=impact_threshold)
+    reached = [*origins, *(eid for eid in caused if eid not in origins)]
+
+    for entity_id in reached:
         entity = graph.entity(entity_id)
         if entity is None:
             continue
@@ -127,7 +135,7 @@ def calculate_blast_radius(
     indirect.sort(key=lambda r: (r.availability, r.entity_id))
 
     exposure = customer_exposure(graph, state, threshold=impact_threshold)
-    impact = business_impact(graph, state, threshold=impact_threshold)
+    impact = business_impact(graph, state, threshold=impact_threshold, causal_only=True)
 
     # Wall-clock enters the engine here and nowhere else. It is a real input — a
     # four-hour-old observation deserves a lower score than a fresh one — but an *input*

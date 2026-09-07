@@ -134,7 +134,11 @@ def infrastructure_availability(
 
 
 def business_impact(
-    graph: WorldGraph, state: PropagationState, *, threshold: float = IMPACT_THRESHOLD
+    graph: WorldGraph,
+    state: PropagationState,
+    *,
+    threshold: float = IMPACT_THRESHOLD,
+    causal_only: bool = False,
 ) -> BusinessImpact:
     """Aggregate the settled state into headline business figures.
 
@@ -226,8 +230,13 @@ def business_impact(
         and entity.criticality is Criticality.CRITICAL
         and state.availability.get(entity.id, 1.0) < threshold
     )
-    impacted_count = sum(
-        1 for value in state.availability.values() if value < threshold
+    # "How many did this cause" for an attributed analysis; "how many are degraded" for a
+    # dashboard. Counting absolutely inside a blast radius reported every entity in an
+    # imported estate as impacted regardless of what failed.
+    impacted_count = (
+        len(state.caused_ids(threshold=threshold))
+        if causal_only
+        else sum(1 for value in state.availability.values() if value < threshold)
     )
 
     return BusinessImpact(
