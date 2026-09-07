@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 
 import pytest
@@ -940,4 +941,8 @@ class TestReadOnlyByConstruction:
         source = Path(__file__).parent.parent / "app" / "adapters" / "azure_inventory.py"
         text = source.read_text()
         assert "ResourceGraphClient" in text
-        assert "client.resources(request)" in text
+        # `.resources` is the query API. Asserting it is the *only* client method invoked
+        # is a stronger guarantee than matching one call site, and survives refactors of
+        # how the request is built.
+        called = set(re.findall(r"\bclient\.(\w+)\(", text))
+        assert called == {"resources"}, f"unexpected client methods: {called}"

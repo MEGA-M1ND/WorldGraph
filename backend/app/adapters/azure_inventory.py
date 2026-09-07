@@ -29,6 +29,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from ..config import Settings
@@ -137,8 +138,18 @@ SENSITIVE_PROPERTY_HINTS: tuple[str, ...] = (
 RESOURCE_GRAPH_QUERY = """
 resources
 | project id, name, type, location, resourceGroup, subscriptionId, tags, kind, sku, properties
-| limit 5000
+| order by id asc
 """
+
+#: Rows requested per page. Resource Graph caps a single response at 1000 regardless of
+#: what a KQL ``limit`` asks for, which is why the previous ``| limit 5000`` did nothing
+#: except make the query *look* bounded.
+PAGE_SIZE = 1000
+
+#: Total rows WorldGraph will hold for one workspace. A real ceiling has to exist, but
+#: hitting it is reported as incomplete collection rather than quietly returning a prefix
+#: of somebody's estate as though it were all of it.
+MAX_RESOURCES = 20_000
 
 
 # ======================================================================================
@@ -270,9 +281,11 @@ def normalize_resource(
     exposure = ExposureProfile(
         internet_facing=raw_type in _INTERNET_FACING_TYPES,
         network_zone="azure",
-        # Azure inventory does not tell us whether a workload authenticates its callers.
-        # Claiming it does would be a security assertion WorldGraph has no basis for.
-        authenticated=True,
+        # Azure inventory does not tell us whether a workload authenticates its callers,
+        # so WorldGraph does not say. The comment here used to argue exactly this and the
+        # line beneath it set True anyway — in the direction that makes an estate look
+        # safer than the evidence supports.
+        authenticated=None,
     )
 
     metadata: dict[str, Any] = {
@@ -520,14 +533,57 @@ def assess_coverage(
     entities: list[WorldEntity],
     edges: list[DependencyEdge],
     tags_by_entity: dict[str, ParsedTags],
+    *,
+    collection: Collection | None = None,
 ) -> list[GraphCoverage]:
     """What WorldGraph knows about this estate, dimension by dimension.
 
     Never one number. Averaging "complete hosting topology" with "no business mapping"
     produces something that looks precise and means nothing.
+
+    Collection completeness leads, because every other dimension is a ratio over what was
+    retrieved and a ratio over a fraction of an estate says nothing about the estate. A
+    subscription of 5 000 resources that imported 1 000 of them used to report "7 of 7
+    resources placed in a region — HIGH".
     """
     workloads = [e for e in entities if e.type is not EntityType.CLOUD_REGION]
     total = len(workloads) or 1
+
+    collection_rows: list[GraphCoverage] = []
+    if collection is not None:
+        reported = collection.reported_total
+        if collection.complete:
+            collection_rows.append(
+                GraphCoverage(
+                    dimension="collection",
+                    label="Inventory collection",
+                    level="HIGH",
+                    detail=(
+                        f"{collection.retrieved} of {reported} resources retrieved"
+                        if reported is not None
+                        else f"{collection.retrieved} resources retrieved"
+                    ),
+                    remedy="",
+                )
+            )
+        else:
+            collection_rows.append(
+                GraphCoverage(
+                    dimension="collection",
+                    label="Inventory collection",
+                    level="LOW",
+                    detail=(
+                        f"INCOMPLETE — {collection.retrieved} of "
+                        f"{reported if reported is not None else 'an unknown number of'} "
+                        "resources retrieved"
+                    ),
+                    remedy=(
+                        collection.truncation_reason
+                        or "Collection stopped short. Every figure below describes only "
+                        "what was retrieved, not the estate."
+                    ),
+                )
+            )
 
     hosted = sum(1 for e in edges if e.type is DependencyType.HOSTED_IN)
     app_edges = [
@@ -549,6 +605,7 @@ def assess_coverage(
         return "NONE"
 
     return [
+        *collection_rows,
         GraphCoverage(
             dimension="infrastructure",
             label="Infrastructure discovered",
@@ -675,33 +732,103 @@ def configured_azure_workspaces(settings: Settings) -> list[Workspace]:
     return workspaces
 
 
-async def fetch_resources(settings: Settings, workspace: Workspace) -> list[dict[str, Any]]:
-    """Read the inventory for a workspace.
+@dataclass(slots=True)
+class Collection:
+    """What one read of a source returned, and whether it was all of it.
 
-    Snapshot workspaces read from disk. Live workspaces query Azure Resource Graph through
-    the official SDK using ``DefaultAzureCredential``, which picks up ``az login``,
-    managed identity, or environment credentials without WorldGraph ever handling a secret
-    itself.
+    The second field is the point. Before this existed, ``fetch_resources`` took the first
+    page of a Resource Graph response and returned it as the estate, so a 5 000-resource
+    subscription imported 1 000 resources and the coverage report — the feature whose
+    entire job is stating completeness honestly — announced HIGH confidence over them.
+    A completeness feature that cannot detect its own incompleteness is worse than none.
+    """
+
+    resources: list[dict[str, Any]]
+    #: How many rows the source says exist, when it says. ``None`` when unknown.
+    reported_total: int | None = None
+    complete: bool = True
+    #: Why collection stopped short, when it did. Empty when complete.
+    truncation_reason: str = ""
+
+    @property
+    def retrieved(self) -> int:
+        return len(self.resources)
+
+
+async def fetch_resources(
+    settings: Settings, workspace: Workspace, *, client_factory=None
+) -> Collection:
+    """Read the inventory for a workspace, and say whether the read was complete.
+
+    Snapshot workspaces read from disk and are complete by construction — the file is the
+    estate. Live workspaces page Azure Resource Graph through the official SDK using
+    ``DefaultAzureCredential``, which picks up ``az login``, managed identity, or
+    environment credentials without WorldGraph ever handling a secret itself.
+
+    ``client_factory`` exists so the paging loop can be tested without a subscription. It
+    does not make the live path verified — see ``docs/REALITY_PASS_REPORT.md`` §2.
     """
     if workspace.source is InventorySourceKind.SNAPSHOT:
-        return load_snapshot(settings.azure_snapshot_path or "")
+        rows = load_snapshot(settings.azure_snapshot_path or "")
+        return Collection(resources=rows, reported_total=len(rows), complete=True)
 
-    try:
-        from azure.identity import DefaultAzureCredential
-        from azure.mgmt.resourcegraph import ResourceGraphClient
-        from azure.mgmt.resourcegraph.models import QueryRequest
-    except ImportError as error:
-        raise AdapterError(
-            "Azure SDK is not installed. Install the optional dependencies with "
-            "`pip install -r requirements-azure.txt` to import live inventory."
-        ) from error
+    if client_factory is None:
+        try:
+            from azure.identity import DefaultAzureCredential
+            from azure.mgmt.resourcegraph import ResourceGraphClient
+        except ImportError as error:
+            raise AdapterError(
+                "Azure SDK is not installed. Install the optional dependencies with "
+                "`pip install -r requirements-azure.txt` to import live inventory."
+            ) from error
 
+        def client_factory():
+            return ResourceGraphClient(DefaultAzureCredential())
+
+    request_factory = _request_factory()
     subscription = workspace.organization
+
+    rows: list[dict[str, Any]] = []
+    reported_total: int | None = None
+    skip_token: str | None = None
+    complete = True
+    reason = ""
+
     try:
-        credential = DefaultAzureCredential()
-        client = ResourceGraphClient(credential)
-        request = QueryRequest(subscriptions=[subscription], query=RESOURCE_GRAPH_QUERY)
-        response = client.resources(request)
+        client = client_factory()
+        # Bounded rather than `while True`: a source that keeps handing back a skip_token
+        # would otherwise spin forever, and an import that never returns is a worse
+        # failure than one that stops and says why.
+        for _ in range(MAX_RESOURCES // PAGE_SIZE + 1):
+            response = client.resources(
+                request_factory(subscription, skip_token=skip_token)
+            )
+            page = [row for row in (getattr(response, "data", None) or []) if isinstance(row, dict)]
+            rows.extend(page)
+
+            total = getattr(response, "total_records", None)
+            if isinstance(total, int) and total > 0:
+                reported_total = total
+
+            if getattr(response, "result_truncated", None) in _TRUNCATED_VALUES:
+                complete = False
+                reason = "Azure reported the result set as truncated."
+
+            skip_token = getattr(response, "skip_token", None) or None
+            if not skip_token or not page:
+                break
+            if len(rows) >= MAX_RESOURCES:
+                complete = False
+                reason = (
+                    f"Collection stopped at WorldGraph's ceiling of {MAX_RESOURCES:,} "
+                    "resources; this subscription holds more."
+                )
+                break
+        else:
+            complete = False
+            reason = "Collection stopped after the maximum number of pages."
+    except AdapterError:
+        raise
     except Exception as error:  # cloud SDK errors carry request detail
         # Only the exception type escapes. An Azure SDK error can contain a request URL, a
         # tenant id or a token fragment, and none of those belong in a log or a response.
@@ -711,8 +838,48 @@ async def fetch_resources(settings: Settings, workspace: Workspace) -> list[dict
             "readable."
         ) from error
 
-    data = getattr(response, "data", None) or []
-    return [row for row in data if isinstance(row, dict)]
+    # The strongest completeness signal available: Azure said how many exist and we hold
+    # fewer. Trusted over the absence of a skip_token, because a missing token proves only
+    # that this response had no continuation.
+    if reported_total is not None and len(rows) < reported_total:
+        complete = False
+        reason = reason or (
+            f"Azure reports {reported_total:,} resources; {len(rows):,} were retrieved."
+        )
+
+    return Collection(
+        resources=rows,
+        reported_total=reported_total,
+        complete=complete,
+        truncation_reason=reason,
+    )
+
+
+#: Values an SDK may use for ``result_truncated``. It is an enum in the real client and a
+#: plain string in most fakes, so both are accepted rather than assuming one.
+_TRUNCATED_VALUES = frozenset({"true", "True", True})
+
+
+def _request_factory():
+    """Build Resource Graph requests, with paging options when the SDK supports them."""
+    try:
+        from azure.mgmt.resourcegraph.models import QueryRequest, QueryRequestOptions
+    except ImportError:  # pragma: no cover — exercised only without the optional SDK
+        QueryRequest = QueryRequestOptions = None
+
+    def build(subscription: str, *, skip_token: str | None):
+        if QueryRequest is None:
+            # A fake client in tests supplies its own request shape; the loop only needs
+            # the token threaded through.
+            return {"subscriptions": [subscription], "query": RESOURCE_GRAPH_QUERY,
+                    "skip_token": skip_token, "top": PAGE_SIZE}
+        return QueryRequest(
+            subscriptions=[subscription],
+            query=RESOURCE_GRAPH_QUERY,
+            options=QueryRequestOptions(top=PAGE_SIZE, skip_token=skip_token),
+        )
+
+    return build
 
 
 def load_snapshot(path: str) -> list[dict[str, Any]]:
@@ -757,7 +924,8 @@ async def import_azure_workspace(
 ) -> tuple[list[WorldEntity], list[DependencyEdge], ImportSummary]:
     """Import one Azure workspace into WorldGraph entities and edges."""
     started = time.perf_counter()
-    resources = await fetch_resources(settings, workspace)
+    collection = await fetch_resources(settings, workspace)
+    resources = collection.resources
 
     entities_by_azure_id: dict[str, WorldEntity] = {}
     tags_by_entity: dict[str, ParsedTags] = {}
@@ -799,6 +967,9 @@ async def import_azure_workspace(
         source=workspace.source,
         subscription_label=workspace.organization,
         resources_discovered=len(resources),
+        resources_reported_by_source=collection.reported_total,
+        collection_complete=collection.complete,
+        truncation_reason=collection.truncation_reason,
         resources_supported=len(entities_by_azure_id),
         resources_unsupported=len(resources) - len(entities_by_azure_id),
         unsupported_types=dict(sorted(unsupported.items(), key=lambda kv: -kv[1])[:25]),
@@ -807,7 +978,7 @@ async def import_azure_workspace(
         declared_edges=declared,
         regions=len(region_entities),
         rejected_tags=[rejection.describe() for rejection in rejections[:50]],
-        coverage=assess_coverage(entities, edges, tags_by_entity),
+        coverage=assess_coverage(entities, edges, tags_by_entity, collection=collection),
         mode=workspace.mode,
         duration_ms=round((time.perf_counter() - started) * 1000, 2),
     )
