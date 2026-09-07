@@ -80,9 +80,17 @@ def get_analyst(request: Request, state: WorldState = Depends(get_state)):
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="The analyst is still starting up.",
         )
-    key = state.workspace.id
+    # Keyed by revision, not by workspace id. An analyst is bound to a world, and a
+    # re-import replaces the world while keeping the id — so an id-keyed cache handed back
+    # an analyst whose tools still read the previous estate.
+    workspace = state.workspace
+    key = f"{workspace.id}:{workspace.revision}"
     analyst = analysts.get(key)
     if analyst is None:
+        # Drop every earlier revision of this workspace rather than letting the cache grow
+        # a new entry per import for the life of the process.
+        for stale in [k for k in analysts if k.rsplit(":", 1)[0] == workspace.id]:
+            analysts.pop(stale, None)
         analyst = build_analyst(state, get_settings())
         analysts[key] = analyst
     return analyst

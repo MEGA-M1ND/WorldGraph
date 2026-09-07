@@ -127,6 +127,11 @@ class Repository(ABC):
     def save_edges(self, edges: Iterable[DependencyEdge]) -> None: ...
 
     @abstractmethod
+    def replace_estate(
+        self, entities: Iterable[WorldEntity], edges: Iterable[DependencyEdge]
+    ) -> None: ...
+
+    @abstractmethod
     def load_edges(self) -> list[DependencyEdge]: ...
 
     @abstractmethod
@@ -210,21 +215,7 @@ class SqliteRepository(Repository):
     # -- entities ----------------------------------------------------------------------
 
     def save_entities(self, entities: Iterable[WorldEntity]) -> None:
-        rows = [
-            (
-                e.id,
-                e.type.value,
-                e.name,
-                e.criticality.value,
-                e.health.value,
-                e.location.lat if e.location else None,
-                e.location.lon if e.location else None,
-                e.source.mode.value,
-                e.updated_at.isoformat(),
-                e.model_dump_json(),
-            )
-            for e in entities
-        ]
+        rows = [self._entity_row(e) for e in entities]
         with self._cursor() as cursor:
             cursor.executemany(
                 "INSERT OR REPLACE INTO entities "
@@ -241,10 +232,7 @@ class SqliteRepository(Repository):
     # -- edges -------------------------------------------------------------------------
 
     def save_edges(self, edges: Iterable[DependencyEdge]) -> None:
-        rows = [
-            (e.id, e.source_entity_id, e.target_entity_id, e.type.value, e.model_dump_json())
-            for e in edges
-        ]
+        rows = [self._edge_row(e) for e in edges]
         with self._cursor() as cursor:
             cursor.executemany(
                 "INSERT OR REPLACE INTO edges (id, source_id, target_id, type, payload) "
@@ -258,6 +246,66 @@ class SqliteRepository(Repository):
             return [
                 DependencyEdge.model_validate_json(row["payload"]) for row in cursor.fetchall()
             ]
+
+    # -- wholesale replacement ---------------------------------------------------------
+
+    def replace_estate(
+        self, entities: Iterable[WorldEntity], edges: Iterable[DependencyEdge]
+    ) -> None:
+        """Make the store match exactly this estate, in one transaction.
+
+        ``save_entities`` is ``INSERT OR REPLACE``, which updates and adds but never
+        removes. That is right for incremental writes and wrong for an inventory import:
+        a resource deleted from the source would linger in the graph forever, and a
+        re-import could not shrink an estate however much the real one had.
+
+        Deleting edges first keeps the store referentially sane at every instant, and the
+        whole thing rolls back together if any part of it fails — a half-replaced estate
+        is worse than a stale one, because a stale one is at least internally consistent.
+        """
+        entity_rows = [self._entity_row(e) for e in entities]
+        edge_rows = [self._edge_row(e) for e in edges]
+        with self._cursor() as cursor:
+            cursor.execute("DELETE FROM edges")
+            cursor.execute("DELETE FROM entities")
+            if entity_rows:
+                cursor.executemany(
+                    "INSERT INTO entities "
+                    "(id, type, name, criticality, health, lat, lon, mode, updated_at, payload) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    entity_rows,
+                )
+            if edge_rows:
+                cursor.executemany(
+                    "INSERT INTO edges (id, source_id, target_id, type, payload) "
+                    "VALUES (?,?,?,?,?)",
+                    edge_rows,
+                )
+
+    @staticmethod
+    def _entity_row(entity: WorldEntity) -> tuple:
+        return (
+            entity.id,
+            entity.type.value,
+            entity.name,
+            entity.criticality.value,
+            entity.health.value,
+            entity.location.lat if entity.location else None,
+            entity.location.lon if entity.location else None,
+            entity.source.mode.value,
+            entity.updated_at.isoformat(),
+            entity.model_dump_json(),
+        )
+
+    @staticmethod
+    def _edge_row(edge: DependencyEdge) -> tuple:
+        return (
+            edge.id,
+            edge.source_entity_id,
+            edge.target_entity_id,
+            edge.type.value,
+            edge.model_dump_json(),
+        )
 
     # -- events ------------------------------------------------------------------------
 

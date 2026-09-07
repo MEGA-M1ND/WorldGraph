@@ -26,12 +26,34 @@ async function dismissFirstRun(page: Page): Promise<void> {
   }
 }
 
-/** Ask the analyst and wait for its reply to land in the transcript. */
+/**
+ * Ask the analyst and wait for its reply to land in the transcript.
+ *
+ * Two things beyond the obvious, both learned from a CI failure that reported only
+ * "expected 3, received 2" after waiting 45 seconds:
+ *
+ * 1. The wait must outlast the *client's* own request timeout (60 s). Timing out first
+ *    turns "the request was still in flight" into an indistinguishable failure.
+ * 2. If the request errored, the app renders a notice rather than a message, so the
+ *    transcript count never moves. Reading that notice back turns an opaque timeout into
+ *    the actual reason.
+ */
 async function ask(page: Page, question: string): Promise<string> {
   const before = await page.locator('.message--analyst').count();
   await page.fill('[data-bind="command-input"]', question);
   await page.press('[data-bind="command-input"]', 'Enter');
-  await expect(page.locator('.message--analyst')).toHaveCount(before + 1, { timeout: 45_000 });
+  try {
+    await expect(page.locator('.message--analyst')).toHaveCount(before + 1, {
+      timeout: 65_000,
+    });
+  } catch (error) {
+    const notices = (await page.locator('[data-bind="notices"]').innerText()).trim();
+    throw new Error(
+      `The analyst never answered ${JSON.stringify(question)}.` +
+        (notices ? ` The app reported: ${notices}` : ' No notice was shown either.'),
+      { cause: error },
+    );
+  }
   return (await page.locator('.message--analyst .message__text').last().innerText()).trim();
 }
 

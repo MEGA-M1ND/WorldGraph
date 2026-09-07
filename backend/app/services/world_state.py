@@ -165,6 +165,7 @@ class WorldState:
         *,
         workspace: Workspace | None = None,
         estate_loader: Callable[[], tuple[list[WorldEntity], list[DependencyEdge]]] | None = None,
+        loader_is_authoritative: bool = False,
     ) -> None:
         self.settings = settings
         self.repository = repository or SqliteRepository(settings.database_path)
@@ -172,6 +173,14 @@ class WorldState:
         # existing caller working; the registry always passes one explicitly.
         self.workspace = workspace or atlaspay_workspace()
         self._estate_loader = estate_loader or build_atlaspay
+        # Whether the loader outranks whatever is already persisted.
+        #
+        # False for the demo, whose store is a harmless cache of a deterministic builder.
+        # True for an inventory import, where the loader holds a freshly read snapshot of
+        # somebody's real estate and the store holds a *previous* read of it. Preferring
+        # the store there meant a forced re-import silently kept stale data: renaming a
+        # resource at the source and re-importing left the old name on screen.
+        self._loader_is_authoritative = loader_is_authoritative
         self.graph = WorldGraph()
         self._events: dict[str, WorldEvent] = {}
         self._scenarios: dict[str, SimulationScenario] = {}
@@ -214,14 +223,33 @@ class WorldState:
         self._started = False
 
     def _load_enterprise_estate(self) -> None:
-        """Load this workspace's estate, preferring anything already persisted.
+        """Load this workspace's estate.
 
-        The loader is the source of truth on a fresh store; a persisted estate wins
-        afterwards so an operator's edits survive a restart. Which loader runs is the
-        workspace's business, not this class's — before the Reality Pass this method
-        always built AtlasPay regardless of what was asked for
+        Two policies, because there are two situations. For a workspace whose store is a
+        cache of a deterministic builder, a persisted estate wins so a restart is cheap.
+        For an imported inventory the loader is authoritative and replaces the store
+        outright: WorldGraph holds no write permission over a real estate, so there are no
+        local edits to preserve — only a previous read, which a re-import exists to
+        supersede.
+
+        Which loader runs is the workspace's business, not this class's; before the
+        Reality Pass this method always built AtlasPay regardless
         (docs/REALITY_PASS_AUDIT.md, B14).
         """
+        if self._loader_is_authoritative:
+            entities, edges = self._estate_loader()
+            # Wholesale, in one transaction. Merging would leave a resource that was
+            # deleted at the source alive in the graph forever, and an estate that can
+            # only ever grow is not a mirror of anything.
+            self.repository.replace_estate(entities, edges)
+            self.graph = WorldGraph(entities, edges)
+            logger.info(
+                "estate_loaded workspace=%s source=loader-authoritative entities=%d",
+                self.workspace.id,
+                len(entities),
+            )
+            return
+
         stored_entities = self.repository.load_entities()
         stored_edges = self.repository.load_edges()
         if stored_entities:
