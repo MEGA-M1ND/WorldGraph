@@ -53,8 +53,40 @@ Operator ──► Analyst ──► allowlisted tool ──► deterministic en
                  └───────── structured result ◄──────────┘
 ```
 
-The model **cannot compute and cannot act**. It can only name a tool. What that tool does is
-Python that a reviewer can read.
+The model **cannot act**. It can only name a tool, and what that tool does is Python a
+reviewer can read. That half is enforced by the registry below and by tests.
+
+It **can still write a sentence**, and for a long time nothing checked what was in it.
+This document previously claimed the model "cannot compute", which was false: its final
+prose was returned verbatim, so an answer claiming "123,456 compromised hosts" with zero
+tool calls reached the operator as an answer. The allowlist governs what the model may
+*do*; it never governed what it may *say*.
+
+### Figures are checked against their sources
+
+Every model answer is now held against one narrow, decidable rule:
+
+> A number in the answer that appears neither in the operator's question nor in any tool
+> result is a number the model made up.
+
+Restatement is allowed, because it is not fabrication: a tool returning `0.90451` and prose
+saying `90.45%` is the same fact at a sane precision, and a figure the operator put in the
+question is theirs, not the model's.
+
+Two outcomes, and they differ for a reason:
+
+- **Unsourced figures with zero tool calls** → the answer is **withheld**. With no tool
+  calls there was no source for a number to come from, so it is invented by construction.
+  The deterministic router answers instead — it reads the same world through the same
+  tools and cannot fabricate.
+- **Unsourced figures despite tool calls** → the answer is **kept and marked
+  `[UNVERIFIED]`**, naming the figures. It may be a restatement the checker cannot
+  recognise, so discarding it would lose real answers; presenting it as verified would be
+  the original defect again.
+
+Both are logged. This polices figures, not wording or reasoning — figures are the claims
+that get acted on, and a rule narrow enough to be correct is worth more than a broad one
+that guesses at intent.
 
 ### The registry is an allowlist
 

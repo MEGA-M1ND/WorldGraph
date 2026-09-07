@@ -23,6 +23,7 @@ import httpx
 
 from ..config import Settings
 from ..services.world_state import WorldState
+from .grounding import check as check_grounding
 from .prompts import DETERMINISTIC_NOTICE, SYSTEM_PROMPT
 from .router import IntentRouter
 from .tools import ToolContext, ToolError, run_tool, tool_definitions
@@ -116,7 +117,7 @@ class ModelAnalyst:
             active_scenario_id=active_scenario_id,
         )
         try:
-            answer, calls = await self._run_loop(ctx, message)
+            answer, calls, outputs = await self._run_loop(ctx, message)
         except Exception as error:
             reason = _describe_model_error(error)
             logger.warning("analyst_model_failed reason=%s", reason)
@@ -128,6 +129,43 @@ class ModelAnalyst:
             )
             fallback.degraded_reason = reason
             return fallback
+
+        grounding = check_grounding(answer, message, outputs)
+        if not grounding.is_grounded and grounding.had_no_data:
+            # The model stated figures having consulted nothing. Those figures are invented
+            # by construction — there was no source for them to come from — so the answer
+            # is not returned. The deterministic router answers instead: it reads the same
+            # world through the same tools and cannot fabricate a number.
+            logger.warning(
+                "analyst_answer_ungrounded tool_calls=0 figures=%s",
+                ",".join(grounding.ungrounded[:5]),
+            )
+            self.state.record_ai_timeline(
+                "Model answer withheld: unsourced figures with no tool calls. "
+                "Answered deterministically instead."
+            )
+            fallback = await self._fallback.ask(
+                message,
+                selected_entity_id=selected_entity_id,
+                selected_event_id=selected_event_id,
+                active_scenario_id=active_scenario_id,
+            )
+            fallback.degraded_reason = grounding.describe()
+            return fallback
+
+        if not grounding.is_grounded:
+            # Figures that no tool result contains, from a model that did call tools. The
+            # answer is kept — it may be a restatement this checker cannot recognise — but
+            # it is never passed off as verified.
+            logger.warning(
+                "analyst_answer_partially_ungrounded tool_calls=%d figures=%s",
+                len(calls),
+                ",".join(grounding.ungrounded[:5]),
+            )
+            answer = (
+                f"{answer}\n\n[UNVERIFIED] {grounding.describe()} "
+                "Check it against the panels before acting on it."
+            )
 
         self.state.record_ai_timeline(
             f"Analyst ({self.settings.anthropic_model}) answered using {len(calls)} tool calls."
@@ -141,12 +179,20 @@ class ModelAnalyst:
             duration_ms=round((time.perf_counter() - started) * 1000, 2),
         )
 
-    async def _run_loop(self, ctx: ToolContext, message: str) -> tuple[str, list[dict[str, Any]]]:
-        """Bounded tool-use loop."""
+    async def _run_loop(
+        self, ctx: ToolContext, message: str
+    ) -> tuple[str, list[dict[str, Any]], list[Any]]:
+        """Bounded tool-use loop.
+
+        Returns the answer, the call log, and the raw tool outputs. The third is what makes
+        the answer checkable: without the results there is nothing to hold its figures
+        against.
+        """
         messages: list[dict[str, Any]] = [
             {"role": "user", "content": _selected_context_block(ctx) + message}
         ]
         calls: list[dict[str, Any]] = []
+        outputs: list[Any] = []
 
         async with httpx.AsyncClient(timeout=self.settings.ai_timeout_seconds) as client:
             for _ in range(MAX_TOOL_ROUNDS):
@@ -176,7 +222,11 @@ class ModelAnalyst:
                 ).strip()
 
                 if not tool_uses:
-                    return text or "I could not produce an answer for that.", calls
+                    return (
+                        text or "I could not produce an answer for that.",
+                        calls,
+                        outputs,
+                    )
 
                 messages.append({"role": "assistant", "content": content})
                 results = []
@@ -186,6 +236,7 @@ class ModelAnalyst:
                     try:
                         output = run_tool(ctx, name, args)
                         calls.append({"tool": name, "args": args, "ok": True})
+                        outputs.append(output)
                         results.append(
                             {
                                 "type": "tool_result",
@@ -212,6 +263,7 @@ class ModelAnalyst:
             "I reached the tool-call limit for this question without finishing. "
             "Try asking for one thing at a time.",
             calls,
+            outputs,
         )
 
 
