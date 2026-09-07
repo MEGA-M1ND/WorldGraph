@@ -30,6 +30,7 @@ from ..analysis.blast_radius import calculate_blast_radius
 from ..analysis.business_impact import business_impact, snapshot_metrics
 from ..analysis.correlation import (
     SpatialMatch,
+    assess_vulnerability,
     correlate_event,
     find_assets_near_event,
     match_vulnerable_assets,
@@ -43,11 +44,14 @@ from ..fixtures.atlaspay import build_atlaspay
 from ..graph.world_graph import WorldGraph
 from ..models.analysis import (
     BlastRadiusResult,
+    Confidence,
+    InventoryCoverage,
     MaterialRisk,
     ResponsePlan,
     SimulationComparison,
     SimulationScenario,
     TimelineEntry,
+    VulnerabilityAssessment,
     WorldSnapshotMetrics,
 )
 from ..models.core import (
@@ -87,6 +91,67 @@ def _availability_move(
         f"{baseline.infrastructure_availability * 100:.2f}% → "
         f"{simulated.infrastructure_availability * 100:.2f}% "
         "(customer-experienced availability UNKNOWN for this workspace)"
+    )
+
+
+def _no_impact_explanations(
+    event: WorldEvent,
+    assessment: VulnerabilityAssessment | None,
+    coverage: InventoryCoverage | None,
+) -> list[str]:
+    """What to tell the operator when nothing was found."""
+    if assessment is VulnerabilityAssessment.INSUFFICIENT_DATA and coverage is not None:
+        return [
+            f"INSUFFICIENT DATA — WorldGraph cannot assess {event.title} against this "
+            "workspace.",
+            f"Software matching requires a software inventory, and {coverage.describe()}.",
+            "This is not a finding that the estate is unaffected. Import scanner findings "
+            "or an SBOM to make this question answerable.",
+        ]
+    lines = [f"{event.title} does not correlate with any asset in this workspace."]
+    if event.location is not None:
+        lines.append(
+            "No facility lies inside the modelled exposure radius and no asset runs "
+            "affected software."
+        )
+    else:
+        lines.append("This event carries no location and matched no software inventory.")
+    if coverage is not None:
+        lines.append(f"Inventory searched: {coverage.describe()}.")
+    return lines
+
+
+def _no_impact_confidence(
+    event: WorldEvent,
+    assessment: VulnerabilityAssessment | None,
+    coverage: InventoryCoverage | None,
+) -> Confidence:
+    """Confidence in a no-impact result.
+
+    A negative conclusion is only as strong as the inventory behind it. Where there is no
+    inventory there is no conclusion, so there is nothing to be confident *in* — the score
+    collapses and the missing input is named rather than hedged around.
+    """
+    if assessment is VulnerabilityAssessment.INSUFFICIENT_DATA:
+        return Confidence(
+            score=0.0,
+            strong_evidence=[],
+            uncertainties=[
+                "No conclusion was reached: "
+                + (coverage.describe() if coverage else "no software inventory is available"),
+                "A negative result requires inventory coverage this workspace does not have.",
+            ],
+        )
+    strong = ["deterministic correlation found no exposed asset"]
+    if coverage is not None and coverage.supports_negative_conclusion:
+        strong.append(f"inventory searched: {coverage.describe()}")
+    return Confidence(
+        score=round(event.source.confidence * 0.9, 2),
+        strong_evidence=strong,
+        uncertainties=[
+            "This workspace may not contain every asset the organisation "
+            "operates; WorldGraph can only reason about what it was given."
+        ],
     )
 
 
@@ -368,14 +433,33 @@ class WorldState:
         raw_products = event.metadata.get("product_names")
         products = [str(p) for p in raw_products] if isinstance(raw_products, list) else []
         matches = match_vulnerable_assets(self.graph, cve_id=cve_id, product_names=products)
+        assessment, coverage = assess_vulnerability(self.graph, matches)
 
         if not matches:
-            self._record_timeline(
-                stage="correlate",
-                message=f"{cve_id or event.title}: no asset in this workspace runs the affected software.",
-                event_id=event.id,
-            )
-            return self._empty_analysis(event)
+            # Two very different facts used to produce the same output here. "We searched
+            # and found nothing" is a finding; "we have nothing to search" is not, and
+            # reporting the second as the first is a confident all-clear derived from
+            # having looked at nothing.
+            if assessment is VulnerabilityAssessment.INSUFFICIENT_DATA:
+                self._record_timeline(
+                    stage="correlate",
+                    message=(
+                        f"{cve_id or event.title}: INSUFFICIENT DATA — {coverage.describe()}. "
+                        "WorldGraph cannot say whether this estate is affected."
+                    ),
+                    event_id=event.id,
+                    severity=event.severity,
+                )
+            else:
+                self._record_timeline(
+                    stage="correlate",
+                    message=(
+                        f"{cve_id or event.title}: no asset in this workspace runs the "
+                        f"affected software ({coverage.describe()})."
+                    ),
+                    event_id=event.id,
+                )
+            return self._empty_analysis(event, assessment=assessment, coverage=coverage)
 
         internet_facing = [m for m in matches if m.internet_facing]
         self._record_timeline(
@@ -402,13 +486,37 @@ class WorldState:
             proximity=1.0 if internet_facing else 0.0,
             mode=event.source.mode,
         )
+        # Carried onto the result so a consumer can tell a confirmed finding from a
+        # product-name collision. Matching "nginx" ignores version and vendor, so it
+        # nominates candidates for triage; presenting that as a confirmed exposure is how
+        # a vulnerability queue becomes noise nobody works.
+        result.assessment = assessment
+        result.inventory_coverage = coverage
+        if assessment is VulnerabilityAssessment.POTENTIALLY_AFFECTED:
+            result.explanations.append(
+                "POTENTIALLY AFFECTED — matched on product name only. No asset's inventory "
+                f"names {cve_id or 'this CVE'}, and WorldGraph does not compare versions or "
+                "vendors. Confirm against a scanner finding before treating this as exposure."
+            )
+            result.confidence.uncertainties.append(
+                "match is by product name, not by a confirmed CVE association"
+            )
         self._store_analysis(result, event)
         return result
 
-    def _empty_analysis(self, event: WorldEvent) -> BlastRadiusResult:
-        """A no-impact analysis that states why nothing was found."""
+    def _empty_analysis(
+        self,
+        event: WorldEvent,
+        *,
+        assessment: VulnerabilityAssessment | None = None,
+        coverage: InventoryCoverage | None = None,
+    ) -> BlastRadiusResult:
+        """A no-impact analysis that states why nothing was found.
+
+        ``assessment`` distinguishes "searched and clean" from "could not search". The
+        second must not be presented as reassurance.
+        """
         from ..models.analysis import (
-            Confidence,
             RiskScore,
         )
 
@@ -421,23 +529,10 @@ class WorldState:
             severity=Severity.LOW,
             risk=RiskScore(score=0.0, severity=Severity.LOW, contributions=[]),
             business_impact=business_impact(self.graph, state),
-            explanations=[
-                f"{event.title} does not correlate with any asset in this workspace.",
-                (
-                    "No facility lies inside the modelled exposure radius and no asset runs "
-                    "affected software."
-                    if event.location is not None
-                    else "This event carries no location and matched no software inventory."
-                ),
-            ],
-            confidence=Confidence(
-                score=round(event.source.confidence * 0.9, 2),
-                strong_evidence=["deterministic correlation found no exposed asset"],
-                uncertainties=[
-                    "This workspace may not contain every asset the organisation "
-                    "operates; WorldGraph can only reason about what it was given."
-                ],
-            ),
+            explanations=_no_impact_explanations(event, assessment, coverage),
+            confidence=_no_impact_confidence(event, assessment, coverage),
+            assessment=assessment,
+            inventory_coverage=coverage,
             mode=event.source.mode,
         )
         self._store_analysis(result, event)

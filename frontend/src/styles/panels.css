@@ -745,3 +745,32 @@
 }
 
 .unknowns__list li + li { margin-top: 3px; }
+
+/* ---------------------------------------------------------------------------------- */
+/* Vulnerability assessment                                                            */
+/* ---------------------------------------------------------------------------------- */
+
+/**
+ * Deliberately not tinted by severity. An INSUFFICIENT_DATA verdict carries severity LOW
+ * and a score of 0 — because nothing was measured, not because nothing is wrong — and a
+ * green panel would turn "we could not look" into "you are fine".
+ */
+.assessment {
+  padding: var(--space-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--bg-panel-raised);
+}
+
+.assessment__detail {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.assessment__coverage {
+  margin: 6px 0 0;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}

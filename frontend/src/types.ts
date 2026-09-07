@@ -239,6 +239,24 @@ export interface BusinessImpact {
   disclaimer: 'MODELLED ESTIMATE';
 }
 
+/**
+ * What WorldGraph could conclude about a vulnerability.
+ *
+ * `INSUFFICIENT_DATA` is not a softer `NOT_AFFECTED`. It means no conclusion was reached
+ * because there was not enough inventory to reach one, and it must never be rendered as
+ * reassurance.
+ */
+export type VulnerabilityAssessment =
+  | 'CONFIRMED_AFFECTED'
+  | 'POTENTIALLY_AFFECTED'
+  | 'NOT_AFFECTED'
+  | 'INSUFFICIENT_DATA';
+
+export interface InventoryCoverage {
+  assessable_entities: number;
+  entities_with_inventory: number;
+}
+
 export interface Confidence {
   score: number;
   strong_evidence: string[];
@@ -265,6 +283,9 @@ export interface BlastRadiusResult {
   business_impact: BusinessImpact;
   explanations: string[];
   confidence: Confidence;
+  /** Present for security analyses only. */
+  assessment: VulnerabilityAssessment | null;
+  inventory_coverage: InventoryCoverage | null;
   truncated: boolean;
   truncation_reason: string | null;
   cycles_detected: string[][];
