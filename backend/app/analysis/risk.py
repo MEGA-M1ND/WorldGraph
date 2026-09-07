@@ -12,6 +12,8 @@ Every score is the sum of named, signed contributions. The formula is documented
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from ..graph.world_graph import WorldGraph
 from ..models.analysis import Confidence, RiskScore, ScoreContribution
 from ..models.core import (
@@ -240,6 +242,7 @@ def assess_confidence(
     origin_ids: list[str],
     truncated: bool,
     proximity: float = 0.0,
+    now: datetime | None = None,
 ) -> Confidence:
     """Honest confidence, with the evidence that supports it and what is missing.
 
@@ -261,7 +264,7 @@ def assess_confidence(
         else:
             uncertain.append("event is synthetic, not an observation")
             score = min(score, 0.75)
-        freshness = event.source.freshness_seconds()
+        freshness = event.source.freshness_seconds(now=now)
         if freshness is not None and freshness > 6 * 3600:
             uncertain.append(f"observation is {freshness / 3600:.1f} h old")
             score -= 0.1

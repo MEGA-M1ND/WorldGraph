@@ -841,3 +841,15 @@ def headline_counts() -> dict[str, int]:
 #: Timestamps used by the replay scenarios, relative to the fixture epoch so a replay
 #: always tells the same story.
 REPLAY_BASE_TIME = FIXTURE_EPOCH + timedelta(days=4, hours=9, minutes=12)
+
+#: The instant the replay scenario depicts — "the earthquake has just been observed".
+#:
+#: Analyses are scored against a clock, because a stale observation genuinely deserves a
+#: lower score than a fresh one. That makes any assertion about a fixture's score a
+#: statement about *when it is evaluated*, and leaving that implicit is what let the
+#: AtlasPay regression pin expire roughly an hour after it was written: the score was
+#: 68.7 at merge and 60.7 the next day, with no code change in between.
+#:
+#: Tests that assert an exact score pass this as ``now`` so they pin a fact rather than a
+#: coincidence of the wall clock. Production passes nothing and reads the real time.
+REPLAY_EVALUATED_AT = REPLAY_BASE_TIME

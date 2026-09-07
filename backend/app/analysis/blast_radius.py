@@ -14,6 +14,7 @@ from __future__ import annotations
 import time
 import uuid
 from collections.abc import Iterable
+from datetime import datetime
 from typing import Literal
 
 from ..graph.world_graph import (
@@ -52,6 +53,7 @@ def calculate_blast_radius(
     node_budget: int = DEFAULT_NODE_BUDGET,
     mode: DataMode = DataMode.SYNTHETIC,
     impact_threshold: float = IMPACT_THRESHOLD,
+    now: datetime | None = None,
 ) -> BlastRadiusResult:
     """Compute the blast radius of one or more failing origins.
 
@@ -127,7 +129,12 @@ def calculate_blast_radius(
     exposure = customer_exposure(graph, state, threshold=impact_threshold)
     impact = business_impact(graph, state, threshold=impact_threshold)
 
-    stale_seconds = event.source.freshness_seconds() if event is not None else None
+    # Wall-clock enters the engine here and nowhere else. It is a real input — a
+    # four-hour-old observation deserves a lower score than a fresh one — but an *input*
+    # is something a caller supplies, not something a pure function reads from the
+    # environment. Leaving it implicit made the AtlasPay regression pin silently expire an
+    # hour after it was written (docs/REALITY_PASS_REPORT.md §7).
+    stale_seconds = event.source.freshness_seconds(now=now) if event is not None else None
     risk = score_impact(
         graph,
         state,
@@ -142,6 +149,7 @@ def calculate_blast_radius(
         state,
         event=event,
         origin_ids=origins,
+        now=now,
         truncated=traversal.truncated,
         proximity=proximity,
     )

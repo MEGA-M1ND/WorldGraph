@@ -424,6 +424,7 @@ class TestAtlasPayRegression:
     def test_hero_risk_score_is_unchanged(self, atlaspay_graph: WorldGraph):
         from app.adapters.fixtures import taiwan_earthquake
         from app.analysis.correlation import correlate_event
+        from app.fixtures.atlaspay import REPLAY_EVALUATED_AT
 
         event = taiwan_earthquake()
         pinned, _matches, proximity = correlate_event(atlaspay_graph, event)
@@ -434,9 +435,73 @@ class TestAtlasPayRegression:
             initial_availability=pinned,
             event=event,
             proximity=proximity,
+            # Evaluated at the instant the scenario depicts. Without this the score is a
+            # function of when the suite happens to run.
+            now=REPLAY_EVALUATED_AT,
         )
         assert result.severity.value == "HIGH"
         assert result.risk.score == pytest.approx(68.7, abs=0.05)
+
+    def test_the_score_is_a_function_of_the_clock_it_is_given(
+        self, atlaspay_graph: WorldGraph
+    ):
+        """The regression pin above is only meaningful if this is true.
+
+        A stale observation *should* score lower — that is the freshness penalty doing its
+        job. The defect was never the penalty; it was that the clock driving it was read
+        from the environment instead of supplied, so an exact-value assertion silently
+        stopped describing the code and started describing the calendar.
+        """
+        from datetime import timedelta
+
+        from app.adapters.fixtures import taiwan_earthquake
+        from app.analysis.correlation import correlate_event
+        from app.fixtures.atlaspay import REPLAY_EVALUATED_AT
+
+        event = taiwan_earthquake()
+        pinned, _matches, proximity = correlate_event(atlaspay_graph, event)
+
+        def score_at(moment):
+            return calculate_blast_radius(
+                atlaspay_graph,
+                origin_ids=sorted(pinned),
+                origin_kind="EVENT",
+                initial_availability=pinned,
+                event=event,
+                proximity=proximity,
+                now=moment,
+            ).risk
+
+        fresh = score_at(REPLAY_EVALUATED_AT)
+        day_old = score_at(REPLAY_EVALUATED_AT + timedelta(days=1))
+
+        assert fresh.score == pytest.approx(68.7, abs=0.05)
+        # A full freshness penalty, and it is itemised rather than folded into the total.
+        assert day_old.score == pytest.approx(60.7, abs=0.05)
+        assert any(c.code == "freshness_penalty" for c in day_old.contributions)
+        assert not any(c.code == "freshness_penalty" for c in fresh.contributions)
+
+    def test_the_same_clock_is_reproducible(self, atlaspay_graph: WorldGraph):
+        """Two runs at the same instant agree, whatever the wall clock says."""
+        from app.adapters.fixtures import taiwan_earthquake
+        from app.analysis.correlation import correlate_event
+        from app.fixtures.atlaspay import REPLAY_EVALUATED_AT
+
+        event = taiwan_earthquake()
+        pinned, _matches, proximity = correlate_event(atlaspay_graph, event)
+        scores = {
+            calculate_blast_radius(
+                atlaspay_graph,
+                origin_ids=sorted(pinned),
+                origin_kind="EVENT",
+                initial_availability=pinned,
+                event=event,
+                proximity=proximity,
+                now=REPLAY_EVALUATED_AT,
+            ).risk.score
+            for _ in range(3)
+        }
+        assert len(scores) == 1
 
     def test_hero_business_impact_is_unchanged(self, atlaspay_graph: WorldGraph):
         state = propagate(

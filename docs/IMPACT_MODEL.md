@@ -222,15 +222,23 @@ M6.8 near Hsinchu, 20 km from AtlasPay's sole-source supplier (radius 132 km, pr
 supplier modelled at 40 % availability):
 
 ```
-HIGH (73/100)
-  +19  critical asset impacted        Taiwan Hardware Supplier at 40% availability
+HIGH (68.7/100)
+  +18  critical asset impacted        Taiwan Hardware Supplier at 40% availability
    +3  customer-facing service degraded
-  +13  single-region dependency with no failover
-  +14  event proximity to enterprise assets
+  +12  single-region dependency with no failover
+  +13  event proximity to enterprise assets
   +11  high severity event
-   +3  customer traffic exposure
+   +2  customer traffic exposure
   +10  deep dependency propagation
 ```
+
+**Scored at the instant the scenario depicts.** The score also carries a freshness term:
+an observation more than an hour old loses up to 8 points, reaching the full penalty at
+twelve hours. That is deliberate — a day-old reading should not carry a fresh reading's
+authority — but it makes any exact score a statement about *when* it was evaluated. The
+engine therefore takes the clock as an argument (`calculate_blast_radius(..., now=...)`)
+rather than reading it from the environment, and the regression tests pass
+`REPLAY_EVALUATED_AT`. Replaying this fixture a day later scores it 60.7, correctly.
 
 Escalating it in simulation to *supplier DOWN + Singapore cluster DOWN* takes the same
 formula to **CRITICAL (90/100)**.

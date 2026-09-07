@@ -107,7 +107,7 @@ sequenceDiagram
     WS->>P: propagate(graph, pinned)
     P-->>WS: settled availability + capacity
     WS->>R: score_impact + assess_confidence
-    R-->>WS: 73/100 HIGH, with derivation
+    R-->>WS: 68.7/100 HIGH, with derivation
     WS->>WS: timeline: analyze, risk
     API-->>UI: BlastRadiusResult
     UI->>UI: recolour globe, frame origin
