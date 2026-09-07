@@ -105,6 +105,9 @@ class WorkspaceRegistry:
         self._states.clear()
 
     def _register(self, workspace: Workspace, state: WorldState) -> None:
+        # Every rebuild is a new revision. Callers cache against this rather than against
+        # the workspace id, because the id survives a re-import and the world does not.
+        workspace.revision += 1
         workspace.entity_count = len(state.graph)
         workspace.edge_count = len(state.graph.edges)
         workspace.status = WorkspaceStatus.READY
@@ -200,6 +203,9 @@ class WorkspaceRegistry:
             self._repository_factory(workspace.id),
             workspace=workspace,
             estate_loader=lambda: (entities, edges),
+            # What was just read from the source outranks what a previous read left
+            # behind. Without this a forced re-import kept the old estate.
+            loader_is_authoritative=True,
         )
         await state.startup()
         # Replace wholesale rather than merging. A re-import must not leave orphans from a

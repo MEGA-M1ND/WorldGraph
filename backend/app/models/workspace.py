@@ -91,6 +91,11 @@ class Workspace(BaseModel):
     edge_count: int = 0
     last_refreshed_at: str | None = None
 
+    #: Bumped every time this workspace's world is rebuilt. Anything cached against a
+    #: world — an analyst and its tools, above all — is keyed by it, so a re-import cannot
+    #: leave a component answering questions from an estate that no longer exists.
+    revision: int = 0
+
     @property
     def is_real(self) -> bool:
         return self.kind is WorkspaceKind.REAL
