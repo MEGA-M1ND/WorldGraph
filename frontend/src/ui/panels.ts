@@ -400,12 +400,86 @@ export function renderEventDetail(
 // Blast radius
 // ------------------------------------------------------------------------------------
 
+/** Copy for each assessment state. Ordered by how much the operator must not misread it. */
+const ASSESSMENT_COPY: Record<
+  NonNullable<BlastRadiusResult['assessment']>,
+  { label: string; tone: string; detail: string }
+> = {
+  CONFIRMED_AFFECTED: {
+    label: 'CONFIRMED AFFECTED',
+    tone: 'CRITICAL',
+    detail: "An asset's own software inventory names this CVE.",
+  },
+  POTENTIALLY_AFFECTED: {
+    label: 'POTENTIALLY AFFECTED',
+    tone: 'MODERATE',
+    detail:
+      'Matched on product name only — version and vendor were not compared. A candidate ' +
+      'for triage, not a confirmed exposure.',
+  },
+  NOT_AFFECTED: {
+    label: 'NOT AFFECTED',
+    tone: 'LOW',
+    detail: 'Adequate software inventory was searched and nothing matched.',
+  },
+  INSUFFICIENT_DATA: {
+    label: 'INSUFFICIENT DATA',
+    tone: 'HIGH',
+    detail:
+      'No conclusion was reached. WorldGraph does not have enough software inventory to ' +
+      'say whether this estate is affected — this is not a finding that it is safe.',
+  },
+};
+
+/**
+ * The security verdict, rendered before anything else.
+ *
+ * Deliberately not colour-coded by severity: an INSUFFICIENT_DATA result carries
+ * severity LOW and score 0, because there is no measured impact — and painting that green
+ * is exactly the misreading this panel exists to prevent.
+ */
+function renderAssessment(analysis: BlastRadiusResult): HTMLElement {
+  const assessment = analysis.assessment;
+  if (assessment === null) return el('div');
+  const copy = ASSESSMENT_COPY[assessment];
+
+  const rows: (Node | string)[] = [
+    el(
+      'div',
+      { class: 'detail__badges', style: 'margin-bottom:8px' },
+      badge(copy.label, copy.tone),
+    ),
+    el('p', { class: 'assessment__detail', text: copy.detail }),
+  ];
+
+  const coverage = analysis.inventory_coverage;
+  if (coverage !== null) {
+    rows.push(
+      el('p', {
+        class: 'assessment__coverage',
+        text:
+          `Inventory searched: ${coverage.entities_with_inventory} of ` +
+          `${coverage.assessable_entities} assets that could run software.`,
+      }),
+    );
+  }
+
+  return section('Vulnerability assessment', el('div', { class: 'assessment' }, ...rows));
+}
+
 export function renderAnalysis(
   analysis: BlastRadiusResult,
   actions: PanelActions,
 ): HTMLElement {
   const container = el('div');
   const impact = analysis.business_impact;
+
+  // A security analysis leads with what could be concluded, not with a severity colour.
+  // INSUFFICIENT_DATA scores 0/100 and would otherwise render as a calm green LOW — a
+  // confident all-clear derived from having searched nothing.
+  if (analysis.assessment !== null) {
+    container.append(renderAssessment(analysis));
+  }
 
   container.append(
     section(

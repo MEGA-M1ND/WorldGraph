@@ -19,8 +19,10 @@ from dataclasses import dataclass
 
 from ..geo.spatial import bearing_degrees, compass_point, haversine_km, proximity_factor
 from ..graph.world_graph import WorldGraph
+from ..models.analysis import InventoryCoverage, VulnerabilityAssessment
 from ..models.core import (
     DependencyType,
+    EntityType,
     EventCategory,
     HealthState,
     Severity,
@@ -187,6 +189,58 @@ class VulnerabilityMatch:
     internet_facing: bool
     #: Shortest path from the public internet to this asset, if one exists.
     internet_path: list[str] | None = None
+    #: How this asset was matched. A CVE id carried by the asset's own inventory is
+    #: evidence; a product-name collision is a candidate for triage. Conflating them is
+    #: how a vulnerability dashboard becomes noise nobody reads.
+    assessment: VulnerabilityAssessment = VulnerabilityAssessment.POTENTIALLY_AFFECTED
+
+
+#: Entity types that can plausibly run software, and therefore can carry an inventory.
+#: A cloud region, a customer segment or an organisation cannot; counting them would
+#: understate coverage and make a thin estate look well-inventoried.
+SOFTWARE_BEARING_TYPES: frozenset[EntityType] = frozenset(
+    {
+        EntityType.APPLICATION,
+        EntityType.MICROSERVICE,
+        EntityType.DATABASE,
+        EntityType.KUBERNETES_CLUSTER,
+        EntityType.NETWORK_NODE,
+        EntityType.EXTERNAL_API,
+    }
+)
+
+
+def inventory_coverage(graph: WorldGraph) -> InventoryCoverage:
+    """How much of this estate WorldGraph could search for vulnerable software.
+
+    Reported alongside every negative conclusion, because "we found nothing" means
+    something entirely different on an estate with no inventory than on one with full
+    inventory, and the two used to be indistinguishable in the output.
+    """
+    assessable = [e for e in graph.entities if e.type in SOFTWARE_BEARING_TYPES]
+    return InventoryCoverage(
+        assessable_entities=len(assessable),
+        entities_with_inventory=sum(1 for e in assessable if e.software),
+    )
+
+
+def assess_vulnerability(
+    graph: WorldGraph, matches: list[VulnerabilityMatch]
+) -> tuple[VulnerabilityAssessment, InventoryCoverage]:
+    """The honest conclusion for one vulnerability against one estate.
+
+    A negative requires inventory to back it. Without that, the answer is
+    ``INSUFFICIENT_DATA`` — which is not a softer way of saying "safe", and must never be
+    rendered as one.
+    """
+    coverage = inventory_coverage(graph)
+    if any(m.assessment is VulnerabilityAssessment.CONFIRMED_AFFECTED for m in matches):
+        return VulnerabilityAssessment.CONFIRMED_AFFECTED, coverage
+    if matches:
+        return VulnerabilityAssessment.POTENTIALLY_AFFECTED, coverage
+    if not coverage.supports_negative_conclusion:
+        return VulnerabilityAssessment.INSUFFICIENT_DATA, coverage
+    return VulnerabilityAssessment.NOT_AFFECTED, coverage
 
 
 def match_vulnerable_assets(
@@ -205,10 +259,14 @@ def match_vulnerable_assets(
 
     for entity in graph.entities:
         for component in entity.software:
-            hit = False
-            if (cve and cve in {c.upper() for c in component.cve_ids}) or (wanted_products and component.name.lower() in wanted_products):
-                hit = True
-            if not hit:
+            # An explicit CVE id on the asset's own inventory is evidence. A product-name
+            # collision is not: it ignores version and vendor, so "nginx" matches every
+            # nginx ever installed, including one patched years ago.
+            if cve and cve in {c.upper() for c in component.cve_ids}:
+                assessment = VulnerabilityAssessment.CONFIRMED_AFFECTED
+            elif wanted_products and component.name.lower() in wanted_products:
+                assessment = VulnerabilityAssessment.POTENTIALLY_AFFECTED
+            else:
                 continue
             matches.append(
                 VulnerabilityMatch(
@@ -216,6 +274,7 @@ def match_vulnerable_assets(
                     component_name=component.name,
                     component_version=component.version,
                     internet_facing=entity.exposure.internet_facing,
+                    assessment=assessment,
                 )
             )
             break  # one row per asset, not per package

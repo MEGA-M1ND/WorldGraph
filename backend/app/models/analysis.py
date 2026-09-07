@@ -157,6 +157,75 @@ class BusinessImpact(BaseModel):
         return self.availability is not None
 
 
+class VulnerabilityAssessment(str, Enum):
+    """What WorldGraph can honestly conclude about a vulnerability and an estate.
+
+    The distinction that matters is between the last two. Before this existed, an estate
+    with **no software inventory at all** produced the same answer as an estate that had
+    been searched and found clean: risk 0, severity LOW, and "deterministic correlation
+    found no exposed asset" offered as *strong evidence*. For a security product that is
+    the most dangerous output shape available — a confident all-clear derived from having
+    looked at nothing.
+
+    This is the Reality Pass thesis applied where it was missed: absent evidence and
+    negative evidence are different facts and must not share a representation.
+    """
+
+    #: An asset's own inventory names this CVE. The strongest claim available.
+    CONFIRMED_AFFECTED = "CONFIRMED_AFFECTED"
+    #: A product name matched, but nothing confirmed the version or vendor. A candidate
+    #: for triage, not a finding — see ``docs/SECURITY.md``.
+    POTENTIALLY_AFFECTED = "POTENTIALLY_AFFECTED"
+    #: Adequate inventory was searched and nothing matched. A real negative.
+    NOT_AFFECTED = "NOT_AFFECTED"
+    #: WorldGraph could not reach a conclusion, because it has too little inventory to
+    #: support one. **Never rendered as "safe".**
+    INSUFFICIENT_DATA = "INSUFFICIENT_DATA"
+
+    @property
+    def is_conclusive_negative(self) -> bool:
+        return self is VulnerabilityAssessment.NOT_AFFECTED
+
+
+class InventoryCoverage(BaseModel):
+    """How much of an estate WorldGraph could actually search for software.
+
+    A negative vulnerability conclusion is only as good as the inventory behind it, so the
+    inventory is reported alongside every such conclusion rather than assumed.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: Entities whose type could plausibly run software (a region or a customer segment
+    #: cannot, and counting them would understate coverage).
+    assessable_entities: int = Field(ge=0)
+    #: Of those, how many declare any software component at all.
+    entities_with_inventory: int = Field(ge=0)
+
+    @property
+    def ratio(self) -> float:
+        if self.assessable_entities <= 0:
+            return 0.0
+        return self.entities_with_inventory / self.assessable_entities
+
+    @property
+    def supports_negative_conclusion(self) -> bool:
+        """Whether "nothing is affected" is a statement this estate can support.
+
+        Deliberately strict: without inventory on a clear majority of the assets that
+        could run software, "we found nothing" describes the search, not the estate.
+        """
+        return self.assessable_entities > 0 and self.ratio >= 0.5
+
+    def describe(self) -> str:
+        if self.assessable_entities == 0:
+            return "no entity in this workspace could run software"
+        return (
+            f"{self.entities_with_inventory} of {self.assessable_entities} assets that "
+            f"could run software declare any software inventory"
+        )
+
+
 class Confidence(BaseModel):
     """Honest uncertainty attached to every analysis."""
 
@@ -206,6 +275,14 @@ class BlastRadiusResult(BaseModel):
 
     explanations: list[str] = Field(default_factory=list)
     confidence: Confidence
+
+    #: For security analyses, what WorldGraph could actually conclude. ``None`` for
+    #: non-security events. A structured field rather than prose, because a consumer that
+    #: renders severity as a colour needs to know that ``LOW`` here means "no conclusion",
+    #: not "no risk" — INSUFFICIENT_DATA must never be painted green.
+    assessment: VulnerabilityAssessment | None = None
+    #: The inventory behind a security conclusion, so a negative can be weighed.
+    inventory_coverage: InventoryCoverage | None = None
 
     #: Truncation is visible, never silent: if traversal hit its depth or node budget
     #: the caller must be able to say so.
