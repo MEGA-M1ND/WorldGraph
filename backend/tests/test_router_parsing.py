@@ -756,3 +756,173 @@ class TestAnExplicitBlastRadiusAskWins:
         ).answer
         assert "reachability paths from the public internet" not in answer
         assert "MATERIAL RISK" in answer
+
+
+class TestTheRoutesThatWereNeverExercised:
+    """Coverage found nine of the router's branches never executed by any test.
+
+    They are the ones an operator hits when the workspace is not in the state the happy
+    path assumes: nothing selected, nothing simulated yet, an empty question, a target
+    that nothing can reach. Each has to say what is missing rather than answer a
+    different question.
+    """
+
+    @staticmethod
+    def _run(world, question: str, **ctx_kwargs):
+        return IntentRouter(ToolContext(state=world, **ctx_kwargs)).handle(question)
+
+    @pytest.mark.anyio
+    async def test_an_empty_question_is_declined_not_answered(self, world):
+        for blank in ("", "   ", "\n\t "):
+            result = self._run(world, blank)
+            assert result.matched is False
+            assert result.answer.startswith("Ask me about this workspace's infrastructure")
+
+    @pytest.mark.anyio
+    async def test_a_comparison_with_no_active_simulation_says_to_simulate_first(self, world):
+        result = self._run(world, "compare that against the baseline")
+        assert result.answer.startswith("There is no active simulation to compare.")
+        assert "▲" not in result.answer and "▼" not in result.answer
+
+    @pytest.mark.anyio
+    async def test_a_comparison_with_an_active_simulation_renders_the_table(self, world):
+        ctx = ToolContext(state=world)
+        IntentRouter(ctx).handle("what happens if the Singapore region goes offline?")
+        scenario_id = ctx.active_scenario_id
+        assert scenario_id is not None, "simulating must leave a scenario active"
+        result = self._run(world, "compare that against the baseline", active_scenario_id=scenario_id)
+        assert result.answer.startswith("CURRENT vs SIMULATION")
+
+    @pytest.mark.anyio
+    async def test_a_vulnerability_question_on_an_estate_with_no_cves_says_so(self, world):
+        world._events.clear()
+        result = self._run(world, "any vulnerabilities we should know about?")
+        assert result.answer == "No vulnerability events are currently ingested."
+
+    @pytest.mark.anyio
+    async def test_a_named_but_unreachable_target_says_no_path_reaches_it(self, world):
+        """Not an empty list under a heading — a statement that nothing reaches it."""
+        result = self._run(world, "what can reach analytics-etl?")
+        assert result.answer == (
+            "No declared network path reaches analytics-etl from the public internet "
+            "in this model."
+        )
+        assert result.directives == [], "nothing to show, so nothing is drawn"
+
+    @pytest.mark.anyio
+    async def test_a_reachable_named_target_lists_its_paths_and_draws_the_first(self, world):
+        result = self._run(world, "what can reach internal-auth?")
+        assert "reachability paths from the public internet to internal-auth:" in result.answer
+        drawn = [d for d in result.directives if d["kind"] == "show_path"]
+        assert len(drawn) == 1
+        assert drawn[0]["path"]
+
+    @pytest.mark.anyio
+    async def test_a_tool_failure_becomes_the_answer_rather_than_a_traceback(self, world):
+        """The router catches ToolError and hands the message straight to the operator."""
+        result = self._run(
+            world, "show the blast radius for no-such-entity", selected_entity_id="ghost"
+        )
+        assert result.answer == "Unknown entities: ghost."
+        assert "Traceback" not in result.answer
+
+    @pytest.mark.anyio
+    async def test_a_blast_radius_with_nothing_named_or_selected_asks_for_a_target(self, world):
+        result = self._run(world, "show me the blast radius")
+        assert result.answer.startswith("Select an entity or event first, or name one")
+
+    @pytest.mark.anyio
+    async def test_a_selection_stands_in_for_a_named_target(self, world):
+        entity = next(e for e in world.entities() if e.type.value == "MICROSERVICE")
+        result = self._run(world, "show me the blast radius", selected_entity_id=entity.id)
+        assert "MATERIAL RISK" in result.answer
+        assert entity.name in result.answer
+
+    @pytest.mark.anyio
+    async def test_a_dependency_question_uses_the_selection_when_nothing_is_named(self, world):
+        entity = next(e for e in world.entities() if e.type.value == "MICROSERVICE")
+        result = self._run(world, "what does it depend on?", selected_entity_id=entity.id)
+        assert result.answer.startswith(f"What {entity.name} depends on")
+
+    @pytest.mark.anyio
+    async def test_a_customer_question_with_no_affected_region_says_none_fell_below(
+        self, world
+    ):
+        from app.graph.world_graph import WorldGraph
+        from app.models.core import (
+            BusinessProfile,
+            DataMode,
+            DataSourceInfo,
+            EntityType,
+            ExposureProfile,
+            WorldEntity,
+        )
+
+        world.graph = WorldGraph(
+            [
+                WorldEntity(
+                    id="lonely",
+                    type=EntityType.APPLICATION,
+                    name="lonely",
+                    source=DataSourceInfo(source_id="s", source_name="S", mode=DataMode.LIVE),
+                    business=BusinessProfile(region="westeurope"),
+                    exposure=ExposureProfile(internet_facing=False, network_zone="z"),
+                )
+            ],
+            [],
+        )
+        ctx = ToolContext(state=world)
+        IntentRouter(ctx).handle("show the blast radius for lonely")
+        answer = IntentRouter(ToolContext(state=world)).handle(
+            "which customers are affected?"
+        ).answer
+        assert "no customer region falls below nominal availability" in answer
+        assert "%" not in answer
+
+
+class TestWhyAnAnalysisSaidWhatItSaid:
+    """The "why" route reads back a stored analysis rather than recomputing one.
+
+    Its whole body was uncovered: choosing the analysis that touched the named entity,
+    falling back to the most recent, and the per-entity line that quotes the path an
+    impact travelled.
+    """
+
+    @staticmethod
+    def _analysed(world):
+        entity = next(e for e in world.entities() if e.type.value == "MICROSERVICE")
+        IntentRouter(ToolContext(state=world)).handle(
+            f"show the blast radius for {entity.name}"
+        )
+        return entity
+
+    @pytest.mark.anyio
+    async def test_it_explains_the_most_recent_analysis_when_nothing_is_named(self, world):
+        self._analysed(world)
+        answer = IntentRouter(ToolContext(state=world)).handle("why?").answer
+        assert "Risk " in answer
+        assert "Confidence " in answer
+
+    @pytest.mark.anyio
+    async def test_naming_an_entity_quotes_the_path_the_impact_travelled(self, world):
+        entity = self._analysed(world)
+        answer = IntentRouter(ToolContext(state=world)).handle(
+            f"why is {entity.name} affected?"
+        ).answer
+        assert f"{entity.name} specifically: modelled at" in answer
+        assert "% availability, reached via" in answer
+
+    @pytest.mark.anyio
+    async def test_with_nothing_analysed_and_a_named_target_it_computes_one(self, world):
+        entity = next(e for e in world.entities() if e.type.value == "MICROSERVICE")
+        world._analyses.clear()
+        answer = IntentRouter(ToolContext(state=world)).handle(
+            f"why would {entity.name} be at risk?"
+        ).answer
+        assert "MATERIAL RISK" in answer
+
+    @pytest.mark.anyio
+    async def test_with_nothing_analysed_and_nothing_named_it_declines(self, world):
+        world._analyses.clear()
+        result = IntentRouter(ToolContext(state=world)).handle("why though?")
+        assert result.matched is False
