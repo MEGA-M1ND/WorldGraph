@@ -7,6 +7,8 @@ instruction.
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import pytest
 
 from app.ai.analyst import DeterministicAnalyst, analyst_status
@@ -448,3 +450,144 @@ class TestToolArgumentsAreBoundedNotTruncated:
         with pytest.raises(ToolError):
             run_tool(ctx, "find_assets_near_event", {"event_id": event_id, "radius_km": -1.0})
 
+
+
+class TestTheToolArgumentContract:
+    """Every argument bound in the registry, written out as a table.
+
+    Roughly forty of these survived mutation individually. Rather than forty near-identical
+    tests, the contract is stated once as literals — which is what a schema table is for —
+    and read back off the live Pydantic models. A bound that is removed, widened or
+    narrowed fails here with the field named.
+
+    The literals are the point. Deriving expectations from `model_json_schema()` on both
+    sides would assert that the schema equals itself.
+    """
+
+    #: (schema, field, min_length/ge, max_length/le). `None` means "no bound on that side".
+    CONTRACT: ClassVar[list[tuple[str, str, object, object]]] = [
+        ("EntityIdArgs", "entity_id", 1, 128),
+        ("SearchArgs", "query", None, 128),
+        ("SearchArgs", "entity_type", None, 64),
+        ("SearchArgs", "criticality", None, 32),
+        ("SearchArgs", "limit", 1, 40),
+        ("TraceArgs", "entity_id", 1, 128),
+        ("TraceArgs", "max_depth", 1, 8),
+        ("EventIdArgs", "event_id", 1, 192),
+        ("RecentEventsArgs", "limit", 1, 40),
+        ("RecentEventsArgs", "minutes", 1, 43200),
+        ("RecentEventsArgs", "category", None, 48),
+        ("BlastRadiusArgs", "event_id", None, 192),
+        ("BlastRadiusArgs", "scenario_id", None, 128),
+        ("NearEventArgs", "event_id", 1, 192),
+        ("NearEventArgs", "radius_km", 0.0, 5000.0),
+        ("CreateSimulationArgs", "name", 1, 160),
+        ("CreateSimulationArgs", "origin_event_id", None, 192),
+        ("AddOverrideArgs", "scenario_id", 1, 128),
+        ("AddOverrideArgs", "target_id", 1, 256),
+        ("AddOverrideArgs", "health", None, 32),
+        ("AddOverrideArgs", "capacity", 0.0, 1.0),
+        ("RemoveOverrideArgs", "scenario_id", 1, 128),
+        ("RemoveOverrideArgs", "override_id", 1, 128),
+        ("ScenarioArgs", "scenario_id", 1, 128),
+        ("PlanArgs", "analysis_id", None, 128),
+        ("PlanArgs", "scenario_id", None, 128),
+        ("PlanArgs", "event_id", None, 192),
+    ]
+
+    @pytest.mark.parametrize(("schema_name", "field", "low", "high"), CONTRACT)
+    def test_the_bound_is_what_the_contract_says(self, schema_name, field, low, high):
+        from app.ai import tools as tools_module
+
+        model = getattr(tools_module, schema_name)
+        info = model.model_fields[field]
+        found_low, found_high = None, None
+        for constraint in info.metadata:
+            for attribute, setter in (
+                ("min_length", "low"), ("ge", "low"), ("max_length", "high"), ("le", "high"),
+            ):
+                value = getattr(constraint, attribute, None)
+                if value is None:
+                    continue
+                if setter == "low":
+                    found_low = value
+                else:
+                    found_high = value
+        assert (found_low, found_high) == (low, high), f"{schema_name}.{field}"
+
+    def test_no_argument_is_left_unbounded(self):
+        """A new schema with an unbounded string is the gap this table exists to catch."""
+        from app.ai import tools as tools_module
+
+        unbounded = []
+        for tool in TOOLS.values():
+            for name, info in tool.args_model.model_fields.items():
+                annotation = str(info.annotation)
+                if "str" not in annotation and "int" not in annotation and "float" not in annotation:
+                    continue
+                if not any(
+                    getattr(c, attribute, None) is not None
+                    for c in info.metadata
+                    for attribute in ("max_length", "le")
+                ):
+                    unbounded.append(f"{tool.args_model.__name__}.{name}")
+        assert unbounded == []
+        assert tools_module.MAX_ROWS == 40
+
+    def test_every_schema_in_the_contract_is_actually_used_by_a_tool(self):
+        """So the table cannot drift into describing dead code."""
+        in_use = {tool.args_model.__name__ for tool in TOOLS.values()}
+        listed = {row[0] for row in self.CONTRACT}
+        assert listed <= in_use
+
+
+class TestTriStateRendering:
+    """`None` reaches a model as the word UNKNOWN, never as a bare null.
+
+    A null in a tool result is routinely read as "no" or as zero, and zero is a
+    measurement. Every branch of this survived mutation.
+    """
+
+    def test_the_three_states_are_three_different_words(self):
+        from app.ai.tools import _tri_state
+
+        assert _tri_state(True) == "YES"
+        assert _tri_state(False) == "NO"
+        assert _tri_state(None) == "UNKNOWN"
+
+    def test_an_entity_row_never_carries_a_bare_null_for_a_declared_quantity(self, ctx):
+        entity_id = next(e.id for e in ctx.state.entities())
+        row = run_tool(ctx, "get_entity", {"entity_id": entity_id})
+        for field in ("traffic_share", "redundancy", "customer_facing"):
+            assert row[field] is not None, field
+
+    def test_an_undeclared_quantity_says_unknown_rather_than_zero(self, ctx):
+        """The estate an Azure import produces: no traffic share, no redundancy declared."""
+        from app.graph.world_graph import WorldGraph
+        from app.models.core import (
+            BusinessProfile,
+            DataMode,
+            DataSourceInfo,
+            EntityType,
+            ExposureProfile,
+            WorldEntity,
+        )
+
+        ctx.state.graph = WorldGraph(
+            [
+                WorldEntity(
+                    id="bare",
+                    type=EntityType.APPLICATION,
+                    name="bare",
+                    source=DataSourceInfo(source_id="s", source_name="S", mode=DataMode.LIVE),
+                    business=BusinessProfile(region="westeurope"),
+                    exposure=ExposureProfile(internet_facing=False, network_zone="z"),
+                )
+            ],
+            [],
+        )
+        row = run_tool(ctx, "get_entity", {"entity_id": "bare"})
+        assert row["traffic_share"] == "UNKNOWN"
+        assert row["redundancy"] == "UNKNOWN"
+        assert row["customer_facing"] == "UNKNOWN"
+        assert 0 not in (row["traffic_share"], row["redundancy"])
