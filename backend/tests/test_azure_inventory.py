@@ -1165,3 +1165,129 @@ class TestEverySensitiveHintActuallyRedacts:
                 "is no longer load-bearing, and if none does it leaks"
             )
             assert sanitize_properties({name: self.SECRET_VALUE})[name] == "[redacted]"
+
+
+class TestTheReferenceWalkerHasBounds:
+    """`collect_references` is the only automatic evidence WorldGraph accepts for an edge.
+
+    Reality Pass §2: dependencies come from explicit configuration, never from resources
+    merely resembling each other. That makes this walker's bounds load-bearing in two
+    directions — too narrow and real references are missed, too wide and a hostile or
+    malformed property tree becomes the import's cost centre. Every bound survived
+    mutation.
+    """
+
+    SUB = "/subscriptions/00000000-0000-0000-0000-000000000001"
+
+    def _ref(self, index: int) -> str:
+        return f"{self.SUB}/resourceGroups/rg/providers/Microsoft.Web/sites/app-{index}"
+
+    def test_a_reference_is_found_however_deeply_it_is_nested(self):
+        tree = {"a": {"b": {"c": [{"d": {"targetId": self._ref(1)}}]}}}
+        assert collect_references(tree) == [self._ref(1)]
+
+    def test_the_walk_stops_before_a_pathological_tree_exhausts_the_stack(self):
+        """Azure property trees are deep and occasionally self-referential."""
+        node: dict = {"targetId": self._ref(1)}
+        for _ in range(30):
+            node = {"child": node}
+        assert collect_references(node) == []
+
+    @pytest.mark.parametrize(
+        ("wrappers", "expected_found"),
+        [(6, True), (7, True), (8, False), (9, False)],
+    )
+    def test_the_depth_bound_sits_exactly_where_it_claims_to(self, wrappers, expected_found):
+        """`vnetSubnetID` inside an AKS agent pool sits several levels down.
+
+        Both sides of the boundary: too shallow and real Azure shapes are missed, too deep
+        and a self-referential tree is walked further than it needs to be.
+        """
+        node: dict = {"targetId": self._ref(1)}
+        for _ in range(wrappers):
+            node = {"child": node}
+        found = collect_references(node)
+        assert bool(found) is expected_found
+
+    def test_the_result_count_is_capped(self):
+        """A dict, not a list — the 50-element list slice must not do this work instead."""
+        tree = {f"ref{i}": self._ref(i) for i in range(400)}
+        assert len(collect_references(tree)) == 200
+        assert len(collect_references(tree, limit=5)) == 5
+
+    def test_only_the_head_of_a_long_list_is_walked(self):
+        """A 10 000-element array must not be traversed to find the same few references."""
+        tree = {"refs": [{"id": self._ref(i)} for i in range(400)]}
+        assert len(collect_references(tree)) == 50
+
+    def test_a_string_that_is_not_a_resource_id_is_not_a_reference(self):
+        found = collect_references(
+            {
+                "note": "see /subscriptions elsewhere",
+                "url": "https://example.invalid/subscriptions/abc",
+                "name": "app-1",
+                "id": self._ref(1),
+            }
+        )
+        assert found == [self._ref(1)]
+
+    def test_a_reference_is_recognised_in_azures_own_casing(self):
+        upper = self._ref(1).replace("/subscriptions/", "/SUBSCRIPTIONS/")
+        assert collect_references({"id": upper}) == [upper]
+
+    def test_surrounding_whitespace_does_not_hide_a_reference(self):
+        assert collect_references({"id": f"  {self._ref(1)}  "}) == [self._ref(1)]
+
+    def test_an_absurdly_long_string_is_not_treated_as_an_id(self):
+        """A blob that merely starts like an id is a payload, not a dependency."""
+        assert collect_references({"id": self.SUB + "/" + "x" * 2000}) == []
+        # And one comfortably under the bound still is.
+        long_but_plausible = self.SUB + "/" + "x" * 200
+        assert collect_references({"id": long_but_plausible}) == [long_but_plausible]
+
+    def test_nothing_is_found_in_an_empty_or_scalar_tree(self):
+        for empty in ({}, [], "", None, 0, 42):
+            assert collect_references(empty) == []
+
+
+class TestEntityIdsAreSlugsNotAzureIds:
+    """Ids reach URLs and shared screens. Every part of the derivation survived mutation."""
+
+    SUB = "/subscriptions/00000000-0000-0000-0000-000000000001"
+
+    def test_the_full_derivation(self):
+        resource_id = f"{self.SUB}/resourceGroups/rg-prod/providers/Microsoft.Web/sites/storefront"
+        # Subscription and resource-group prefix dropped, the provider segment collapsed,
+        # slashes become dots, lower-cased, prefixed.
+        assert entity_id_for(resource_id) == "az.rg-prod.sites.storefront"
+
+    def test_the_provider_segment_is_collapsed_not_kept(self):
+        """`Microsoft.Web` in the id would make every slug longer and no more distinct."""
+        slug = entity_id_for(
+            f"{self.SUB}/resourceGroups/rg/providers/Microsoft.Network/virtualNetworks/vnet"
+        )
+        assert "microsoft" not in slug
+        assert slug == "az.rg.virtualnetworks.vnet"
+
+    def test_two_resources_of_different_types_in_one_group_do_not_collide(self):
+        first = entity_id_for(f"{self.SUB}/resourceGroups/rg/providers/Microsoft.Web/sites/x")
+        second = entity_id_for(
+            f"{self.SUB}/resourceGroups/rg/providers/Microsoft.Sql/servers/x"
+        )
+        assert first != second
+
+    def test_the_same_name_in_two_resource_groups_does_not_collide(self):
+        first = entity_id_for(f"{self.SUB}/resourceGroups/rg-a/providers/Microsoft.Web/sites/x")
+        second = entity_id_for(f"{self.SUB}/resourceGroups/rg-b/providers/Microsoft.Web/sites/x")
+        assert first != second
+
+    def test_the_slug_is_bounded(self):
+        long_id = f"{self.SUB}/resourceGroups/rg/providers/Microsoft.Web/sites/" + "n" * 400
+        slug = entity_id_for(long_id)
+        assert len(slug) <= 124  # "az." + a 120-character slug
+        assert slug.startswith("az.")
+
+    def test_the_subscription_guid_never_appears(self):
+        slug = entity_id_for(f"{self.SUB}/resourceGroups/rg/providers/Microsoft.Web/sites/x")
+        assert "00000000" not in slug
+        assert "subscriptions" not in slug
