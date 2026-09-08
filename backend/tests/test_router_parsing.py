@@ -618,3 +618,141 @@ class TestThePlanRendering:
         assert "Assumptions:" in answer
         assumption_lines = [line for line in answer.splitlines() if line.startswith("  - ")]
         assert assumption_lines
+
+
+class TestWhichIncidentTheRouterPicks:
+    """With nothing selected, "what should we do?" has to pick *an* incident.
+
+    The severity order and the "must correlate with this estate" filter both survived. A
+    reordered list answers about the least severe thing on the feed; a dropped filter
+    answers about somebody else's outage.
+    """
+
+    @staticmethod
+    def _make(world, event_id: str, severity, *, correlating: bool):
+        from app.models.core import DataMode, DataSourceInfo, EventCategory, WorldEvent, utcnow
+
+        target = world.entities()[0].id
+        return WorldEvent(
+            id=event_id,
+            category=EventCategory.CLOUD_INCIDENT,
+            title=event_id,
+            severity=severity,
+            source=DataSourceInfo(source_id="p", source_name="P", mode=DataMode.REPLAY),
+            directly_named_entity_ids=[target] if correlating else ["not-in-this-estate"],
+            occurred_at=utcnow(),
+        )
+
+    @pytest.mark.anyio
+    async def test_the_most_severe_correlating_incident_wins(self, world):
+        from app.models.core import Severity
+
+        world._events.clear()
+        for name, severity in (
+            ("low-one", Severity.LOW),
+            ("critical-one", Severity.CRITICAL),
+            ("high-one", Severity.HIGH),
+            ("moderate-one", Severity.MODERATE),
+        ):
+            world._events[name] = self._make(world, name, severity, correlating=True)
+        router = IntentRouter(ToolContext(state=world))
+        assert router._most_severe_incident() == "critical-one"
+
+    @pytest.mark.anyio
+    async def test_a_more_severe_event_that_does_not_touch_this_estate_is_skipped(self, world):
+        """Somebody else's CRITICAL is not our incident."""
+        from app.models.core import Severity
+
+        world._events.clear()
+        world._events["theirs"] = self._make(world, "theirs", Severity.CRITICAL, correlating=False)
+        world._events["ours"] = self._make(world, "ours", Severity.LOW, correlating=True)
+        router = IntentRouter(ToolContext(state=world))
+        assert router._most_severe_incident() == "ours"
+
+    @pytest.mark.anyio
+    async def test_nothing_correlating_yields_nothing_rather_than_a_guess(self, world):
+        from app.models.core import Severity
+
+        world._events.clear()
+        world._events["theirs"] = self._make(world, "theirs", Severity.CRITICAL, correlating=False)
+        router = IntentRouter(ToolContext(state=world))
+        assert router._most_severe_incident() is None
+
+    @pytest.mark.anyio
+    async def test_a_tie_on_severity_is_broken_by_recency(self, world):
+        from datetime import timedelta
+
+        from app.models.core import Severity, utcnow
+
+        world._events.clear()
+        older = self._make(world, "older", Severity.HIGH, correlating=True)
+        older.occurred_at = utcnow() - timedelta(hours=3)
+        newer = self._make(world, "newer", Severity.HIGH, correlating=True)
+        world._events["older"] = older
+        world._events["newer"] = newer
+        router = IntentRouter(ToolContext(state=world))
+        assert router._most_severe_incident() == "newer"
+
+
+class TestDegradedIsNotDown:
+    """"What if Singapore is degraded" and "what if Singapore goes down" are two questions.
+
+    `\\bdegrad` was unprotected, so both phrasings could have modelled a total outage —
+    which overstates the impact of every partial-failure what-if an operator asks.
+    """
+
+    @pytest.mark.anyio
+    async def test_a_degraded_what_if_models_degradation(self, world):
+        result = IntentRouter(ToolContext(state=world)).handle(
+            "what if the Singapore region is degraded?"
+        )
+        assert "DEGRADED" in result.answer
+        assert "DOWN" not in result.answer
+
+    @pytest.mark.anyio
+    async def test_an_outage_what_if_models_an_outage(self, world):
+        result = IntentRouter(ToolContext(state=world)).handle(
+            "what happens if the Singapore region goes offline?"
+        )
+        assert "DOWN" in result.answer
+
+    @pytest.mark.anyio
+    async def test_a_simulation_answer_says_nothing_real_changed(self, world):
+        """Reality Pass §27, at the top of the answer where it cannot be missed."""
+        answer = IntentRouter(ToolContext(state=world)).handle(
+            "what happens if the Singapore region goes offline?"
+        ).answer
+        assert answer.startswith(
+            "SIMULATION — hypothetical world state. Nothing real has changed.\n"
+        )
+        assert "Scenario: What-if: " in answer
+        assert "\nFailures: " in answer
+
+    @pytest.mark.anyio
+    async def test_an_unresolvable_target_asks_rather_than_failing_something_arbitrary(
+        self, world
+    ):
+        answer = IntentRouter(ToolContext(state=world)).handle(
+            "what happens if it goes offline?"
+        ).answer
+        assert answer.startswith("I could not tell which entity to fail.")
+        assert not world.scenarios(), "a failed parse must not leave a scenario behind"
+
+
+class TestAnExplicitBlastRadiusAskWins:
+    """Both intents match "show the blast radius if admin-api is compromised"."""
+
+    @pytest.mark.anyio
+    async def test_the_vulnerability_route_stands_down(self, world):
+        answer = IntentRouter(ToolContext(state=world)).handle(
+            "show the blast radius for this exploit"
+        ).answer
+        assert "assets confirmed running the affected software" not in answer
+
+    @pytest.mark.anyio
+    async def test_the_reachability_route_stands_down_too(self, world):
+        answer = IntentRouter(ToolContext(state=world)).handle(
+            "show the blast radius if admin-api is compromised"
+        ).answer
+        assert "reachability paths from the public internet" not in answer
+        assert "MATERIAL RISK" in answer
