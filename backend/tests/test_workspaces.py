@@ -490,3 +490,108 @@ class TestPerformance:
         # blast radius reads as a complete one.
         if result.truncated:
             assert result.truncation_reason
+
+
+class TestDatabaseFilesAreTheIsolationMechanism:
+    """`default_repository_for` is what makes isolation structural rather than a filter.
+
+    The class docstring says it: "a query cannot reach another workspace's rows if those
+    rows are in a different database". Every constant that derives the per-workspace path
+    survived mutation, so two workspaces sharing one file — which is exactly the
+    contamination this design exists to rule out — would have gone unnoticed.
+    """
+
+    @staticmethod
+    def _path_for(tmp_path, workspace_id: str, *, filename: str = "worldgraph.db") -> str:
+        from app.config import RunMode, Settings
+        from app.services.workspaces import default_repository_for
+
+        settings = Settings(
+            run_mode=RunMode.DEMO,
+            database_path=str(tmp_path / filename),
+            anthropic_api_key=None,
+            cesium_ion_token=None,
+            google_maps_api_key=None,
+        )
+        return default_repository_for(settings, workspace_id)._path
+
+    def test_two_workspaces_never_resolve_to_the_same_file(self, tmp_path):
+        from app.models.workspace import ATLASPAY_WORKSPACE_ID
+
+        paths = {
+            self._path_for(tmp_path, wid)
+            for wid in (ATLASPAY_WORKSPACE_ID, "azure-a", "azure-b")
+        }
+        assert len(paths) == 3
+
+    def test_the_demo_keeps_the_configured_path_unsuffixed(self, tmp_path):
+        from app.models.workspace import ATLASPAY_WORKSPACE_ID
+
+        assert self._path_for(tmp_path, ATLASPAY_WORKSPACE_ID) == str(tmp_path / "worldgraph.db")
+
+    def test_another_workspace_is_namespaced_by_its_id_before_the_extension(self, tmp_path):
+        assert self._path_for(tmp_path, "azure-a") == str(tmp_path / "worldgraph.azure-a.db")
+
+    def test_a_path_without_a_db_extension_is_suffixed_at_the_end(self, tmp_path):
+        assert self._path_for(tmp_path, "azure-a", filename="store") == str(
+            tmp_path / "store.azure-a"
+        )
+        # And the .db branch must not fire on a name that merely contains "db".
+        assert self._path_for(tmp_path, "azure-a", filename="dbstore") == str(
+            tmp_path / "dbstore.azure-a"
+        )
+
+    def test_an_in_memory_store_stays_in_memory_for_every_workspace(self, tmp_path):
+        from app.config import RunMode, Settings
+        from app.models.workspace import ATLASPAY_WORKSPACE_ID
+        from app.services.workspaces import default_repository_for
+
+        settings = Settings(
+            run_mode=RunMode.DEMO,
+            database_path=":memory:",
+            anthropic_api_key=None,
+            cesium_ion_token=None,
+            google_maps_api_key=None,
+        )
+        for wid in (ATLASPAY_WORKSPACE_ID, "azure-a"):
+            assert default_repository_for(settings, wid)._path == ":memory:"
+
+
+class TestAnImportFailureReasonCarriesNothingInternal:
+    """`_safe_reason` is the only thing between a cloud SDK exception and an API response.
+
+    A raw SDK error can carry a request URL, a tenant id or a token fragment. Only a
+    message the adapter deliberately authored may pass through whole.
+    """
+
+    def test_an_adapter_authored_message_passes_through(self):
+        from app.adapters.base import AdapterError
+        from app.services.workspaces import _safe_reason
+
+        assert _safe_reason(AdapterError("Subscription id is not configured.")) == (
+            "Subscription id is not configured."
+        )
+
+    def test_any_other_exception_is_reduced_to_its_type(self):
+        from app.services.workspaces import _safe_reason
+
+        leaky = RuntimeError(
+            "GET https://management.azure.com/subscriptions/"
+            "00000000-1111-2222-3333-444444444444/providers?api-version=2021-03-01 "
+            "failed: Bearer eyJ0eXAiOiJKV1Qi"
+        )
+        reason = _safe_reason(leaky)
+        assert reason == "RuntimeError while importing inventory"
+        for secret in ("management.azure.com", "00000000", "Bearer", "eyJ0eXAiOiJKV1Qi"):
+            assert secret not in reason
+
+    def test_the_type_name_is_the_real_one_not_a_placeholder(self):
+        """It has to be diagnostic enough to act on — that is why the type survives."""
+        from app.services.workspaces import _safe_reason
+
+        class CredentialUnavailableError(Exception):
+            pass
+
+        assert _safe_reason(CredentialUnavailableError("token path /home/x/.azure")) == (
+            "CredentialUnavailableError while importing inventory"
+        )

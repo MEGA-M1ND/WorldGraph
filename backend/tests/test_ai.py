@@ -366,3 +366,85 @@ class TestReachabilityRendering:
         assert "[ESTABLISHED]" in answer
         assert "[INFERRED]" in answer
         assert "not proof of exploitability" in answer.lower()
+
+
+class TestToolArgumentsAreBoundedNotTruncated:
+    """Every tool argument is a string an operator or a model can choose.
+
+    Mutation testing found every one of these caps unprotected. They are not cosmetic:
+    `MAX_ROWS` is what stops a single query dumping the whole estate into a context
+    window, and the length ceilings are what stop an unbounded string reaching the graph
+    lookup, the log line and the prompt.
+
+    Pydantic must *reject*, not silently truncate — a truncated entity id resolves to a
+    different entity, which is worse than an error.
+    """
+
+    def test_an_over_long_entity_id_is_rejected(self, ctx):
+        with pytest.raises(ToolError) as over:
+            run_tool(ctx, "get_entity", {"entity_id": "x" * 129})
+        assert "at most 128 characters" in str(over.value)
+        # One character under the ceiling gets past validation and fails on lookup
+        # instead — a different error from a different layer, which is how we know the
+        # ceiling is at 128 and not somewhere else.
+        with pytest.raises(ToolError) as at_limit:
+            run_tool(ctx, "get_entity", {"entity_id": "x" * 128})
+        assert str(at_limit.value).startswith("No entity ")
+
+    def test_a_row_limit_above_the_ceiling_is_rejected(self, ctx):
+        from app.ai.tools import MAX_ROWS
+
+        assert MAX_ROWS == 40
+        with pytest.raises(ToolError):
+            run_tool(ctx, "search_entities", {"limit": MAX_ROWS + 1})
+        with pytest.raises(ToolError):
+            run_tool(ctx, "search_entities", {"limit": 0})
+        assert run_tool(ctx, "search_entities", {"limit": MAX_ROWS})["count"] >= 0
+
+    def test_a_result_list_is_cut_at_the_row_cap_not_at_the_estate_size(self, ctx):
+        """AtlasPay has 42 entities, so a 40-row cap is observable rather than vacuous."""
+        from app.ai.tools import MAX_ROWS
+
+        result = run_tool(ctx, "search_entities", {"query": "", "limit": MAX_ROWS})
+        assert result["count"] == len(ctx.state.entities()) > MAX_ROWS
+        # `count` is the true total; the rows are what fits in a prompt.
+        assert len(result["entities"]) == MAX_ROWS
+
+    def test_traversal_depth_is_bounded_on_both_sides(self, ctx):
+        entity_id = next(e.id for e in ctx.state.entities())
+        with pytest.raises(ToolError):
+            run_tool(ctx, "trace_dependencies", {"entity_id": entity_id, "max_depth": 9})
+        with pytest.raises(ToolError):
+            run_tool(ctx, "trace_dependencies", {"entity_id": entity_id, "max_depth": 0})
+        assert run_tool(ctx, "trace_dependencies", {"entity_id": entity_id, "max_depth": 8})
+
+    def test_a_recency_window_cannot_exceed_a_month(self, ctx):
+        """`60 * 24 * 30`. An unbounded window makes "recent" meaningless."""
+        assert run_tool(ctx, "get_recent_changes", {"minutes": 60 * 24 * 30})
+        with pytest.raises(ToolError):
+            run_tool(ctx, "get_recent_changes", {"minutes": 60 * 24 * 30 + 1})
+        with pytest.raises(ToolError):
+            run_tool(ctx, "get_recent_changes", {"minutes": 0})
+
+    def test_a_capacity_override_stays_inside_zero_to_one(self, ctx):
+        scenario = run_tool(ctx, "create_simulation", {"name": "bounds probe"})
+        target = next(e.id for e in ctx.state.entities())
+        for bad in (-0.1, 1.1):
+            with pytest.raises(ToolError):
+                run_tool(
+                    ctx,
+                    "add_simulation_override",
+                    {
+                        "scenario_id": scenario["scenario_id"],
+                        "target_id": target,
+                        "capacity": bad,
+                    },
+                )
+
+    def test_a_search_radius_cannot_span_the_planet(self, ctx):
+        event_id = next(iter(ctx.state._events))
+        with pytest.raises(ToolError):
+            run_tool(ctx, "find_assets_near_event", {"event_id": event_id, "radius_km": 5001.0})
+        with pytest.raises(ToolError):
+            run_tool(ctx, "find_assets_near_event", {"event_id": event_id, "radius_km": -1.0})
+
