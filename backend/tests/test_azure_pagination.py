@@ -58,18 +58,37 @@ class FakePage:
         self.result_truncated = result_truncated
 
 
+def token_of(request) -> str | None:
+    """Read the continuation token from a request, whichever shape it is.
+
+    `_request_factory` builds a real `QueryRequest` when the optional Azure SDK is
+    installed and a plain dict when it is not, and the token sits in a different place in
+    each: `request.options.skip_token` versus `request["skip_token"]`.
+
+    This used to be `request.get("skip_token") if isinstance(request, dict) else None`,
+    which silently reported **no token at all** for the real SDK shape. CI runs without the
+    optional SDK, so it only ever exercised the dict — and with the SDK installed, the one
+    test that proves the loop threads its token at all passed while asserting nothing.
+    """
+    if isinstance(request, dict):
+        return request.get("skip_token")
+    options = getattr(request, "options", None)
+    return getattr(options, "skip_token", None)
+
+
 class FakeClient:
     """A Resource Graph client that hands back prepared pages, recording the tokens it saw."""
 
     def __init__(self, pages):
         self._pages = list(pages)
         self.tokens_seen: list[str | None] = []
+        self.requests_seen: list[object] = []
         self.calls = 0
 
     def resources(self, request):
         self.calls += 1
-        token = request.get("skip_token") if isinstance(request, dict) else None
-        self.tokens_seen.append(token)
+        self.requests_seen.append(request)
+        self.tokens_seen.append(token_of(request))
         return self._pages[min(self.calls - 1, len(self._pages) - 1)]
 
 
@@ -264,3 +283,58 @@ def test_a_final_short_page_ends_collection_cleanly(size):
     result, _client = collect(pages)
     assert result.retrieved == PAGE_SIZE + size
     assert result.complete is True
+
+
+class TestTheRequestShapeItself:
+    """Which request shape the loop built, and that the token is readable from it.
+
+    These exist because the token assertion above was shape-blind. `FakeClient` reported
+    `None` for anything that was not a dict, so with the optional SDK installed the paging
+    tests kept passing while checking nothing about the token — and CI, which runs without
+    the SDK, never met that case at all.
+    """
+
+    @staticmethod
+    def _sdk_installed() -> bool:
+        try:
+            import azure.mgmt.resourcegraph.models  # noqa: F401
+        except ImportError:
+            return False
+        return True
+
+    def test_the_token_is_readable_from_whichever_shape_was_built(self):
+        """The property that matters, and it holds either way."""
+        from app.adapters.azure_inventory import _request_factory
+
+        request = _request_factory()("sub", skip_token="tok-42")
+        assert token_of(request) == "tok-42"
+
+    def test_a_request_with_no_token_reads_back_as_none(self):
+        from app.adapters.azure_inventory import _request_factory
+
+        assert token_of(_request_factory()("sub", skip_token=None)) is None
+
+    def test_the_shape_matches_whether_the_sdk_is_present(self):
+        """Names which path this environment actually exercised, rather than assuming."""
+        from app.adapters.azure_inventory import PAGE_SIZE, _request_factory
+
+        request = _request_factory()("sub", skip_token="tok")
+        if self._sdk_installed():
+            assert type(request).__name__ == "QueryRequest"
+            assert request.options.top == PAGE_SIZE
+            assert request.options.skip_token == "tok"
+        else:
+            assert isinstance(request, dict), "the fallback must be a plain dict"
+            assert request["skip_token"] == "tok"
+            assert request["top"] == PAGE_SIZE
+
+    def test_the_loop_threads_its_token_through_the_real_shape(self):
+        """The original assertion, now proved against whatever shape was built."""
+        pages = [
+            FakePage([resource(0)], skip_token="token-one"),
+            FakePage([resource(1)], skip_token=None),
+        ]
+        _result, client = collect(pages)
+        assert client.tokens_seen == [None, "token-one"]
+        # And the recorded requests are the shape this environment actually builds.
+        assert all(token_of(r) == t for r, t in zip(client.requests_seen, client.tokens_seen))

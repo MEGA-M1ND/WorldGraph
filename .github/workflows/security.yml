@@ -107,6 +107,55 @@ jobs:
           fi
           echo "Azure access is query-only: no write client, no secret client."
 
+  azure-extras-import:
+    name: The Azure SDK extra actually imports
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # The mirror of the job below. That one proves WorldGraph runs *without* the cloud
+      # SDK; nothing proved the SDK could be installed and imported at all — and it could
+      # not. The pinned azure-mgmt-resourcegraph 8.0.0 does `from six import
+      # with_metaclass` without declaring `six`, so a clean install of this file produced
+      # a package that raised ModuleNotFoundError on import. Anyone following the live
+      # connector instructions hit it, and the adapter reported it as "Azure SDK is not
+      # installed" — telling them to run the command they had just run.
+      - name: Install ONLY the optional Azure extras, in a clean environment
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-azure.txt
+
+      - name: Import exactly what the adapter imports
+        working-directory: backend
+        run: |
+          python - <<'EOF'
+          from azure.identity import DefaultAzureCredential
+          from azure.mgmt.resourcegraph import ResourceGraphClient
+          from azure.mgmt.resourcegraph.models import QueryRequest, QueryRequestOptions
+          print("all four symbols import cleanly")
+          EOF
+
+      - name: The adapter builds a real request with them
+        working-directory: backend
+        # Constructing the request object is as far as this can go without a subscription:
+        # it proves the SDK's model classes accept the shape the paging loop builds.
+        run: |
+          pip install -r requirements.txt
+          python - <<'EOF'
+          from app.adapters.azure_inventory import PAGE_SIZE, _request_factory
+          request = _request_factory()("00000000-0000-0000-0000-000000000000", skip_token="tok")
+          assert type(request).__name__ == "QueryRequest", type(request)
+          assert request.options.top == PAGE_SIZE
+          assert request.options.skip_token == "tok"
+          print("adapter builds a real QueryRequest:", type(request).__name__)
+          EOF
+
   runs-without-cloud-sdks:
     name: WorldGraph runs with no cloud SDK installed
     runs-on: ubuntu-latest

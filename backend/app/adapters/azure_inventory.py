@@ -777,6 +777,17 @@ async def fetch_resources(
             from azure.identity import DefaultAzureCredential
             from azure.mgmt.resourcegraph import ResourceGraphClient
         except ImportError as error:
+            # An incomplete install is not a missing one, and saying so matters: with a
+            # broken optional dependency this told the operator to run exactly the command
+            # they had just run, with no hint of what was wrong. Only the module name
+            # escapes — it carries no credential surface.
+            missing = (getattr(error, "name", "") or "").split(".")[0]
+            if missing and missing != "azure":
+                raise AdapterError(
+                    f"The Azure SDK is installed but cannot be imported: no module named "
+                    f"'{missing}'. The optional dependency set is incomplete — reinstall "
+                    "with `pip install -r requirements-azure.txt`."
+                ) from error
             raise AdapterError(
                 "Azure SDK is not installed. Install the optional dependencies with "
                 "`pip install -r requirements-azure.txt` to import live inventory."

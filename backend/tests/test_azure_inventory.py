@@ -946,3 +946,80 @@ class TestReadOnlyByConstruction:
         # how the request is built.
         called = set(re.findall(r"\bclient\.(\w+)\(", text))
         assert called == {"resources"}, f"unexpected client methods: {called}"
+
+
+class TestBrokenOptionalDependency:
+    """An incomplete install is not a missing one.
+
+    `requirements-azure.txt` pinned `azure-mgmt-resourcegraph==8.0.0`, which does
+    `from six import with_metaclass` at import time without declaring `six`. A clean
+    install of the documented file therefore produced a package that raised
+    `ModuleNotFoundError` — and because that is a subclass of `ImportError`, the adapter
+    reported it as "Azure SDK is not installed" and told the operator to run the exact
+    command they had just run.
+
+    The pin is fixed. This pins the diagnostic, which is the part that will matter the
+    next time a transitive dependency goes missing.
+    """
+
+    @staticmethod
+    def _fetch_with_import_error(monkeypatch, error: ImportError) -> str:
+        import asyncio
+        import builtins
+
+        from app.adapters.azure_inventory import AdapterError, fetch_resources
+        from app.config import Settings
+        from app.models.core import DataMode
+        from app.models.workspace import (
+            InventorySourceKind,
+            Workspace,
+            WorkspaceKind,
+            WorkspaceStatus,
+        )
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name.startswith("azure"):
+                raise error
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        workspace = Workspace(
+            id="azure-probe",
+            name="probe",
+            kind=WorkspaceKind.REAL,
+            source=InventorySourceKind.AZURE,
+            status=WorkspaceStatus.NOT_LOADED,
+            mode=DataMode.LIVE,
+            organization="sub",
+            description="probe",
+        )
+        try:
+            asyncio.run(fetch_resources(Settings(database_path=":memory:"), workspace))
+        except AdapterError as raised:
+            return str(raised)
+        raise AssertionError("fetch_resources should have raised AdapterError")
+
+    def test_a_missing_sdk_still_says_install_it(self, monkeypatch):
+        message = self._fetch_with_import_error(
+            monkeypatch, ModuleNotFoundError("No module named 'azure'", name="azure")
+        )
+        assert "Azure SDK is not installed" in message
+        assert "requirements-azure.txt" in message
+
+    def test_a_broken_sdk_says_so_and_names_the_missing_module(self, monkeypatch):
+        """The reported defect: this used to be indistinguishable from 'not installed'."""
+        message = self._fetch_with_import_error(
+            monkeypatch, ModuleNotFoundError("No module named 'six'", name="six")
+        )
+        assert "installed but cannot be imported" in message
+        assert "'six'" in message
+        assert "Azure SDK is not installed" not in message
+
+    def test_the_diagnostic_leaks_nothing_but_a_module_name(self, monkeypatch):
+        message = self._fetch_with_import_error(
+            monkeypatch, ModuleNotFoundError("No module named 'six'", name="six")
+        )
+        for forbidden in ("token", "secret", "tenant", "https://", "Bearer"):
+            assert forbidden.lower() not in message.lower()
