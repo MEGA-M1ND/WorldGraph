@@ -349,17 +349,52 @@ test.describe('WorldGraph hero demo', () => {
     await expect(page.locator('.notice')).toContainText('Share link not understood');
   });
 
-  test('executive and engineer modes both render', async ({ page }) => {
+  test('the rail switch is absent at a width where both rails fit', async ({ page }) => {
+    // Its predecessor asserted only that a `data-view-mode` attribute flipped, which was
+    // true while the two "modes" rendered byte-identically at this viewport: every rule
+    // keyed to that attribute lived inside a max-width media query. A control that
+    // changes nothing has no business in the top bar.
+    await page.setViewportSize({ width: 1600, height: 950 });
     await page.goto('/');
     await waitForBoot(page);
     await dismissFirstRun(page);
 
-    await page.locator('.mode-switch__button', { hasText: 'Engineer' }).click();
-    await expect(page.locator('#app')).toHaveAttribute('data-view-mode', 'engineer');
-    await page.screenshot({ path: `${SHOTS}/10-engineer-mode.png` });
+    // Counted before it is checked for visibility: `toBeHidden` is also satisfied by an
+    // element that does not exist, which would let this pass against a build that never
+    // rendered the control at all.
+    await expect(page.locator('.rail-switch')).toHaveCount(1);
+    await expect(page.locator('.rail-switch')).toBeHidden();
+    await expect(page.locator('.rail--left')).toBeVisible();
+    await expect(page.locator('.rail--right')).toBeVisible();
+  });
 
-    await page.locator('.mode-switch__button', { hasText: 'Executive' }).click();
-    await expect(page.locator('#app')).toHaveAttribute('data-view-mode', 'executive');
+  test('below the breakpoint the switch chooses which rail is shown', async ({ page }) => {
+    await page.setViewportSize({ width: 1100, height: 900 });
+    await page.goto('/');
+    await waitForBoot(page);
+    await dismissFirstRun(page);
+
+    const left = page.locator('.rail--left');
+    const right = page.locator('.rail--right');
+    await expect(page.locator('.rail-switch')).toBeVisible();
+
+    // Only one rail fits, so the control is load-bearing here.
+    await expect(left).toBeVisible();
+    await expect(right).toBeHidden();
+
+    await page.locator('.rail-switch__button', { hasText: 'Analyst' }).click();
+    await expect(page.locator('#app')).toHaveAttribute('data-rail-focus', 'analyst');
+    await expect(left).toBeHidden();
+    await expect(right).toBeVisible();
+    // The assertion the old test was missing: something actually moved.
+    await expect(page.locator('[data-bind="command-input"]')).toBeVisible();
+    await page.screenshot({ path: `${SHOTS}/10-rail-analyst.png` });
+
+    await page.locator('.rail-switch__button', { hasText: 'Risks' }).click();
+    await expect(page.locator('#app')).toHaveAttribute('data-rail-focus', 'risks');
+    await expect(left).toBeVisible();
+    await expect(right).toBeHidden();
+    await expect(page.locator('[data-bind="risk-list"] .row').first()).toBeVisible();
   });
 
   test('no console errors during the core flow', async ({ page }) => {

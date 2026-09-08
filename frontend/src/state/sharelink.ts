@@ -32,7 +32,7 @@ export interface ShareState {
   camera: CameraState | null;
   path: string[];
   showDependencies: boolean;
-  viewMode: 'executive' | 'engineer';
+  railFocus: 'risks' | 'analyst';
 }
 
 /** Ids are slugs. Anything else is malformed, and ids reach API paths. */
@@ -74,7 +74,7 @@ export function encodeShareState(state: ShareState): URLSearchParams {
   }
   if (state.path.length > 0) params.set(PARAM.path, state.path.slice(0, MAX_PATH_HOPS).join(','));
   if (!state.showDependencies) params.set(PARAM.deps, '0');
-  if (state.viewMode === 'engineer') params.set(PARAM.mode, 'eng');
+  if (state.railFocus === 'analyst') params.set(PARAM.mode, 'analyst');
   return params;
 }
 
@@ -107,8 +107,12 @@ export function decodeShareState(search: string | URLSearchParams): ShareState |
   const depsRaw = params.get(PARAM.deps);
   if (depsRaw !== null && depsRaw !== '0' && depsRaw !== '1') return null;
 
+  // `eng`/`exec` are the values this parameter carried when the control was labelled
+  // "Engineer / Executive". They are still accepted so links copied then keep working;
+  // anything else is malformed and rejects the whole link rather than being half-applied.
+  const ACCEPTED_RAILS = ['risks', 'analyst', 'exec', 'eng'] as const;
   const modeRaw = params.get(PARAM.mode);
-  if (modeRaw !== null && modeRaw !== 'eng' && modeRaw !== 'exec') return null;
+  if (modeRaw !== null && !(ACCEPTED_RAILS as readonly string[]).includes(modeRaw)) return null;
 
   return {
     eventId,
@@ -117,7 +121,7 @@ export function decodeShareState(search: string | URLSearchParams): ShareState |
     camera,
     path,
     showDependencies: depsRaw !== '0',
-    viewMode: modeRaw === 'eng' ? 'engineer' : 'executive',
+    railFocus: modeRaw === 'analyst' || modeRaw === 'eng' ? 'analyst' : 'risks',
   };
 }
 

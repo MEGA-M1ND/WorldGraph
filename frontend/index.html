@@ -11,7 +11,7 @@
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='none' stroke='%234da3ff' stroke-width='2'/%3E%3Cpath d='M3 16h26M16 3c5 6 5 20 0 26M16 3c-5 6-5 20 0 26' fill='none' stroke='%234da3ff' stroke-width='1.2' opacity='.7'/%3E%3C/svg%3E" />
   </head>
   <body>
-    <div id="app" class="app" data-view-mode="executive">
+    <div id="app" class="app" data-rail-focus="risks">
       <!-- Top bar ------------------------------------------------------------------ -->
       <header class="topbar" role="banner">
         <div class="topbar__brand">
@@ -26,9 +26,18 @@
         </div>
         <div class="topbar__stats" data-bind="headline-stats"></div>
         <div class="topbar__right">
-          <div class="mode-switch" role="group" aria-label="View mode">
-            <button type="button" class="mode-switch__button is-active" data-view="executive">Executive</button>
-            <button type="button" class="mode-switch__button" data-view="engineer">Engineer</button>
+          <!--
+            A layout control, not two views of the estate. Below the three-column
+            breakpoint only one side rail fits, and this picks which. It is hidden above
+            that width, where it would change nothing — it used to be labelled
+            "Executive / Engineer" and sat here permanently, promising an audience-specific
+            view that does not exist.
+          -->
+          <div class="rail-switch" role="group" aria-label="Which side panel to show">
+            <button type="button" class="rail-switch__button is-active" data-rail="risks"
+              title="Show risks and the event feed">Risks</button>
+            <button type="button" class="rail-switch__button" data-rail="analyst"
+              title="Show the analyst and detail panel">Analyst</button>
           </div>
           <span class="chip" data-bind="run-mode">DEMO</span>
           <time class="topbar__clock" data-bind="clock">--:-- UTC</time>
