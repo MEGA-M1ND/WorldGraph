@@ -926,3 +926,74 @@ class TestWhyAnAnalysisSaidWhatItSaid:
         world._analyses.clear()
         result = IntentRouter(ToolContext(state=world)).handle("why though?")
         assert result.matched is False
+
+
+class TestResolvingWhatTheOperatorMeant:
+    """The two resolvers that turn free text into an id, on the paths nothing exercised.
+
+    Naming a thing exactly, and naming an event by its id, are the unambiguous cases —
+    and they are the ones that must beat the fuzzy scoring underneath, or a precise
+    question gets a nearby answer.
+    """
+
+    @pytest.mark.anyio
+    async def test_an_entity_named_exactly_is_resolved_before_any_scoring(self, world):
+        entity = next(e for e in world.entities() if len(e.name) >= 6)
+        result = IntentRouter(ToolContext(state=world)).handle(
+            f"tell me about {entity.name}"
+        )
+        assert result.answer.startswith(f"{entity.name} — {entity.type.value}")
+
+    @pytest.mark.anyio
+    async def test_an_event_named_by_its_id_wins_over_word_scoring(self, world):
+        event_id = next(iter(world._events))
+        answer = IntentRouter(ToolContext(state=world)).handle(
+            f"show the blast radius for {event_id}"
+        ).answer
+        assert "MATERIAL RISK" in answer
+
+    @pytest.mark.anyio
+    async def test_a_why_question_naming_an_entity_uses_that_entity(self, world):
+        entity = next(e for e in world.entities() if e.type.value == "MICROSERVICE")
+        IntentRouter(ToolContext(state=world)).handle(
+            f"show the blast radius for {entity.name}"
+        )
+        answer = IntentRouter(ToolContext(state=world)).handle(
+            f"why is {entity.name} at risk?"
+        ).answer
+        assert entity.name in answer
+
+    @pytest.mark.anyio
+    async def test_a_why_question_falls_back_to_the_selection(self, world):
+        entity = next(e for e in world.entities() if e.type.value == "MICROSERVICE")
+        IntentRouter(ToolContext(state=world)).handle(
+            f"show the blast radius for {entity.name}"
+        )
+        answer = IntentRouter(
+            ToolContext(state=world, selected_entity_id=entity.id)
+        ).handle("why though?").answer
+        assert "Risk " in answer
+
+    @pytest.mark.anyio
+    async def test_an_entity_matched_by_name_rather_than_id_still_resolves(self, world):
+        """`AWS ap-northeast-1 (Tokyo)` shares no substring with `cloud-region-tokyo`.
+
+        The id pass misses it entirely, so this is the name pass — the one that requires
+        at least six characters, so a two-letter name cannot match inside a sentence.
+        """
+        result = IntentRouter(ToolContext(state=world)).handle(
+            "tell me about AWS ap-northeast-1 (Tokyo)"
+        )
+        assert result.answer.startswith("AWS ap-northeast-1 (Tokyo) — ")
+
+    @pytest.mark.anyio
+    async def test_a_lookup_lists_both_directions_of_the_dependency_graph(self, world):
+        """Depends on / depended on by. A one-directional answer is half an answer."""
+        entity = world.graph.require_entity("payments-k8s-mumbai")
+        assert world.graph.dependencies_of(entity.id)
+        assert world.graph.dependents_of(entity.id)
+        answer = IntentRouter(ToolContext(state=world)).handle(
+            f"tell me about {entity.name}"
+        ).answer
+        assert "Depends on: " in answer
+        assert "Depended on by: " in answer
