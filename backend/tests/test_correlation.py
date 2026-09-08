@@ -23,7 +23,17 @@ from app.geo.spatial import (
     within_radius,
 )
 from app.graph.world_graph import WorldGraph
-from app.models.core import EventCategory, GeoPoint, Severity
+from app.models.core import (
+    DataMode,
+    DataSourceInfo,
+    DependencyEdge,
+    DependencyType,
+    EntityType,
+    EventCategory,
+    GeoPoint,
+    Severity,
+    WorldEntity,
+)
 
 SINGAPORE = GeoPoint(lat=1.3521, lon=103.8198)
 FRANKFURT = GeoPoint(lat=50.1109, lon=8.6821)
@@ -297,3 +307,115 @@ class TestSeverityFloorsArePinned:
         for severity in Severity:
             event = demo_vulnerability().model_copy(update={"severity": severity})
             assert modelled_availability(event, 1.0) > 0.0
+
+
+class TestProximitySummaryIsPinned:
+    """The numbers on the event card, not just that they are at least one.
+
+    Found by mutation testing. `test_proximity_summary_counts_facilities_and_suppliers`
+    asserted `>= 1` for each count, which survives almost any error: flipping
+    `== "SUPPLIER"` to `!=`, starting `dependent` at 1 instead of 0, changing the traversal
+    depth from 4 to 5, or dropping any single entity type from either classification set
+    all left the suite green.
+
+    These four numbers are the "Enterprise proximity" panel an operator reads first when an
+    event is selected. They should not be able to drift.
+    """
+
+    def test_the_taiwan_quake_summary_is_exactly_this(self, atlaspay_graph: WorldGraph):
+        assert proximity_summary(atlaspay_graph, taiwan_earthquake()) == {
+            "critical_facilities": 2,   # dc-taiwan-hsinchu, factory-taiwan-assembly
+            "suppliers": 1,             # supplier-taiwan-hardware
+            "dependent_services": 8,
+            "assets_in_radius": 3,
+        }
+
+    def test_facilities_and_suppliers_partition_the_matches(self, atlaspay_graph: WorldGraph):
+        """A supplier is not a facility, and together they account for everything matched.
+
+        This is what makes the two counts independent: if `== "SUPPLIER"` were inverted,
+        or a type moved between the sets, the parts would stop summing to the whole.
+        """
+        summary = proximity_summary(atlaspay_graph, taiwan_earthquake())
+        assert summary["critical_facilities"] + summary["suppliers"] == summary["assets_in_radius"]
+
+    def test_every_matched_entity_is_classified(self, atlaspay_graph: WorldGraph):
+        """No matched asset falls through both sets and is silently uncounted."""
+        matches = find_assets_near_event(atlaspay_graph, taiwan_earthquake())
+        assert matches, "the fixture must match something or this proves nothing"
+        facility_types = {"DATACENTER", "OFFICE", "CLOUD_REGION", "FACTORY", "NETWORK_NODE"}
+        for match in matches:
+            kind = match.entity.type.value
+            assert kind in facility_types or kind == "SUPPLIER", f"{kind} is counted by nothing"
+
+    def test_the_traversal_depth_bound_is_observable(self):
+        """A chain longer than the bound is cut at the bound, and the number says so.
+
+        Built rather than reimplemented. My first attempt at this test recomputed the
+        count with the same expression the code uses, so it moved in lockstep with the
+        implementation and could not detect a change in it — the very fault this audit is
+        about. A constructed graph with a known answer has no such coupling.
+        """
+        source = DataSourceInfo(source_id="t", source_name="t", mode=DataMode.SYNTHETIC)
+        entities = [
+            WorldEntity(
+                id="dc",
+                name="dc",
+                type=EntityType.DATACENTER,
+                source=source,
+                location=HSINCHU,
+            )
+        ]
+        edges = []
+        previous = "dc"
+        for depth in range(1, 7):  # six hops, two beyond the bound of four
+            entities.append(
+                WorldEntity(
+                    id=f"svc{depth}",
+                    name=f"svc{depth}",
+                    type=EntityType.MICROSERVICE,
+                    source=source,
+                )
+            )
+            edges.append(
+                DependencyEdge(
+                    id=f"e{depth}",
+                    source_entity_id=f"svc{depth}",
+                    target_entity_id=previous,
+                    type=DependencyType.DEPENDS_ON,
+                )
+            )
+            previous = f"svc{depth}"
+
+        summary = proximity_summary(WorldGraph(entities, edges), taiwan_earthquake())
+        assert summary["dependent_services"] == 4, "the depth-4 bound must be what stops the walk"
+        assert summary["critical_facilities"] == 1
+        assert summary["assets_in_radius"] == 1
+
+    def test_the_depth_guard_is_redundant_given_physical_only_matching(
+        self, atlaspay_graph: WorldGraph
+    ):
+        """Why `step.depth > 0` cannot be pinned, recorded so nobody re-chases it.
+
+        Mutating that guard to `>= 0` survives, and it is an equivalent mutant rather than
+        a gap: `find_assets_near_event` matches `physical_only`, so every origin is a
+        physical type, and the service set the walk counts contains none of them. A depth-0
+        entry can never be counted whichever way the guard reads.
+
+        The guard is kept because it stops being redundant the moment anything matches a
+        logical entity, and this test states the assumption it depends on.
+        """
+        matches = find_assets_near_event(atlaspay_graph, taiwan_earthquake())
+        assert matches
+        service_types = {"MICROSERVICE", "APPLICATION", "BUSINESS_SERVICE", "DATABASE"}
+        for match in matches:
+            assert match.entity.type.value not in service_types
+
+    def test_an_event_matching_nothing_summarises_to_zero(self, atlaspay_graph: WorldGraph):
+        """The `if exposed_ids` branch, which no test reached."""
+        assert proximity_summary(atlaspay_graph, demo_vulnerability()) == {
+            "critical_facilities": 0,
+            "suppliers": 0,
+            "dependent_services": 0,
+            "assets_in_radius": 0,
+        }
