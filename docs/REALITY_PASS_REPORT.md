@@ -14,6 +14,14 @@ instead of inventing a number.
 This is an engineering record, not a summary of achievements. The findings are ordered by
 what they cost, and the section that matters most is [§9](#9-what-is-still-not-real).
 
+> **Status.** Sections 1–11 were written at commit `c16614c`, when Phase 8 closed. An
+> external review of that commit then raised eight findings; all eight held, several in code
+> this report had described as verified. Those and six more found by running the app rather
+> than reading it have since been fixed and merged. **[§12](#12-what-an-external-review-found-after-this-report-was-written)
+> records what they were and what they say about the rest of this document.** Counts and
+> claims throughout have been corrected to the current state, except where a figure is
+> explicitly historical; the substance of §1–§11 is otherwise as written.
+
 ---
 
 ## 1. What was actually verified
@@ -28,11 +36,17 @@ what they cost, and the section that matters most is [§9](#9-what-is-still-not-
 | Key Vault contents are never read | Secret child resources refused at normalization; vault itself inventoried | **Verified** |
 | Malformed tags are rejected and reported, never guessed | 14 tag-validation tests | **Verified** |
 | Tag values reach no instruction path | Prompt-injection payloads in `worldgraph.owner`, `depends_on`, and free text | **Verified** |
-| The whole flow works in a real browser | 15 Playwright tests, 6 of them new, driving the workspace switch | **Verified** |
+| The whole flow works in a real browser | 19 Playwright tests driving the workspace switch, the analyst, and the layout at five viewport widths | **Verified** |
 | Import scales to 5 000 resources | Performance budgets at 100 / 1 000 / 5 000 | **Verified** |
+| Resource Graph paging is handled | 17 tests in `backend/tests/test_azure_pagination.py` against a fake client: exact-multiple boundaries, a vanishing token, a token that never vanishes, an empty page mid-walk, the ceiling, and a disagreeing `total_records` | **Verified against a fake client — see §2** |
+| A vulnerability count matches its evidence | 14 tests in `backend/tests/test_vulnerability_counts.py`; confirmed and product-name-only matches counted and scored apart | **Verified** |
+| The model cannot state a figure it was not given | 20 tests in `backend/tests/test_answer_grounding.py`; unsourced figures with no tool calls are withheld, not returned | **Verified** |
 | **The live Azure connector works against a real subscription** | — | **NOT VERIFIED — see §2** |
 
-Totals: **483 backend tests, 30 frontend unit tests, 15 end-to-end tests.** All green.
+Totals: **590 backend tests, 32 frontend unit tests, 19 end-to-end tests.** All green.
+
+Three of those rows are new since this report was first written, and one of them —
+paging — replaced a claim that was quietly false. See [§12](#12-what-an-external-review-found-after-this-report-was-written).
 
 ---
 
@@ -54,11 +68,23 @@ assessment, workspace isolation, and every engine downstream of them. These are 
 functions of the resource rows, and the rows are realistic.
 
 **Not established.** That `DefaultAzureCredential` resolves in a given deployment; that
-the Resource Graph query is accepted verbatim by the service; that its paging behaves as
-assumed beyond the first page; that a real estate's property trees stay inside the depth
-and size bounds; that a 5 000-resource subscription returns inside the query timeout.
-`fetch_resources()` — the ~20 lines that actually call Azure — is the one part of this
-adapter that has never run.
+the Resource Graph query is accepted verbatim by the service; that a real estate's
+property trees stay inside the depth and size bounds; that a large subscription returns
+inside the query timeout. `fetch_resources()` — the ~100 lines that actually call Azure —
+is the one part of this adapter that has never run.
+
+**Changed since this was written.** The sentence above used to include *"that its paging
+behaves as assumed beyond the first page"*. That was too generous to the code: paging was
+not merely unverified, it was **absent**. The query carried `| limit 5000`, Resource Graph
+caps a response at 1 000 rows regardless, and the `skip_token` was never read — so a
+5 000-resource subscription would have imported 1 000 resources and reported HIGH coverage
+over them. Paging is now implemented and exercised by 17 tests against a fake client,
+including the case where Azure's own `total_records` disagrees with the row count.
+
+**That fix does not move this section's verdict.** A fake client is a test of the paging
+loop I wrote, not of Resource Graph. `fetch_resources` takes a `client_factory` argument
+purely so that loop can be driven in tests; it does not make the live path verified, and
+the docstring says so at the call site.
 
 The failure mode is bounded: a credential or query failure raises `AdapterError`, the
 workspace is marked UNAVAILABLE with a reason, and the demo workspace is unaffected. But
@@ -287,7 +313,7 @@ The lesson generalises: **the fixture that makes a demo good makes its tests wea
 AtlasPay declares everything, so it never exercises an absent-metadata path. Every one of
 these seven was invisible until a second estate existed — and three of them were found
 only after the first two were fixed, because each fix let the flow run one step further
-before failing. A suite of 483 tests over one fixture is not the same as two fixtures.
+before failing. A suite of 483 tests — the entire backend suite at that point — over one fixture is not the same as two fixtures.
 
 ---
 
@@ -301,6 +327,7 @@ the *shape* of the gap, because that is what tells them which tag to add.
 On the test fixture (7 modelled resources of 9 discovered):
 
 ```
+HIGH     collection                9 of 9 resources retrieved
 HIGH     infrastructure            7 resources imported from Azure Resource Graph
 HIGH     hosting                   7 of 7 resources are placed in a region
 PARTIAL  application_dependencies  3 dependency edges, all from explicit references or tags
@@ -309,6 +336,12 @@ PARTIAL  criticality               3 of 7 resources declare a criticality
 LOW      customer_exposure         2 of 7 resources declare worldgraph.customer_facing
 LOW      revenue                   1 of 7 resources declare a revenue figure
 ```
+
+`collection` leads the list, and that ordering is the point: every dimension below it is a
+ratio over what was *retrieved*, and a ratio over a fraction of an estate says nothing
+about the estate. When collection is incomplete the row reads `LOW` and its remedy states
+plainly that the figures beneath it describe only what was retrieved. That row did not
+exist when this section was first written — see [§12](#12-what-an-external-review-found-after-this-report-was-written).
 
 Unsupported types are counted and named, not dropped: an import that silently discarded
 44 of 187 resources would leave the operator believing the graph is complete. The same
@@ -321,7 +354,10 @@ panel lists every rejected tag with its reason.
 The honest list. Each of these is a real limitation, not a roadmap entry dressed up as
 one.
 
-1. **The live connector has never run** (§2). This is the largest single gap.
+1. **The live connector has never run** (§2). This is the largest single gap, and it is
+   the same gap it was when this report was written — thirteen merged fixes since have
+   made the code around it better without touching the fact that it has never contacted
+   Azure.
 2. **Runtime dependencies are invisible.** Inventory cannot see a call graph. Without
    `worldgraph.depends_on` tags or a tracing source, an imported blast radius reaches only
    what hosting and explicit configuration references prove — narrower than reality.
@@ -344,8 +380,12 @@ one.
    telling it what to declare — which is correct behaviour, but it is work the operator
    has to do.
 8. **Performance is bounded by budget, not measured at scale.** 5 000 resources import
-   inside 60 seconds in tests; the Resource Graph query itself carries a `limit 5000` and
-   paging past it is unimplemented.
+   inside 60 seconds in tests, from a fixture on local disk. Paging *is* now implemented
+   and bounded at 20 000 resources, beyond which collection stops and reports itself
+   incomplete — but no timing figure here involves a network, so none of it says what a
+   real subscription costs. (This item previously ended *"the Resource Graph query itself
+   carries a `limit 5000` and paging past it is unimplemented"*. That was accurate and
+   its consequence was not thought through: see §12.)
 9. **No multi-tenancy, no authentication, no authorization.** WorldGraph is a
    single-operator tool. Anyone who can reach the API can read every workspace it has
    loaded. That is acceptable for a locally-run analysis tool and unacceptable for a
@@ -354,6 +394,22 @@ one.
 10. **Recommendations only.** WorldGraph proposes; it never executes, and it holds no
     permission that would let it. The AI cannot say "I failed over the cluster" because
     there is no tool that could.
+11. **An attack path is reachability, and part of it is inferred.** WorldGraph walks
+    dependency edges backwards to model an attacker moving into what relies on a service.
+    That is real for an authentication service and false for a database, and an
+    operational dependency edge cannot tell them apart — so such a hop is labelled
+    `INFERRED_TRUST` at low confidence and the path is scored by its weakest hop. Two
+    applications that merely share a database still produce a path. Establishing this
+    properly needs edges inventory cannot supply: who may assume which role, who accepts
+    whose tokens, what network policy permits.
+12. **A product-name match is not a finding.** Vulnerability correlation is confirmed only
+    when an asset's own inventory names the CVE. A bare product-name match ignores version
+    and vendor, is labelled `POTENTIALLY_AFFECTED`, and is counted and scored separately
+    from confirmed matches — it is a triage candidate, not exposure.
+13. **`ExposureProfile.authenticated` is `None` on import, and that is the truth.** Cloud
+    inventory does not report whether a workload authenticates its callers. It used to
+    default to `True`, which asserted a security property from nothing, in the direction
+    that makes an estate look safer.
 
 ---
 
@@ -367,7 +423,7 @@ radius with walkable explanation paths, the risk score with its full derivation,
 simulation engine's never-mutate-the-baseline contract, correlation, the deterministic
 tool layer, provenance and data-mode labelling, workspace isolation, and the whole
 inventory import path. None of that references AtlasPay, and after this phase all of it
-runs correctly on an estate that declares nothing. The 483-test suite would lose its
+runs correctly on an estate that declares nothing. The 590-test suite would lose its
 fixture, not its subject.
 
 **Would need replacing — the demonstration, and it is most of what makes a viewer believe
@@ -409,9 +465,9 @@ cd frontend && npm ci && npm run build
 npm run preview -- --host 127.0.0.1 --port 5173 --strictPort
 
 # Tests
-cd backend  && python -m pytest          # 483
-cd frontend && npm test                  # 30
-cd frontend && npx playwright test       # 15, real browser
+cd backend  && python -m pytest          # 590
+cd frontend && npm test                  # 32
+cd frontend && npx playwright test       # 19, real browser
 ```
 
 To point it at a real subscription — which, again, has not been done — run `az login` and
@@ -421,3 +477,88 @@ one Resource Graph query and has no code path that could use anything else.
 
 Screenshots of the imported estate are in `docs/screenshots/reality-pass-*.png`, captured
 by the Playwright run rather than staged.
+
+---
+
+## 12. What an external review found after this report was written
+
+Sections 1–11 closed Phase 8. An external review of commit `c16614c` then read the code
+this report described and raised **eight findings. All eight held under examination**, and
+became the seven fixes [#3](https://github.com/MEGA-M1ND/WorldGraph/pull/3)–[#9](https://github.com/MEGA-M1ND/WorldGraph/pull/9)
+— one finding was largely covered by another's fix and completed later by
+[#12](https://github.com/MEGA-M1ND/WorldGraph/pull/12).
+
+Six more defects came afterwards, from *running* the application rather than reading it:
+five found by driving it in a browser, one by counting the checks on a pull request. All
+thirteen are fixed and merged.
+
+They are recorded here because a reality-pass report that omits what it got wrong is not
+a reality pass.
+
+### The defects, and what each one had been reported as
+
+The first seven rows are the external review's findings. The last is what driving the CVE
+scenario in a browser turned up.
+
+| # | Defect | What §1 had claimed |
+|---|---|---|
+| [#3](https://github.com/MEGA-M1ND/WorldGraph/pull/3) | Risk scoring read `datetime.now()` internally, so no test could pin an exact score | "Verified" — by tests that could not assert the number they cared about |
+| [#4](https://github.com/MEGA-M1ND/WorldGraph/pull/4) | "No vulnerable software found" was returned for assets with **no software inventory at all** | — |
+| [#5](https://github.com/MEGA-M1ND/WorldGraph/pull/5) | Entities already degraded before an event were reported as *caused* by it | Blast radius "Verified" |
+| [#6](https://github.com/MEGA-M1ND/WorldGraph/pull/6) | A forced re-import silently kept the old estate; the analyst kept answering from it | Import path "Verified" |
+| [#7](https://github.com/MEGA-M1ND/WorldGraph/pull/7) | `skip_token` never read — 1 000 of 5 000 resources imported, then HIGH coverage reported over them | "Import scales to 5 000 resources — Verified" |
+| [#8](https://github.com/MEGA-M1ND/WorldGraph/pull/8) | Inferred trust hops presented as established fact; every non-internet foothold returned `[]` | — |
+| [#9](https://github.com/MEGA-M1ND/WorldGraph/pull/9) | `SECURITY.md` claimed the model "cannot compute"; its prose was returned verbatim with zero tool calls | Tool-boundary claims |
+| [#12](https://github.com/MEGA-M1ND/WorldGraph/pull/12) | A vulnerability count and its risk score included assets WorldGraph could see were patched | — |
+
+Plus four layout and interaction defects found in the browser
+([#10](https://github.com/MEGA-M1ND/WorldGraph/pull/10),
+[#13](https://github.com/MEGA-M1ND/WorldGraph/pull/13),
+[#14](https://github.com/MEGA-M1ND/WorldGraph/pull/14),
+[#15](https://github.com/MEGA-M1ND/WorldGraph/pull/15)), and one in CI itself
+([#11](https://github.com/MEGA-M1ND/WorldGraph/pull/11)): both workflows listened for
+`push` on every branch *and* for `pull_request`, so every commit on a branch with an open
+PR ran the entire suite twice — nine jobs became eighteen checks, and the browser job was
+paid for twice to prove the same thing both times.
+
+### The pattern
+
+**Two of these were the same bug this report claims as its central finding.**
+
+§3 of this document describes absent evidence and negative evidence sharing one
+representation — an estate with no data reporting the same thing as an estate that was
+searched and found clean. The report presents that as diagnosed and fixed. It was fixed in
+the impact model and left in place in the security path (#4) and the blast radius (#5).
+
+So the finding was correct and its application was incomplete, and this report did not
+notice the difference. That is worth more than the individual bugs: *knowing* the failure
+mode did not prevent shipping two more instances of it.
+
+### What the tests were doing instead
+
+Every defect above lived in the gap between what a test asserted and what a user
+experiences:
+
+- The E2E `ask()` helper waited on **message count**, which the app satisfied 0.4 s in. The
+  composer stayed disabled for eight more seconds, silently swallowing every keystroke
+  (#10).
+- **No test covered the vulnerability count or its score at all.** The full suite passed
+  unchanged after both were altered (#12).
+- The mode-toggle test asserted a **DOM attribute flipped**, which was true while the two
+  modes rendered byte-identically (#13).
+- The read-only CI check matched **one call site by string**; it now asserts `resources` is
+  the only client method invoked anywhere in the adapter (#7).
+
+Four tests written during these fixes were themselves vacuous on first draft — including
+one asserting an element was hidden, which also passes when the element does not exist.
+Each was caught the same way: revert the fix, run the test, confirm it goes red. That step
+is the only thing separating a test from a comment, and it is now how every behavioural
+test in these thirteen PRs was accepted.
+
+### What this does not change
+
+**§2 stands exactly as written.** None of this work involved an Azure subscription. The
+paging fixed in #7 was validated against a fake client — a test of the loop that was
+written, not of Resource Graph. The largest claim in this repository remains unverified,
+and thirteen merged fixes have not moved it one step closer to being verified; they have
+only made the code around it more honest about what it does not know.

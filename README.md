@@ -315,10 +315,10 @@ figures switch to the simulated world — badged as such.
 ## Testing
 
 ```bash
-cd backend && pytest                    # 483 tests
+cd backend && pytest                    # 590 tests
 cd frontend && npm run typecheck         # TypeScript strict
-cd frontend && npm test                  # 30 unit tests
-cd frontend && npm run test:e2e          # 15 Playwright specs (needs the backend running)
+cd frontend && npm test                  # 32 unit tests
+cd frontend && npm run test:e2e          # 19 Playwright specs (needs the backend running)
 ```
 
 Every push runs all three in CI, plus a security workflow that builds the frontend with
