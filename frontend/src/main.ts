@@ -35,7 +35,7 @@ import {
   renderTimeline,
   type PanelActions,
 } from './ui/panels.ts';
-import type { AnalystDirective, MaterialRisk, ReplayScenario } from './types.ts';
+import type { AnalystDirective, AskResponse, MaterialRisk, ReplayScenario } from './types.ts';
 
 /** Suggested commands under the command bar. Every one is routed deterministically. */
 const SUGGESTIONS = [
@@ -505,9 +505,11 @@ class WorldGraphApp {
     const { selectedEntityId, selectedEventId, scenario } = store.get();
 
     store.appendMessage({ role: 'operator', text: trimmed, at: Date.now() });
+
+    let response: AskResponse;
     const done = store.startWork('ask');
     try {
-      const response = await api.ask({
+      response = await api.ask({
         message: trimmed,
         selected_entity_id: selectedEntityId,
         selected_event_id: selectedEventId,
@@ -522,7 +524,32 @@ class WorldGraphApp {
         tools: response.tool_calls.map((call) => call.tool),
         degradedReason: response.degraded_reason,
       });
+    } catch (error) {
+      if (isSuperseded(error)) return;
+      const detail =
+        error instanceof ApiError ? error.message : 'The analyst could not be reached.';
+      store.appendMessage({ role: 'system', text: detail, at: Date.now() });
+      store.notify({
+        id: 'ask',
+        tone: 'error',
+        title: 'Analyst request failed',
+        detail: `${detail} Infrastructure analysis and simulation remain available.`,
+      });
+      return;
+    } finally {
+      // Released here rather than after the work below, and that placement is the whole
+      // point. Everything that follows — camera flights, panel refreshes — is presentation
+      // of an answer the operator can already read. Holding `ask` across it disabled the
+      // send button for ~8 s after the reply appeared, and because a disabled submit
+      // button also suppresses a form's implicit submission, Enter did nothing at all:
+      // no request, no notice, the typed question just sitting in the box.
+      done();
+    }
 
+    // Presentation. Failures here cost the operator a camera move or a stale panel, not
+    // the answer, so they are reported as such rather than as "the analyst could not be
+    // reached" — and they never block the next question.
+    try {
       if (response.degraded_reason) {
         store.notify({
           id: 'analyst-degraded',
@@ -552,20 +579,10 @@ class WorldGraphApp {
       }
       await this.refreshTimeline();
     } catch (error) {
+      // A second question supersedes the first one's refreshes by design; that is the
+      // cancellation working, not a failure to report.
       if (isSuperseded(error)) return;
-      const detail =
-        error instanceof ApiError
-          ? error.message
-          : 'The analyst could not be reached.';
-      store.appendMessage({ role: 'system', text: detail, at: Date.now() });
-      store.notify({
-        id: 'ask',
-        tone: 'error',
-        title: 'Analyst request failed',
-        detail: `${detail} Infrastructure analysis and simulation remain available.`,
-      });
-    } finally {
-      done();
+      this.reportError('Analyst view update', error);
     }
   }
 
