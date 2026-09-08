@@ -158,6 +158,48 @@ class TestExposureRadius:
     def test_non_geographic_categories_have_no_radius(self):
         assert exposure_radius_for(EventCategory.SECURITY_VULNERABILITY) == 0.0
         assert exposure_radius_for(EventCategory.CLOUD_INCIDENT) == 0.0
+        assert exposure_radius_for(EventCategory.SERVICE_INCIDENT) == 0.0
+
+    @pytest.mark.parametrize(
+        ("category", "expected_km"),
+        [
+            (EventCategory.WILDFIRE, 30.0),
+            (EventCategory.SEVERE_WEATHER, 150.0),
+            (EventCategory.FLOOD, 60.0),
+            (EventCategory.POWER_OUTAGE, 50.0),
+            (EventCategory.NETWORK_OUTAGE, 250.0),
+            (EventCategory.SUPPLY_CHAIN, 200.0),
+            (EventCategory.OTHER, 50.0),
+            # Zero means "not geographic at all" — these correlate by named region or by
+            # software inventory. A non-zero here would make a cloud status page start
+            # matching assets by distance, which is precisely the §21 confusion.
+            (EventCategory.CLOUD_INCIDENT, 0.0),
+            (EventCategory.SERVICE_INCIDENT, 0.0),
+            (EventCategory.SECURITY_VULNERABILITY, 0.0),
+        ],
+    )
+    def test_the_category_baselines_are_these_figures(self, category, expected_km):
+        """The fallback footprint decides which assets correlate at all.
+
+        Written out as literals rather than read from `_CATEGORY_BASE_RADIUS_KM`, which
+        would assert the table against itself.
+        """
+        assert exposure_radius_for(category) == expected_km
+
+    def test_every_category_has_a_declared_radius(self):
+        """A new category must not silently inherit the 50 km `.get` default."""
+        from app.geo.spatial import _CATEGORY_BASE_RADIUS_KM
+
+        assert set(_CATEGORY_BASE_RADIUS_KM) == set(EventCategory)
+
+    def test_an_earthquake_ignores_the_category_baseline(self):
+        """It has its own model; the 100 km entry is a fallback that must never be used."""
+        assert exposure_radius_for(
+            EventCategory.EARTHQUAKE, {"magnitude": 6.0}
+        ) == pytest.approx(63.1, rel=0.01)
+
+    def test_a_negative_explicit_radius_is_floored_at_zero(self):
+        assert exposure_radius_for(EventCategory.WILDFIRE, {"radius_km": -5.0}) == 0.0
 
     def test_explicit_radius_metadata_wins(self):
         assert exposure_radius_for(EventCategory.WILDFIRE, {"radius_km": 12.5}) == 12.5
