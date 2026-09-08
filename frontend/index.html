@@ -96,15 +96,20 @@
             </div>
           </div>
 
-          <div class="globe__overlay globe__overlay--bottom-left">
+          <!--
+            One row rather than two independently positioned corners. As separate
+            absolute boxes the legend and the controls had no way to know about each
+            other, so on a narrow stage they simply overlapped — the legend's provenance
+            note sitting underneath a button.
+          -->
+          <div class="globe__overlay globe__overlay--bottom">
             <div class="legend" data-bind="legend"></div>
-          </div>
-
-          <div class="globe__overlay globe__overlay--bottom-right">
-            <button type="button" class="ghost-button" data-action="toggle-dependencies">
-              Dependencies: on
-            </button>
-            <button type="button" class="ghost-button" data-action="reset-view">Reset view</button>
+            <div class="globe__controls">
+              <button type="button" class="ghost-button" data-action="toggle-dependencies">
+                Dependencies: on
+              </button>
+              <button type="button" class="ghost-button" data-action="reset-view">Reset view</button>
+            </div>
           </div>
 
           <div class="globe__loading" data-bind="globe-loading">

@@ -503,14 +503,27 @@ button {
   top: var(--space-3);
   left: var(--space-3);
 }
-.globe__overlay--bottom-left {
+/**
+ * The bottom row spans the stage so its two halves share a layout instead of being
+ * positioned into opposite corners and hoping they never meet. When the stage is too
+ * narrow for both, they wrap onto separate lines rather than overlapping.
+ */
+.globe__overlay--bottom {
   bottom: var(--space-3);
   left: var(--space-3);
-}
-.globe__overlay--bottom-right {
-  bottom: var(--space-3);
   right: var(--space-3);
   flex-direction: row;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+.globe__controls {
+  display: flex;
+  gap: var(--space-2);
+  flex-shrink: 0;
+  /* Stays right-aligned on its own line once the row has wrapped. */
+  margin-left: auto;
 }
 
 .globe__loading {
@@ -583,9 +596,12 @@ button {
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-1) var(--space-3);
-  /* Narrow enough to leave the bottom-right controls clear on a 1280-wide stage, which
-     is where the two overlays first come close to colliding. */
-  max-width: 340px;
+  /* The cap keeps the legend compact on a wide stage; `100%` is what lets it give way on
+     a narrow one. The number alone was the bug: it was chosen against a 1280px *viewport*,
+     but the legend sits on the globe column, which is some 500px narrower once a side rail
+     is open — so the two overlays collided long before the viewport reached 1280. */
+  max-width: min(340px, 100%);
+  min-width: 0;
   padding: var(--space-2) var(--space-3);
   background: color-mix(in srgb, var(--bg-panel) 94%, transparent);
   border: 1px solid var(--line);

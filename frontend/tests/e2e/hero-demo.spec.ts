@@ -349,6 +349,72 @@ test.describe('WorldGraph hero demo', () => {
     await expect(page.locator('.notice')).toContainText('Share link not understood');
   });
 
+  test('the globe overlays never sit on top of each other', async ({ page }) => {
+    test.slow();
+    await page.goto('/');
+    await waitForBoot(page);
+    await dismissFirstRun(page);
+
+    /**
+     * Does the legend intersect either control?
+     *
+     * The buttons are addressed by their `data-action`, not by whatever wrapper happens
+     * to hold them, so this measures the actual geometry rather than the markup — it
+     * would have caught the overlap in the previous layout too.
+     */
+    const overlays = () =>
+      page.evaluate(() => {
+        const rect = (sel: string) => document.querySelector(sel)!.getBoundingClientRect();
+        const legend = rect('.legend');
+        const stage = rect('.globe');
+        const hits = ['[data-action="toggle-dependencies"]', '[data-action="reset-view"]']
+          .map((sel) => rect(sel))
+          .filter(
+            (c) =>
+              !(
+                legend.right <= c.left ||
+                c.right <= legend.left ||
+                legend.bottom <= c.top ||
+                c.bottom <= legend.top
+              ),
+          );
+        const note = [...document.querySelectorAll('.legend__item')].pop()!;
+        const noteBox = note.getBoundingClientRect();
+        return {
+          overlap: hits.length > 0,
+          noteText: note.textContent!.trim(),
+          noteInsideStage:
+            noteBox.left >= stage.left - 1 &&
+            noteBox.right <= stage.right + 1 &&
+            noteBox.top >= stage.top - 1 &&
+            noteBox.bottom <= stage.bottom + 1,
+        };
+      });
+
+    // The legend and the controls used to be independently positioned corners with no
+    // way to know about each other, and the legend's width was capped against a *viewport*
+    // of 1280px. It sits on the globe column, which is some 500px narrower once a side
+    // rail is open — so they collided well before the viewport was anywhere near that.
+    for (const width of [1600, 1280, 1100, 960, 820]) {
+      await page.setViewportSize({ width, height: 900 });
+      await page.waitForTimeout(300);
+      const r = await overlays();
+      expect(r.overlap, `legend and controls overlap at ${width}px`).toBe(false);
+      // The provenance note lives in the legend. It is the line that says whether this
+      // estate is synthetic, so it is the one thing here that must never end up under a
+      // button or off the stage.
+      expect(r.noteText).toMatch(/synthetic demo data|read-only inventory/i);
+      expect(r.noteInsideStage, `provenance note escapes the globe at ${width}px`).toBe(true);
+    }
+
+    // The smallest stage this app can produce: narrowest viewport, side rail open.
+    await page.locator('.rail-switch__button', { hasText: 'Analyst' }).click();
+    await page.waitForTimeout(500);
+    const smallest = await overlays();
+    expect(smallest.overlap, 'legend and controls overlap on the smallest stage').toBe(false);
+    expect(smallest.noteInsideStage).toBe(true);
+  });
+
   test('the top bar fits every viewport instead of clipping', async ({ page }) => {
     test.slow();
     await page.goto('/');
