@@ -5,9 +5,16 @@ from __future__ import annotations
 import pytest
 
 from app.analysis.blast_radius import MAX_CRITICAL_PATHS, calculate_blast_radius
-from app.analysis.business_impact import business_impact, regional_capacity, snapshot_metrics
+from app.analysis.business_impact import (
+    SLA_FLOORS,
+    business_impact,
+    regional_capacity,
+    snapshot_metrics,
+)
 from app.analysis.propagation import (
     IMPACT_THRESHOLD,
+    MAX_ITERATIONS,
+    PropagationState,
     edge_transfer,
     propagate,
 )
@@ -15,6 +22,7 @@ from app.analysis.risk import WEIGHTS, assess_confidence, score_impact
 from app.graph.world_graph import WorldGraph
 from app.models.core import (
     HEALTH_VALUES,
+    BusinessProfile,
     Criticality,
     DependencyType,
     HealthState,
@@ -506,3 +514,71 @@ class TestRiskWeightsArePinned:
         else:
             assert found, f"{criticality.value} should contribute to the score"
             assert found[0].points == pytest.approx(expected, abs=0.05)
+
+
+class TestSlaFloorsArePinned:
+    """The thresholds that turn an availability number into a reported SLA breach.
+
+    Mutation testing found every floor unprotected: TIER-0, TIER-1 and TIER-2 could all be
+    changed without a test noticing, as could the `<` that compares against them. A breach
+    is a claim about a contract, and the docstring is careful to call it modelled rather
+    than contractual — which makes the number it is modelled against worth pinning.
+    """
+
+    def test_the_floors_are_the_documented_values(self):
+        assert SLA_FLOORS == {"TIER-0": 0.9995, "TIER-1": 0.999, "TIER-2": 0.99}
+
+    def test_a_stricter_tier_promises_more(self):
+        assert SLA_FLOORS["TIER-0"] > SLA_FLOORS["TIER-1"] > SLA_FLOORS["TIER-2"]
+
+    @pytest.mark.parametrize(
+        ("tier", "availability", "breached"),
+        [
+            ("TIER-0", 0.9994, True),    # just under the floor
+            ("TIER-0", 0.9995, False),   # exactly at it is not a breach
+            ("TIER-1", 0.9989, True),
+            ("TIER-1", 0.999, False),
+            ("TIER-2", 0.989, True),
+            ("TIER-2", 0.99, False),
+        ],
+    )
+    def test_a_breach_is_strictly_below_the_floor(
+        self, tier: str, availability: float, breached: bool
+    ):
+        """Pins both the number and the boundary: `<` and not `<=`."""
+        graph = WorldGraph([entity("a", business=BusinessProfile(sla_tier=tier))], [])
+        state = PropagationState(
+            availability={"a": availability},
+            capacity={"a": 1.0},
+            baseline_availability={"a": 1.0},
+        )
+        impact = business_impact(graph, state)
+        assert ("a" in impact.sla_breaches) is breached
+
+    def test_an_undeclared_tier_is_never_a_breach(self):
+        """An entity with no SLA tier cannot breach one, however badly it is hurt."""
+        graph = WorldGraph([entity("a")], [])
+        state = PropagationState(
+            availability={"a": 0.0}, capacity={"a": 0.0}, baseline_availability={"a": 1.0}
+        )
+        impact = business_impact(graph, state)
+        assert impact.sla_breaches == []
+        assert any("SLA exposure is unknown" in u for u in impact.unknown_reasons)
+
+
+class TestPropagationSolverBounds:
+    """The solver's iteration cap and what it reports about reaching it."""
+
+    def test_the_cap_is_sixty_four(self):
+        """Written out. Importing the constant to compare against itself proves nothing."""
+        assert MAX_ITERATIONS == 64
+
+    def test_a_normal_graph_converges_well_inside_the_cap(self, atlaspay_graph: WorldGraph):
+        state = propagate(atlaspay_graph, initial_availability={"cloud-region-singapore": 0.0})
+        assert state.converged is True
+        assert 0 < state.iterations < MAX_ITERATIONS
+
+    def test_iterations_are_counted_not_left_at_the_default(self, atlaspay_graph: WorldGraph):
+        """`iterations: int = 0` is a field default; a real run must overwrite it."""
+        state = propagate(atlaspay_graph, initial_availability={"cloud-region-singapore": 0.0})
+        assert state.iterations >= 1
