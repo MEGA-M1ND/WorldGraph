@@ -290,15 +290,41 @@ def _vulnerability_risks(graph: WorldGraph, events: list[WorldEvent]) -> list[Ma
         if not matches:
             continue
         seen.add(cve_id)
-        exposed = [m for m in matches if m.internet_facing]
+
+        # Confirmed and potential matches are scored apart, because they are different
+        # facts. A confirmed match is the asset's own inventory naming this CVE. A
+        # potential match is a product name colliding — version and vendor unchecked — so
+        # an asset already on the fixed release matches exactly as loudly as one that is
+        # not. Scoring `len(matches)` counted those patched assets as exposure and
+        # inflated the risk, and the summary then stated the inflated total as fact.
+        confirmed = [m for m in matches if m.is_confirmed]
+        potential = [m for m in matches if not m.is_confirmed]
+        exposed = [m for m in confirmed if m.internet_facing]
+
         contributions = [
             ScoreContribution(
                 code="vulnerable_assets",
-                label=f"{len(matches)} assets run affected software",
-                points=round(min(25.0, len(matches) * 6.0), 1),
-                detail=", ".join(sorted(m.entity.name for m in matches)[:4]),
+                label=f"{len(confirmed)} assets confirmed running affected software",
+                points=round(min(25.0, len(confirmed) * 6.0), 1),
+                detail=", ".join(sorted(m.entity.name for m in confirmed)[:4]) or "none",
             ),
         ]
+        if potential:
+            # Surfaced so nobody has to wonder where the rest went, and worth no points:
+            # a name collision is a triage candidate, not exposure.
+            contributions.append(
+                ScoreContribution(
+                    code="potentially_affected",
+                    label=f"{len(potential)} more match by product name only",
+                    points=0.0,
+                    detail=(
+                        ", ".join(
+                            sorted(f"{m.entity.name} ({m.component_version})" for m in potential)[:4]
+                        )
+                        + " — version unverified, triage rather than a finding"
+                    ),
+                )
+            )
         if exposed:
             contributions.append(
                 ScoreContribution(
@@ -332,14 +358,20 @@ def _vulnerability_risks(graph: WorldGraph, events: list[WorldEvent]) -> list[Ma
                 title=f"{cve_id} exposure",
                 severity=severity_from_score(score),
                 summary=(
-                    f"{cve_id} affects {len(matches)} AtlasPay assets; "
+                    f"{cve_id} is confirmed on {len(confirmed)} assets; "
                     + (
                         f"{len(exposed)} reachable from the internet."
                         if exposed
                         else "none are reachable from the internet."
                     )
+                    + (
+                        f" {len(potential)} more match by product name only and are "
+                        "unverified."
+                        if potential
+                        else ""
+                    )
                 ),
-                focus_entity_ids=[m.entity.id for m in (exposed or matches)][:4],
+                focus_entity_ids=[m.entity.id for m in (exposed or confirmed or matches)][:4],
                 contributions=contributions,
                 score=round(score, 1),
             )

@@ -401,17 +401,56 @@ export function renderEventDetail(
   }
 
   if (detail.vulnerable_assets.length > 0) {
-    const list = el('div', { class: 'pill-list' });
-    for (const asset of detail.vulnerable_assets) {
-      const pill = el('button', {
-        type: 'button',
-        class: 'pill',
-        text: `${asset.name}${asset.internet_facing ? ' · internet-facing' : ''}`,
-      });
-      pill.addEventListener('click', () => actions.selectEntity(asset.entity_id));
-      list.append(pill);
+    // Confirmed and unverified matches are listed apart, and only the confirmed ones are
+    // counted in the heading. A single "Affected assets (6)" put an asset already on the
+    // fixed release beside one whose own inventory names the CVE, and stated the total as
+    // fact — over-counting, on a security number a responder acts on.
+    const confirmed = detail.vulnerable_assets.filter(
+      (asset) => asset.assessment === 'CONFIRMED_AFFECTED',
+    );
+    const unverified = detail.vulnerable_assets.filter(
+      (asset) => asset.assessment !== 'CONFIRMED_AFFECTED',
+    );
+
+    const pillsFor = (assets: typeof detail.vulnerable_assets, tone: string) => {
+      const list = el('div', { class: 'pill-list' });
+      for (const asset of assets) {
+        const version = asset.component_version ? ` ${asset.component_version}` : '';
+        const pill = el('button', {
+          type: 'button',
+          class: 'pill',
+          text: `${asset.name}${version}${asset.internet_facing ? ' · internet-facing' : ''}`,
+        });
+        pill.dataset['tone'] = tone;
+        pill.addEventListener('click', () => actions.selectEntity(asset.entity_id));
+        list.append(pill);
+      }
+      return list;
+    };
+
+    if (confirmed.length > 0) {
+      container.append(
+        section(`Confirmed affected (${confirmed.length})`, pillsFor(confirmed, 'confirmed')),
+      );
     }
-    container.append(section(`Affected assets (${detail.vulnerable_assets.length})`, list));
+    if (unverified.length > 0) {
+      container.append(
+        section(
+          `Product name only — unverified (${unverified.length})`,
+          el(
+            'div',
+            {},
+            el('p', {
+              class: 'muted',
+              text:
+                'Matched on product name. WorldGraph did not compare version or vendor, so ' +
+                'an asset already on the fixed release matches here. Triage, not a finding.',
+            }),
+            pillsFor(unverified, 'unverified'),
+          ),
+        ),
+      );
+    }
   }
 
   const analyse = el('button', {

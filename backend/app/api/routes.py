@@ -410,6 +410,12 @@ def event_detail(event_id: str, state: WorldState = Depends(get_state)) -> dict[
                 "entity_id": m.entity.id,
                 "name": m.entity.name,
                 "component": m.component_name,
+                # The version and the assessment travel with the match. Dropping them
+                # here was enough to make the panel render a product-name collision and
+                # a confirmed finding as the same thing, so an asset already on the fixed
+                # release was counted into an "affected assets" total stated as fact.
+                "component_version": m.component_version,
+                "assessment": m.assessment.value,
                 "internet_facing": m.internet_facing,
             }
             for m in match_vulnerable_assets(

@@ -194,6 +194,15 @@ class VulnerabilityMatch:
     #: how a vulnerability dashboard becomes noise nobody reads.
     assessment: VulnerabilityAssessment = VulnerabilityAssessment.POTENTIALLY_AFFECTED
 
+    @property
+    def is_confirmed(self) -> bool:
+        """The asset's own inventory names this CVE.
+
+        Every count WorldGraph reports about a vulnerability has to go through this, or a
+        product-name collision ends up stated — and scored — as a finding.
+        """
+        return self.assessment is VulnerabilityAssessment.CONFIRMED_AFFECTED
+
 
 #: Entity types that can plausibly run software, and therefore can carry an inventory.
 #: A cloud region, a customer segment or an organisation cannot; counting them would

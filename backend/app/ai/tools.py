@@ -647,19 +647,26 @@ def _get_vulnerability_exposure(ctx: ToolContext, args: VulnerabilityArgs) -> di
             "assets": [],
             "note": "No AtlasPay asset runs software matching that vulnerability.",
         }
+    # Counted apart, because they are different facts. `count` stays the confirmed total:
+    # it is what the model and the router quote, and a product-name collision quoted as a
+    # finding is exactly the noise this distinction exists to prevent.
+    confirmed = [m for m in matches if m.is_confirmed]
+    potential = [m for m in matches if not m.is_confirmed]
     return {
         "cve_id": args.cve_id,
-        "count": len(matches),
-        "internet_facing_count": sum(1 for m in matches if m.internet_facing),
+        "count": len(confirmed),
+        "unverified_count": len(potential),
+        "internet_facing_count": sum(1 for m in confirmed if m.internet_facing),
         "assets": [
             {
                 "id": m.entity.id,
                 "name": m.entity.name,
                 "component": f"{m.component_name} {m.component_version}".strip(),
+                "assessment": m.assessment.value,
                 "internet_facing": m.internet_facing,
                 "network_zone": m.entity.exposure.network_zone,
             }
-            for m in matches[:MAX_ROWS]
+            for m in (confirmed + potential)[:MAX_ROWS]
         ],
     }
 
