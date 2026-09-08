@@ -11,6 +11,7 @@ from app.analysis.business_impact import (
     regional_capacity,
     snapshot_metrics,
 )
+from app.analysis.material_risk import MAX_RISKS, material_risks
 from app.analysis.propagation import (
     IMPACT_THRESHOLD,
     MAX_ITERATIONS,
@@ -24,9 +25,14 @@ from app.models.core import (
     HEALTH_VALUES,
     BusinessProfile,
     Criticality,
+    DataMode,
+    DataSourceInfo,
+    DependencyEdge,
     DependencyType,
+    EntityType,
     HealthState,
     Severity,
+    WorldEntity,
     health_from_value,
     severity_from_score,
 )
@@ -582,3 +588,190 @@ class TestPropagationSolverBounds:
         """`iterations: int = 0` is a field default; a real run must overwrite it."""
         state = propagate(atlaspay_graph, initial_availability={"cloud-region-singapore": 0.0})
         assert state.iterations >= 1
+
+
+class TestMaterialRiskScoring:
+    """Every number on a material-risk card, pinned against the demo estate.
+
+    Mutation testing found 137 survivors in `material_risk.py`. The point formulas, their
+    ceilings, the traversal depth, the concentration qualifying rule and the cap on how
+    many risks are returned were all unprotected. These cards are the left-hand rail of
+    the application — "CRITICAL · 67% of modelled traffic and 2 critical workloads sit in
+    one region, score 83" — so every one of those figures is read and acted on.
+
+    The expected values are written out. Deriving them from the module under test would
+    move the expectation with the code, which is how three earlier tests in this audit
+    managed to pass while asserting nothing.
+    """
+
+    @staticmethod
+    def _by_id(graph: WorldGraph) -> dict[str, object]:
+        return {r.id: r for r in material_risks(graph)}
+
+    def test_the_cap_is_six(self):
+        assert MAX_RISKS == 6
+
+    def test_the_demo_estate_produces_exactly_these_risks(self, atlaspay_graph: WorldGraph):
+        risks = material_risks(atlaspay_graph)
+        assert [r.id for r in risks] == [
+            "risk-sole-source-supplier-taiwan-hardware",
+            "risk-concentration-cloud-region-singapore",
+            "risk-spof-supplier-taiwan-hardware",
+            "risk-spof-factory-taiwan-assembly",
+        ], "risks are ordered worst-first; a change here changes what an operator sees"
+
+    @pytest.mark.parametrize(
+        ("risk_id", "score", "severity"),
+        [
+            ("risk-sole-source-supplier-taiwan-hardware", 84.6, "CRITICAL"),
+            ("risk-concentration-cloud-region-singapore", 83.0, "CRITICAL"),
+            ("risk-spof-supplier-taiwan-hardware", 80.0, "CRITICAL"),
+            ("risk-spof-factory-taiwan-assembly", 72.0, "HIGH"),
+        ],
+    )
+    def test_each_score_and_band(
+        self, atlaspay_graph: WorldGraph, risk_id: str, score: float, severity: str
+    ):
+        risk = self._by_id(atlaspay_graph)[risk_id]
+        assert risk.score == pytest.approx(score)
+        assert risk.severity.value == severity
+
+    @pytest.mark.parametrize(
+        ("risk_id", "code", "points"),
+        [
+            # Concentration: traffic x 110 capped at 45, criticals x 9 capped at 25,
+            # downstream x 1.6 capped at 20.
+            ("risk-concentration-cloud-region-singapore", "traffic_concentration", 45.0),
+            ("risk-concentration-cloud-region-singapore", "critical_workloads", 18.0),
+            ("risk-concentration-cloud-region-singapore", "downstream_reach", 20.0),
+            # Sole source.
+            ("risk-sole-source-supplier-taiwan-hardware", "sole_source", 35.0),
+            ("risk-sole-source-supplier-taiwan-hardware", "capacity_exposure", 30.0),
+            ("risk-sole-source-supplier-taiwan-hardware", "lead_time", 19.6),
+            # Single point of failure.
+            ("risk-spof-supplier-taiwan-hardware", "no_redundancy", 28.0),
+            ("risk-spof-supplier-taiwan-hardware", "downstream_reach", 32.0),
+            ("risk-spof-supplier-taiwan-hardware", "criticality", 20.0),
+            ("risk-spof-factory-taiwan-assembly", "criticality", 12.0),
+        ],
+    )
+    def test_each_contribution_is_worth_what_it_says(
+        self, atlaspay_graph: WorldGraph, risk_id: str, code: str, points: float
+    ):
+        risk = self._by_id(atlaspay_graph)[risk_id]
+        found = [c for c in risk.contributions if c.code == code]
+        assert found, f"{risk_id} lost its {code} contribution"
+        assert found[0].points == pytest.approx(points)
+
+    def test_no_score_can_exceed_one_hundred(self, atlaspay_graph: WorldGraph):
+        for risk in material_risks(atlaspay_graph):
+            assert 0.0 <= risk.score <= 100.0
+
+    @pytest.mark.parametrize(
+        ("flag", "expect_risk"),
+        [
+            (False, True),   # explicitly no qualified alternative -> a real finding
+            (True, False),   # explicitly qualified -> nothing to report
+            (None, False),   # never declared -> WorldGraph does not invent the finding
+        ],
+    )
+    def test_sole_source_fires_only_on_an_explicit_denial(
+        self, atlaspay_graph: WorldGraph, flag: object, expect_risk: bool
+    ):
+        """`is not False` is tri-state, and the quiet direction is deliberate.
+
+        The risk is raised only when an operator has declared there is no qualified second
+        source. An undeclared supplier produces no finding — absence of evidence is not
+        evidence of a sole source, and inventing the risk would be the same fault as
+        inventing a dependency.
+
+        I first wrote this with the polarity inverted, assuming undeclared meant risky. The
+        test failed, which is what a test that can fail is for.
+        """
+        entities = [e.model_copy(deep=True) for e in atlaspay_graph.entities]
+        for item in entities:
+            if item.id == "supplier-taiwan-hardware":
+                if flag is None:
+                    item.metadata.pop("second_source_qualified", None)
+                else:
+                    item.metadata["second_source_qualified"] = flag
+        graph = WorldGraph(entities, list(atlaspay_graph.edges))
+        ids = {r.id for r in material_risks(graph)}
+        assert ("risk-sole-source-supplier-taiwan-hardware" in ids) is expect_risk
+
+    @staticmethod
+    def _region_estate(chain: int, traffic: float = 0.30):
+        """A single region with one critical workload and a chain behind it.
+
+        Built to land every contribution BELOW its ceiling. On the demo estate three of
+        them are saturated — traffic x 110 gives 73.7 against a cap of 45 — so the
+        multipliers underneath are invisible there and survive mutation. Nothing about
+        AtlasPay can pin them; this can.
+        """
+        source = DataSourceInfo(source_id="t", source_name="t", mode=DataMode.SYNTHETIC)
+
+        def make(entity_id: str, kind: EntityType, **kwargs):
+            return WorldEntity(
+                id=entity_id,
+                name=entity_id,
+                type=kind,
+                source=source,
+                health=HealthState.HEALTHY,
+                **kwargs,
+            )
+
+        entities = [
+            make("region", EntityType.CLOUD_REGION),
+            make(
+                "app1",
+                EntityType.MICROSERVICE,
+                criticality=Criticality.CRITICAL,
+                business=BusinessProfile(traffic_share=traffic),
+            ),
+        ]
+        edges = [
+            DependencyEdge(
+                id="h1",
+                source_entity_id="app1",
+                target_entity_id="region",
+                type=DependencyType.HOSTED_IN,
+            )
+        ]
+        previous = "app1"
+        for index in range(1, chain + 1):
+            entities.append(make(f"svc{index}", EntityType.MICROSERVICE))
+            edges.append(
+                DependencyEdge(
+                    id=f"d{index}",
+                    source_entity_id=f"svc{index}",
+                    target_entity_id=previous,
+                    type=DependencyType.DEPENDS_ON,
+                )
+            )
+            previous = f"svc{index}"
+        return WorldGraph(entities, edges)
+
+    def test_the_concentration_multipliers_below_their_ceilings(self):
+        """30% traffic x 110 = 33; one critical x 9 = 9; three downstream x 1.6 = 4.8."""
+        risk = material_risks(self._region_estate(chain=2))[0]
+        points = {c.code: c.points for c in risk.contributions}
+        assert points["traffic_concentration"] == pytest.approx(33.0)
+        assert points["critical_workloads"] == pytest.approx(9.0)
+        assert points["downstream_reach"] == pytest.approx(4.8)
+
+    def test_the_concentration_traversal_stops_at_depth_six(self):
+        """An eight-deep chain still reaches only six, at 1.6 points each."""
+        risk = material_risks(self._region_estate(chain=8))[0]
+        points = {c.code: c.points for c in risk.contributions}
+        assert points["downstream_reach"] == pytest.approx(9.6), "6 hops x 1.6"
+
+    def test_concentration_needs_both_traffic_and_a_critical_workload(self):
+        """`traffic >= threshold and bool(critical)` — a conjunction, not a disjunction."""
+        heavy_but_not_critical = self._region_estate(chain=2)
+        for item in heavy_but_not_critical.entities:
+            if item.id == "app1":
+                item.criticality = Criticality.MEDIUM
+        assert material_risks(heavy_but_not_critical) == []
+
+        light = self._region_estate(chain=2, traffic=0.24)  # just under the 0.25 threshold
+        assert material_risks(light) == []
