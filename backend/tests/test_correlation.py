@@ -23,7 +23,7 @@ from app.geo.spatial import (
     within_radius,
 )
 from app.graph.world_graph import WorldGraph
-from app.models.core import EventCategory, GeoPoint
+from app.models.core import EventCategory, GeoPoint, Severity
 
 SINGAPORE = GeoPoint(lat=1.3521, lon=103.8198)
 FRANKFURT = GeoPoint(lat=50.1109, lon=8.6821)
@@ -243,3 +243,57 @@ class TestSecurityCorrelation:
 
     def test_unknown_origin_yields_no_paths(self, atlaspay_graph: WorldGraph):
         assert attack_paths(atlaspay_graph, from_entity_id="nowhere") == []
+
+
+class TestSeverityFloorsArePinned:
+    """The floors themselves, not just that they are ordered.
+
+    Found by mutation testing: changing `_SEVERITY_FLOOR[CRITICAL]` from 0.10 to 1.10 —
+    which says a facility at the centre of a CRITICAL event is completely unaffected —
+    failed no test. Four of the five floors survived the same treatment. Only HIGH was
+    pinned, and only because the AtlasPay fixture happens to be a HIGH event.
+
+    Three assertions covered this table: that availability falls off with distance, that it
+    is 1.0 at zero proximity, and that it is greater than zero at the centre. All three are
+    relative or one-sided, and none of them names a number.
+
+    These floors are a deliberate modelling decision — the comment above the table argues
+    that a magnitude number alone cannot justify claiming a facility is gone — so they are
+    exactly the kind of value that should not be able to drift unnoticed.
+    """
+
+    @pytest.mark.parametrize(
+        ("severity", "floor"),
+        [
+            (Severity.CRITICAL, 0.10),
+            (Severity.HIGH, 0.30),
+            (Severity.MODERATE, 0.60),
+            (Severity.LOW, 0.85),
+            (Severity.INFO, 0.97),
+        ],
+    )
+    def test_each_floor_is_the_documented_value(self, severity: Severity, floor: float):
+        """At full proximity an asset retains exactly the floor for its severity."""
+        event = demo_vulnerability().model_copy(update={"severity": severity})
+        assert modelled_availability(event, 1.0) == pytest.approx(floor)
+
+    def test_every_severity_is_covered(self):
+        """A new severity must not silently inherit someone else's floor."""
+        for severity in Severity:
+            event = demo_vulnerability().model_copy(update={"severity": severity})
+            assert 0.0 < modelled_availability(event, 1.0) <= 1.0
+
+    def test_the_floors_are_ordered_by_severity(self):
+        floors = [
+            modelled_availability(
+                demo_vulnerability().model_copy(update={"severity": s}), 1.0
+            )
+            for s in (Severity.CRITICAL, Severity.HIGH, Severity.MODERATE, Severity.LOW, Severity.INFO)
+        ]
+        assert floors == sorted(floors), "a worse event must not leave more availability"
+
+    def test_no_severity_models_total_destruction(self):
+        """The property the original test asserted, now for every severity, not just HIGH."""
+        for severity in Severity:
+            event = demo_vulnerability().model_copy(update={"severity": severity})
+            assert modelled_availability(event, 1.0) > 0.0

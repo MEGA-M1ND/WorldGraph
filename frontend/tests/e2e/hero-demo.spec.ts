@@ -203,14 +203,22 @@ test.describe('WorldGraph hero demo', () => {
     });
     const actions = page.locator('.plan__action');
     await expect(actions.first()).toBeVisible();
-    expect(await actions.count()).toBeGreaterThanOrEqual(3);
-    for (const rationale of await page.locator('.plan__rationale').allInnerTexts()) {
-      expect(rationale.trim().length).toBeGreaterThan(0);
-    }
-    // Every row states that nothing ran.
-    for (const note of await page.locator('.plan__footnote').allInnerTexts()) {
-      expect(note).toContain('not executed');
-    }
+    const actionCount = await actions.count();
+    expect(actionCount).toBeGreaterThanOrEqual(3);
+
+    // Counted against the actions before being looped. These two loops used to be guarded
+    // only by the `.plan__action` count above — a different selector — so an app that
+    // rendered actions with no rationale and no footnote iterated nothing and passed.
+    // Verified: with the footnote removed from the renderer entirely, this test stayed
+    // green, while claiming to prove every action says it was not executed.
+    const rationales = await page.locator('.plan__rationale').allInnerTexts();
+    expect(rationales, 'every action needs a rationale').toHaveLength(actionCount);
+    for (const rationale of rationales) expect(rationale.trim().length).toBeGreaterThan(0);
+
+    // The safety claim this product is built on: it recommends, it never executes.
+    const notes = await page.locator('.plan__footnote').allInnerTexts();
+    expect(notes, 'every action needs its not-executed footnote').toHaveLength(actionCount);
+    for (const note of notes) expect(note).toContain('not executed');
 
     await page.screenshot({ path: `${SHOTS}/07-response-plan.png` });
   });
@@ -277,10 +285,11 @@ test.describe('WorldGraph hero demo', () => {
     await expect(page.locator('[data-bind="detail-title"]')).toHaveText('Response plan', {
       timeout: 30_000,
     });
-    expect(await page.locator('.plan__action').count()).toBeGreaterThanOrEqual(3);
-    for (const note of await page.locator('.plan__footnote').allInnerTexts()) {
-      expect(note).toContain('not executed');
-    }
+    const planActions = await page.locator('.plan__action').count();
+    expect(planActions).toBeGreaterThanOrEqual(3);
+    const footnotes = await page.locator('.plan__footnote').allInnerTexts();
+    expect(footnotes, 'every action needs its not-executed footnote').toHaveLength(planActions);
+    for (const note of footnotes) expect(note).toContain('not executed');
   });
 
   test('the analyst refuses to invent infrastructure', async ({ page }) => {
