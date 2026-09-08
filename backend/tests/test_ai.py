@@ -493,7 +493,43 @@ class TestTheToolArgumentContract:
         ("PlanArgs", "analysis_id", None, 128),
         ("PlanArgs", "scenario_id", None, 128),
         ("PlanArgs", "event_id", None, 192),
+        ("FocusEntityArgs", "entity_id", 1, 128),
+        ("FocusEventArgs", "event_id", 1, 192),
+        ("PathArgs", "from_entity_id", 1, 128),
+        ("PathArgs", "to_entity_id", 1, 128),
+        ("AnnotateArgs", "entity_ids", 1, 40),
+        ("AnnotateArgs", "label", None, 120),
+        ("VulnerabilityArgs", "cve_id", None, 64),
+        ("VulnerabilityArgs", "product", None, 128),
+        ("AttackPathArgs", "to_entity_id", None, 128),
+        ("AttackPathArgs", "from_entity_id", None, 128),
+        ("BlastRadiusArgs", "entity_ids", None, 10),
     ]
+
+    #: What a caller gets when it omits an optional argument entirely.
+    DEFAULTS: ClassVar[list[tuple[str, str, object]]] = [
+        ("SearchArgs", "limit", 20),
+        ("TraceArgs", "max_depth", 4),
+        ("RecentEventsArgs", "limit", 10),
+        ("RecentEventsArgs", "minutes", None),
+        ("NearEventArgs", "radius_km", None),
+        # The one default that is not a number: an attack-path question with no source
+        # named means "from the public internet", which is the only externally reachable
+        # starting point. A different default would silently answer a different question.
+        ("AttackPathArgs", "from_entity_id", "internet"),
+        ("AttackPathArgs", "to_entity_id", ""),
+        ("AnnotateArgs", "label", ""),
+        ("SearchArgs", "query", ""),
+    ]
+
+    @pytest.mark.parametrize(("schema_name", "field", "expected"), DEFAULTS)
+    def test_the_default_is_what_the_contract_says(self, schema_name, field, expected):
+        """Read off the field, so a schema with other required arguments still works."""
+        from app.ai import tools as tools_module
+
+        info = getattr(tools_module, schema_name).model_fields[field]
+        assert info.is_required() is False, f"{schema_name}.{field} has no default"
+        assert info.get_default(call_default_factory=True) == expected
 
     @pytest.mark.parametrize(("schema_name", "field", "low", "high"), CONTRACT)
     def test_the_bound_is_what_the_contract_says(self, schema_name, field, low, high):
@@ -533,6 +569,21 @@ class TestTheToolArgumentContract:
                     unbounded.append(f"{tool.args_model.__name__}.{name}")
         assert unbounded == []
         assert tools_module.MAX_ROWS == 40
+
+    def test_only_the_four_scenario_tools_are_writes(self):
+        """`kind` defaults to "read" — every other tool must actually carry that word.
+
+        `writers == {…}` alone passes if the default string drifts to something else
+        entirely, because the *set of writers* is unchanged by that.
+        """
+        kinds = {tool.name: tool.kind for tool in TOOLS.values()}
+        assert set(kinds.values()) == {"read", "write"}
+        assert {name for name, kind in kinds.items() if kind == "write"} == {
+            "create_simulation",
+            "add_simulation_override",
+            "remove_simulation_override",
+            "reset_simulation",
+        }
 
     def test_every_schema_in_the_contract_is_actually_used_by_a_tool(self):
         """So the table cannot drift into describing dead code."""

@@ -49,6 +49,7 @@ from app.adapters.azure_regions import (
     CLOUD_REGION_APPROXIMATION,
     is_known_region,
     normalize_region,
+    region_display_name,
     region_location,
 )
 from app.adapters.azure_tags import (
@@ -1291,3 +1292,244 @@ class TestEntityIdsAreSlugsNotAzureIds:
         slug = entity_id_for(f"{self.SUB}/resourceGroups/rg/providers/Microsoft.Web/sites/x")
         assert "00000000" not in slug
         assert "subscriptions" not in slug
+
+
+class TestNormalizationBoundsAndFallbacks:
+    """A row from Resource Graph is untrusted input with optional fields.
+
+    Re-running the mutation harness left every metadata key, every length cap and every
+    fallback in `normalize_resource` standing. A misspelled key does not raise — it silently
+    produces an entity missing the field the UI reads.
+    """
+
+    SUB = "/subscriptions/00000000-0000-0000-0000-000000000001"
+
+    def _row(self, **overrides) -> dict:
+        row = {
+            "id": f"{self.SUB}/resourceGroups/rg-prod/providers/Microsoft.Web/sites/store",
+            "name": "store",
+            "type": "microsoft.web/sites",
+            "location": "westeurope",
+            "resourceGroup": "rg-prod",
+            "subscriptionId": "00000000-0000-0000-0000-000000000001",
+            "tags": {},
+            "properties": {},
+        }
+        row.update(overrides)
+        return row
+
+    def test_a_row_with_no_type_is_reported_as_unknown_not_dropped(self, azure_workspace):
+        """The caller counts what it could not model. A silent drop hides the gap."""
+        entity, tags, raw_type = normalize_resource(self._row(type=""), azure_workspace)
+        assert entity is None and tags is None
+        assert raw_type == "unknown"
+
+    def test_a_row_with_no_id_is_the_same(self, azure_workspace):
+        _entity, _tags, raw_type = normalize_resource(self._row(id=""), azure_workspace)
+        assert raw_type == "microsoft.web/sites"
+
+    def test_a_nameless_resource_falls_back_to_the_last_id_segment(self, azure_workspace):
+        """Resource Graph omits `name` on some row shapes; the id always carries it."""
+        entity, _tags, _type = normalize_resource(self._row(name=None), azure_workspace)
+        assert entity is not None
+        assert entity.name == "store"
+
+    def test_the_metadata_keys_the_ui_reads_are_all_present(self, azure_workspace):
+        entity, _tags, _type = normalize_resource(self._row(kind="app,linux"), azure_workspace)
+        assert entity is not None
+        assert entity.metadata["provider"] == "azure"
+        assert entity.metadata["resourceGroup"] == "rg-prod"
+        assert entity.metadata["subscriptionId"] == "00000000-0000-0000-0000-000000000001"
+        assert entity.metadata["resourceType"] == "microsoft.web/sites"
+        assert entity.metadata["locationDisplay"] == region_display_name("westeurope")
+        assert entity.metadata["kind"] == "app,linux"
+
+    def test_kind_is_omitted_rather_than_stored_empty(self, azure_workspace):
+        entity, _tags, _type = normalize_resource(self._row(), azure_workspace)
+        assert entity is not None
+        assert "kind" not in entity.metadata
+
+    def test_every_imported_entity_sits_in_the_azure_network_zone(self, azure_workspace):
+        entity, _tags, _type = normalize_resource(self._row(), azure_workspace)
+        assert entity is not None
+        assert entity.exposure.network_zone == "azure"
+
+    def test_the_tag_map_is_capped(self, azure_workspace):
+        """A resource with a hundred tags must not carry a hundred into the graph."""
+        entity, _tags, _type = normalize_resource(
+            self._row(tags={f"tag{i}": str(i) for i in range(100)}), azure_workspace
+        )
+        assert entity is not None
+        assert len(entity.metadata["tags"]) == 40
+
+    def test_a_non_dict_tag_field_is_ignored_rather_than_crashing(self, azure_workspace):
+        entity, _tags, _type = normalize_resource(self._row(tags="not-a-dict"), azure_workspace)
+        assert entity is not None
+        assert entity.metadata["tags"] == {}
+
+    def test_the_description_names_the_type_and_where_it_runs(self, azure_workspace):
+        entity, _tags, _type = normalize_resource(self._row(), azure_workspace)
+        assert entity is not None
+        assert entity.description == (
+            f"microsoft.web/sites in {region_display_name('westeurope')}"
+        )
+
+    def test_a_resource_with_no_location_says_only_what_it_is(self, azure_workspace):
+        entity, _tags, _type = normalize_resource(self._row(location=""), azure_workspace)
+        assert entity is not None
+        assert entity.description == "microsoft.web/sites"
+        assert entity.business.region == ""
+
+
+class TestInferredEdgesCarryNoRedundancyClaim:
+    """`redundancy=0.0` on every inferred edge is a statement, not a placeholder.
+
+    Azure inventory does not say whether a dependency has a fallback path. Claiming any
+    redundancy would make the impact model treat a single point of failure as survivable.
+    """
+
+    def test_no_inferred_edge_claims_redundancy(self, snapshot_resources, azure_workspace):
+        entities = {}
+        tags = {}
+        for resource in snapshot_resources:
+            entity, parsed, _type = normalize_resource(resource, azure_workspace)
+            if entity is None:
+                continue
+            entities[str(resource["id"])] = entity
+            if parsed is not None:
+                tags[entity.id] = parsed
+        edges, explicit, declared = infer_edges(entities, tags, azure_workspace)
+        assert edges
+        assert all(edge.redundancy == 0.0 for edge in edges)
+        assert explicit + declared <= len(edges)
+
+    def test_edge_ids_encode_both_ends_and_the_relationship(self, azure_workspace):
+        entity, _tags, _type = normalize_resource(
+            {
+                "id": "/subscriptions/x/resourceGroups/rg/providers/Microsoft.Web/sites/a",
+                "name": "a",
+                "type": "microsoft.web/sites",
+                "location": "westeurope",
+                "tags": {},
+                "properties": {},
+            },
+            azure_workspace,
+        )
+        assert entity is not None
+        edges, _explicit, _declared = infer_edges({"x": entity}, {}, azure_workspace)
+        hosting = [e for e in edges if e.type is DependencyType.HOSTED_IN]
+        assert hosting
+        for edge in hosting:
+            assert edge.id == f"{edge.source_entity_id}--{edge.type.value}--{edge.target_entity_id}"
+        # Distinct ends, distinct ids: a shared id would silently overwrite.
+        assert len({e.id for e in edges}) == len(edges)
+
+    def test_a_resource_declaring_itself_gets_no_self_dependency(self, azure_workspace):
+        """A tag pointing at its own resource is a mistake, not a cycle to model."""
+        azure_id = "/subscriptions/x/resourceGroups/rg/providers/Microsoft.Web/sites/a"
+        row = {
+            "id": azure_id,
+            "name": "a",
+            "type": "microsoft.web/sites",
+            "location": "westeurope",
+            "tags": {"worldgraph.depends_on": azure_id},
+            "properties": {},
+        }
+        entity, parsed, _type = normalize_resource(row, azure_workspace)
+        assert entity is not None and parsed is not None
+        edges, _explicit, declared = infer_edges({azure_id: entity}, {entity.id: parsed}, azure_workspace)
+        assert declared == 0
+        assert all(e.source_entity_id != e.target_entity_id for e in edges)
+
+
+class TestImportSummaryBounds:
+    @pytest.mark.anyio
+    async def test_unsupported_types_are_counted_and_ranked(self, tmp_path, azure_workspace):
+        """The count is what tells an operator how much of the estate is unmodelled."""
+        rows = [
+            {"id": f"/subscriptions/x/a{i}", "type": "microsoft.unknown/thing",
+             "name": f"a{i}", "location": "westeurope", "tags": {}, "properties": {}}
+            for i in range(3)
+        ] + [
+            {"id": "/subscriptions/x/b", "type": "microsoft.other/thing",
+             "name": "b", "location": "westeurope", "tags": {}, "properties": {}}
+        ]
+        snapshot = tmp_path / "s.json"
+        snapshot.write_text(json.dumps({"resources": rows}))
+        settings = Settings(
+            run_mode=RunMode.OFFLINE, database_path=":memory:", anthropic_api_key=None,
+            azure_snapshot_path=str(snapshot),
+        )
+        _entities, _edges, summary = await import_azure_workspace(settings, azure_workspace)
+        assert summary.resources_discovered == 4
+        assert summary.resources_supported == 0
+        assert summary.resources_unsupported == 4
+        # Ranked by count, so the biggest gap leads.
+        assert list(summary.unsupported_types) == [
+            "microsoft.unknown/thing", "microsoft.other/thing"
+        ]
+        assert summary.unsupported_types["microsoft.unknown/thing"] == 3
+
+    @pytest.mark.anyio
+    async def test_a_dangling_edge_never_survives_into_the_graph(self, imported):
+        """A dangling edge would let the graph claim reachability into nothing."""
+        entities, edges, _summary = imported
+        known = {e.id for e in entities}
+        assert edges
+        for edge in edges:
+            assert edge.source_entity_id in known
+            assert edge.target_entity_id in known
+
+
+class TestConfiguredWorkspacesAreReadOnly:
+    """Reality Pass §4: WorldGraph holds no write permission on a real subscription."""
+
+    @staticmethod
+    def _settings(**kwargs):
+        from app.config import RunMode, Settings
+
+        return Settings(
+            run_mode=RunMode.OFFLINE,
+            database_path=":memory:",
+            anthropic_api_key=None,
+            cesium_ion_token=None,
+            google_maps_api_key=None,
+            **kwargs,
+        )
+
+    def test_every_configured_workspace_declares_itself_read_only(self):
+        workspaces = configured_azure_workspaces(
+            self._settings(azure_subscriptions=["prod", "staging"], azure_snapshot_path="/tmp/s.json")
+        )
+        assert len(workspaces) == 3
+        assert all(w.read_only is True for w in workspaces)
+
+    def test_a_snapshot_is_replay_and_a_subscription_is_live(self):
+        """Calling a recording LIVE is the dishonesty the provenance model prevents."""
+        from app.models.core import DataMode
+
+        workspaces = configured_azure_workspaces(
+            self._settings(azure_subscriptions=["prod"], azure_snapshot_path="/tmp/s.json")
+        )
+        by_id = {w.id: w for w in workspaces}
+        assert by_id["azure-prod"].mode is DataMode.LIVE
+        assert by_id["azure-snapshot"].mode is DataMode.REPLAY
+
+    def test_two_subscriptions_never_share_a_workspace_id(self):
+        workspaces = configured_azure_workspaces(
+            self._settings(azure_subscriptions=["Prod EU", "Prod US"])
+        )
+        assert len({w.id for w in workspaces}) == 2
+        assert workspaces[0].name == "Azure — Prod EU"
+
+    def test_an_unusable_label_still_produces_a_usable_workspace(self):
+        """`or "subscription"`. An empty id would collide with every other empty id."""
+        workspaces = configured_azure_workspaces(self._settings(azure_subscriptions=["///"]))
+        # `sanitize_identifier` already reduces an unusable label to "unknown"; the
+        # `or "subscription"` beneath it is the second net. Either way the id is usable
+        # and distinct from the empty string.
+        assert workspaces[0].id == "azure-unknown"
+        assert workspaces[0].read_only is True
+
+    def test_no_subscriptions_configured_means_no_workspaces(self):
+        assert configured_azure_workspaces(self._settings()) == []
