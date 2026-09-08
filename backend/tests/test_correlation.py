@@ -45,8 +45,32 @@ class TestDistance:
         assert haversine_km(SINGAPORE, SINGAPORE) == pytest.approx(0.0, abs=1e-9)
 
     def test_known_distance(self):
-        """Singapore → Frankfurt is ~10,270 km great-circle."""
-        assert haversine_km(SINGAPORE, FRANKFURT) == pytest.approx(10_270, rel=0.01)
+        """Singapore → Frankfurt is ~10,258 km great-circle.
+
+        `rel=0.01` used to be the tolerance here, which is ±103 km — wide enough that the
+        Earth radius constant itself could drift by a kilometre with nothing failing, on a
+        figure that decides whether an asset sits inside a 50 km exposure radius.
+        Mutation testing found exactly that. 0.05 % is float noise; 1 % is a different
+        planet.
+        """
+        assert haversine_km(SINGAPORE, FRANKFURT) == pytest.approx(10_258.05, rel=5e-4)
+
+    def test_the_earth_radius_is_the_iugg_mean(self):
+        """6371.0088 km. Written out rather than imported, or it would pin itself."""
+        from app.geo.spatial import EARTH_RADIUS_KM
+
+        assert EARTH_RADIUS_KM == 6371.0088
+
+    def test_a_degree_of_latitude_is_a_hundred_and_eleven_kilometres(self):
+        """The schoolbook figure, and an independent check on the radius."""
+        assert haversine_km(
+            GeoPoint(lat=0.0, lon=0.0), GeoPoint(lat=1.0, lon=0.0)
+        ) == pytest.approx(111.195, rel=5e-4)
+
+    def test_the_equator_to_the_pole_is_a_quarter_of_the_circumference(self):
+        assert haversine_km(
+            GeoPoint(lat=0.0, lon=0.0), GeoPoint(lat=90.0, lon=0.0)
+        ) == pytest.approx(10_007.56, rel=5e-4)
 
     def test_symmetry(self):
         assert haversine_km(SINGAPORE, FRANKFURT) == pytest.approx(
@@ -57,7 +81,7 @@ class TestDistance:
         """The sqrt clamp exists for exactly this input."""
         north = GeoPoint(lat=90.0, lon=0.0)
         south = GeoPoint(lat=-90.0, lon=0.0)
-        assert haversine_km(north, south) == pytest.approx(20_015, rel=0.01)
+        assert haversine_km(north, south) == pytest.approx(20_015.11, rel=5e-4)
 
     def test_dateline_is_a_short_hop_not_a_lap(self):
         west = GeoPoint(lat=0.0, lon=179.9)
