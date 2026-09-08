@@ -92,6 +92,11 @@ button {
   padding: 0 var(--space-4);
   background: var(--bg-panel);
   border-bottom: 1px solid var(--line);
+  /* A flex item will not shrink below its content by default, so without this the bar
+     forced itself wider than its grid column — 1439px inside a 1100px window — and the
+     overflow was invisible until you clicked something on the right, whose focus scrolled
+     the brand and the workspace selector out of view. */
+  min-width: 0;
 }
 
 .topbar__brand {
@@ -129,17 +134,30 @@ button {
   gap: var(--space-2);
   padding-left: var(--space-4);
   border-left: 1px solid var(--line);
+  min-width: 0;
 }
 
 .topbar__org-name {
   font-size: var(--text-base);
   font-weight: 550;
+  /* The name gives way before the badge does. Which estate you are looking at, and
+     whether it is synthetic or read-only, is not something to truncate. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.topbar__org .badge,
+.workspace-select {
+  flex-shrink: 0;
 }
 
 .topbar__stats {
   display: flex;
   gap: var(--space-5);
   margin-left: auto;
+  min-width: 0;
 }
 
 .stat {
@@ -168,6 +186,11 @@ button {
   gap: var(--space-3);
   padding-left: var(--space-4);
   border-left: 1px solid var(--line);
+  flex-shrink: 0;
+}
+
+.topbar__brand {
+  flex-shrink: 0;
 }
 
 .topbar__clock {
@@ -634,6 +657,49 @@ button {
 @media (max-width: 1500px) {
   :root {
     --rail-width: 300px;
+  }
+}
+
+/**
+ * Narrow windows: the bar wraps rather than clipping.
+ *
+ * The six headline stats are 661px of a 1439px minimum, so below roughly this width they
+ * cannot share a row with the brand, the workspace selector and the controls. They move to
+ * a second row instead of being cut off — every figure stays readable, and the run mode,
+ * the provenance badge and the estate selector keep their place on the first row.
+ *
+ * Hiding them would have been fewer lines. It would also have removed numbers from the
+ * screen without saying so, which is the failure mode this product is supposed to avoid.
+ */
+@media (max-width: 1360px) {
+  .app {
+    grid-template-rows: auto auto 1fr var(--dock-height);
+  }
+  .topbar {
+    flex-wrap: wrap;
+    padding-top: var(--space-2);
+    padding-bottom: var(--space-2);
+    row-gap: var(--space-2);
+  }
+  /* Controls stay beside the estate; the stats take the row below. */
+  .topbar__right {
+    order: 1;
+    margin-left: auto;
+  }
+  .topbar__stats {
+    order: 2;
+    flex-basis: 100%;
+    margin-left: 0;
+    gap: var(--space-4);
+    /* Last resort at very small widths: scroll the figures rather than clip them. */
+    overflow-x: auto;
+  }
+}
+
+@media (max-width: 1024px) {
+  /* The wordmark is the one thing here that carries no information. The mark stays. */
+  .topbar__name {
+    display: none;
   }
 }
 
