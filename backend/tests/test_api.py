@@ -758,3 +758,63 @@ class TestThePlanAndCompareEdges:
         response = client.get(f"/api/simulation/{scenario_id}/compare")
         assert response.status_code == 422
         assert "payments-api" in response.json()["detail"]
+
+
+class TestStartupAndRateLimitGuards:
+    """What the API does before it is ready, and when a limiter is not configured.
+
+    Coverage found these never executed. A 503 that says "still starting up" is a
+    different fact from a 500, and the frontend retries one and not the other.
+    """
+
+    @staticmethod
+    def _bare_app():
+        from fastapi import FastAPI
+
+        from app.api.routes import router
+
+        app = FastAPI()
+        app.include_router(router, prefix="/api")
+        return app
+
+    def test_a_request_before_the_registry_exists_is_a_503_not_a_crash(self):
+        with TestClient(self._bare_app(), raise_server_exceptions=False) as client:
+            response = client.get("/api/world")
+        assert response.status_code == 503
+        assert response.json()["detail"] == "WorldGraph is still starting up."
+
+    def test_an_ask_before_the_analyst_exists_is_its_own_503(self, client):
+        """A different subsystem, so a different sentence — the UI can say which.
+
+        The registry has to be up to reach this, because `get_state` resolves first.
+        """
+        analysts = client.app.state.analysts
+        del client.app.state.analysts
+        try:
+            response = client.post("/api/ai/ask", json={"message": "hello"})
+        finally:
+            client.app.state.analysts = analysts
+        assert response.status_code == 503
+        assert response.json()["detail"] == "The analyst is still starting up."
+
+    def test_with_no_limiters_configured_requests_are_not_blocked(self):
+        """A missing limiter must fail open, not closed: it is a budget, not a gate."""
+        from app.api.deps import get_settings
+
+        app = self._bare_app()
+        app.dependency_overrides[get_settings] = lambda: Settings(
+            run_mode=RunMode.DEMO, database_path=":memory:", anthropic_api_key=None
+        )
+        with TestClient(app, raise_server_exceptions=False) as client:
+            # Reaches the handler and fails there on the missing registry, not on a 429.
+            for _ in range(5):
+                assert client.get("/api/world").status_code == 503
+
+    def test_an_unknown_limiter_kind_also_fails_open(self, client):
+        """`limiters.get(kind)` returning None must not deny the request."""
+        limiters = client.app.state.limiters
+        client.app.state.limiters = {}
+        try:
+            assert client.get("/api/world").status_code == 200
+        finally:
+            client.app.state.limiters = limiters

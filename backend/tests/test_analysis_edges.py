@@ -495,3 +495,69 @@ class TestTheBlastRadiusExplanation:
             self._estate(), origin_ids=["region"], origin_kind="ENTITY"
         )
         assert any("MODELLED ESTIMATE" in line for line in result.explanations)
+
+
+class TestConfidenceNamesTheTraversalsOwnLimits:
+    """Truncation and non-convergence are findings about the *answer*, not the estate.
+
+    Both were uncovered. An analysis that hit its depth budget, or whose solver ran out of
+    iterations, has to say so: the impact it reports is a lower bound, and a reader who
+    does not know that will treat it as the whole picture.
+    """
+
+    @staticmethod
+    def _confidence(*, truncated: bool, converged: bool = True):
+        from app.analysis.risk import assess_confidence
+
+        graph = WorldGraph([_entity("a"), _entity("b")], [])
+        state = propagate(graph)
+        if not converged:
+            state.converged = False
+        return assess_confidence(
+            graph, state, origin_ids=["a"], event=None, truncated=truncated, proximity=0.0
+        )
+
+    def test_a_truncated_traversal_says_the_impact_may_be_wider(self):
+        confidence = self._confidence(truncated=True)
+        assert any(
+            "traversal was truncated; impact may be wider" in item
+            for item in confidence.uncertainties
+        )
+
+    def test_an_untruncated_traversal_makes_no_such_claim(self):
+        confidence = self._confidence(truncated=False)
+        assert not any("truncated" in item for item in confidence.uncertainties)
+
+    def test_a_solver_that_did_not_converge_says_so(self):
+        confidence = self._confidence(truncated=False, converged=False)
+        assert any(
+            "did not fully converge" in item for item in confidence.uncertainties
+        )
+
+    def test_both_limits_lower_the_score_rather_than_only_being_narrated(self):
+        """A caveat that does not move the number is decoration."""
+        clean = self._confidence(truncated=False)
+        truncated = self._confidence(truncated=True)
+        stalled = self._confidence(truncated=False, converged=False)
+        assert truncated.score < clean.score
+        assert stalled.score < clean.score
+
+    def test_a_synthetic_estate_is_labelled_synthetic(self):
+        from app.analysis.risk import _estate_provenance_notes
+
+        synthetic = _entity("demo", source=DataSourceInfo(
+            source_id="fx", source_name="Fixture", mode=DataMode.SYNTHETIC
+        ))
+        notes = _estate_provenance_notes(WorldGraph([synthetic], []))
+        assert any("synthetic demonstration data" in note for note in notes)
+        # One mode only, so nothing about mixing.
+        assert not any("mixes" in note for note in notes)
+
+    def test_a_simulated_record_is_labelled_simulated(self):
+        from app.analysis.risk import _estate_provenance_notes
+
+        simulated = _entity("what-if", source=DataSourceInfo(
+            source_id="sim", source_name="Simulation", mode=DataMode.SIMULATED
+        ))
+        notes = _estate_provenance_notes(WorldGraph([simulated], []))
+        assert any("simulated world state" in note for note in notes)
