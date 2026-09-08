@@ -28,7 +28,7 @@ what they cost, and the section that matters most is [§9](#9-what-is-still-not-
 > comparison and boolean in the code under audit and asking whether any test notices. It
 > found that the nine prompt-injection patterns, the reachability factor in CVE scoring,
 > and the function that *is* workspace isolation were all unprotected, and that an
-> exception's text bypassed log redaction entirely. 597 tests → 1,413, 92 % → 99 % coverage.
+> exception's text bypassed log redaction entirely. 597 tests → 1,456, 92 % → 99 % coverage.
 
 ---
 
@@ -619,7 +619,7 @@ that string with an `X` on the end — and the whole suite was run against each.
 that no test notices is a behaviour no test protects. That is not an opinion about test
 quality; it is a decision procedure with a yes or no answer.
 
-The suite went from **597 tests to 1,413** as a result, plus 32 → 39 on the frontend, and
+The suite went from **597 tests to 1,456** as a result, plus 32 → 39 on the frontend, and
 backend line coverage from 92 % to 99 %. Almost none of that is new product code — one line
 is, and §13.5 is about that line. The rest is behaviour that was already shipping and could
 have been altered silently.
@@ -777,6 +777,19 @@ every analysis says, and that is a product decision rather than a test one.
 
 The invariant underneath it — a pinned origin cannot be healed by its own dependencies — is
 real and is now pinned by a test. The dead branch is left as it is, named here.
+
+### What the two techniques cost, and which paid
+
+Roughly in proportion: the mutation pass took most of the wall clock — a full run is
+~1,100 mutants, each one a complete suite execution — and produced the sharper individual
+findings, the ones about a specific constant carrying a specific claim. The coverage pass
+took minutes and produced more of them, because "no test runs this line" is a cheaper
+question to answer than "can any test tell this apart", and on a suite this size it was
+still true of about eight per cent of the code.
+
+Both were needed. Coverage would never have found the reachability factor in CVE scoring —
+that line runs on every security analysis, it just runs unchecked. Mutation would never have
+found the log-redaction defect, because a mutant cannot be killed on a line no test runs.
 
 ### The honest limit of this
 
