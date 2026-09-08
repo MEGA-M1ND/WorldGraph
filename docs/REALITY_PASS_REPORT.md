@@ -27,7 +27,8 @@ what they cost, and the section that matters most is [§9](#9-what-is-still-not-
 > applies that standard to the whole suite by machine** — mutating every constant,
 > comparison and boolean in the code under audit and asking whether any test notices. It
 > found that the nine prompt-injection patterns, the reachability factor in CVE scoring,
-> and the function that *is* workspace isolation were all unprotected. 597 tests → 1,068.
+> and the function that *is* workspace isolation were all unprotected, and that an
+> exception's text bypassed log redaction entirely. 597 tests → 1,351.
 
 ---
 
@@ -618,8 +619,9 @@ that string with an `X` on the end — and the whole suite was run against each.
 that no test notices is a behaviour no test protects. That is not an opinion about test
 quality; it is a decision procedure with a yes or no answer.
 
-The suite went from **597 tests to 1,068** as a result, plus 32 → 39 on the frontend. None
-of that is new product code. All of it is behaviour that was already shipping and could
+The suite went from **597 tests to 1,351** as a result, plus 32 → 39 on the frontend, and
+backend line coverage from 92 % to 98 %. Almost none of that is new product code — one line
+is, and §13.5 is about that line. The rest is behaviour that was already shipping and could
 have been altered silently.
 
 ### The five shapes a vacuous assertion takes
@@ -675,6 +677,9 @@ Ordered by what the finding costs if it goes wrong, not by count.
 | `adapters/azure_inventory.py` | Every truncation reason — "Azure said it truncated" and "WorldGraph stopped at its own ceiling" call for opposite responses and could have collapsed onto one string. Every threshold in `level()`, which turns a ratio into a word an operator reads as a verdict. The sanitizer's bounds, and `PAGE_SIZE` — Resource Graph returns at most 1 000 rows whatever KQL asks for, so a larger page size makes the paging loop read a full page as the end of the estate. |
 | `geo/spatial.py` | The Earth's radius. The distance tests were there, at `rel=0.01` — ±103 km on a 10 000 km figure, on the number that decides whether an asset sits inside a 50 km exposure radius. Also half the compass table, and the per-category exposure radii whose zeros mean "not geographic at all". |
 | `frontend/src/ui/dom.ts` | The `el()` XSS chokepoint, and the codebase-wide property it depends on. The module's own docstring claimed both; nothing tested either. |
+| `observability/logging.py` | Log redaction, where the exception branch was not merely unprotected but **wrong** — see §13.5. |
+| `storage/repository.py` | Whole methods no test called: `load_events`, `recent_analyses`, `list_scenarios`, `delete_scenario`, `save_plan`, `load_plan`, `load_timeline`, and the transaction rollback. This is what makes a share link work after a restart. |
+| `ai/analyst.py` | The entire model-backed tool-use loop and its fallback. It only runs when an API key is configured, which is exactly why it needed testing: code that runs only in a configuration nobody tests fails the first time somebody uses it. |
 
 ### What was left alone, and why
 
@@ -703,6 +708,55 @@ work rather than the work being trusted once it was green.
 
 This is the argument for the technique in one line. Careful review had already passed that
 assertion twice.
+
+### Where the survivor count actually landed
+
+The harness was run back over its own output at the end: all **666 recorded survivors**,
+re-applied one at a time against the grown suite.
+
+| Verdict | Count |
+|---|---|
+| Now killed by a test written during this audit | **379** |
+| No longer exists (the line changed) | 48 |
+| Still surviving | **239** |
+
+Of the 239, 130 are in `ai/router.py` and are overwhelmingly prose — wording inside answer
+text where no claim is attached. The measurement was taken against a checkout that already
+lagged the branch head by several commits, so the true current figure is lower; it is
+reported as measured rather than as estimated, because an estimate is exactly the kind of
+number this document exists to refuse.
+
+**Zero would be the wrong target.** Driving it there means pinning sentences, and a test
+that breaks on every copy edit while protecting nothing is a vacuous assertion wearing a
+different hat.
+
+### 13.5 — the one defect this found in shipped code
+
+Everything above is a test gap: behaviour that was correct and unprotected. One thing was
+not.
+
+`app/observability/logging.py` opens with **"Secrets never enter a log record"**, and §5 of
+this document lists logs as one of three places a credential must never reach.
+`JsonFormatter.format` redacted the message and every structured field — and then wrote the
+formatted traceback straight into the payload without passing it through `_redact`.
+
+Both `logger.exception` call sites in the codebase are precisely where a credential-bearing
+exception arrives: the unhandled-request handler, and `ai_tool_failed`. An HTTP error
+carrying a key in its URL, or a cloud SDK error carrying a bearer fragment, reached the log
+verbatim.
+
+It was found by *covering* the module, not by reading it. Five of its branches had never
+been executed and the exception branch was one of them. Nothing in the mutation audit would
+have found it either — a mutant cannot be killed on a line no test runs.
+
+That is the argument for measuring coverage alongside mutation score, and it is why the
+second half of this audit switched technique. A surviving mutant means "no test can tell the
+difference". An uncovered line means "no test runs this", which is strictly worse and was
+strictly more productive to chase: `storage/repository.py` (76 %), `ai/tools.py` (77 %),
+`ai/analyst.py` (54 %), `adapters/base.py` (83 %) and `api/routes.py` (91 %) were all whole
+methods and error paths that no test called — persistence, the tool failure surface, the
+model-backed analyst, feed error sanitisation, and every HTTP 404 and 422 the frontend codes
+against.
 
 ### The honest limit of this
 
