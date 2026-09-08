@@ -677,3 +677,147 @@ class TestTheDemoHeadlineCountsAreDerived:
         assert counts["infrastructure_assets"] < len(entities)
         for absent in (EntityType.ORGANIZATION, EntityType.CUSTOMER_REGION):
             assert absent not in counted
+
+
+class TestMaterialRiskFilters:
+    """The cards the left-hand rail shows, and the things it deliberately does not.
+
+    Three filters were uncovered: the entity types that are never a single point of
+    failure worth naming, the criticality floor beneath which one is not material, and
+    the duplicate-CVE guard. Each one exists to stop the rail filling with noise, which
+    is the failure mode that makes an operator ignore it.
+    """
+
+    @staticmethod
+    def _hub_estate(hub_type: EntityType, hub_criticality) -> WorldGraph:
+        """One hub with six dependents and no redundancy."""
+        from app.models.core import Criticality
+
+        # `redundancy=1` is a *declared* absence of redundancy. `None` would be a
+        # coverage gap, and reporting that as a single point of failure would assert
+        # something nobody said (REALITY_PASS_AUDIT B3).
+        hub = _entity(
+            "hub",
+            type=hub_type,
+            criticality=hub_criticality,
+            business=BusinessProfile(region="westeurope", redundancy=1),
+        )
+        leaves = [_entity(f"leaf{i}", criticality=Criticality.HIGH) for i in range(6)]
+        edges = [
+            DependencyEdge(
+                id=f"leaf{i}--DEPENDS_ON--hub",
+                source_entity_id=f"leaf{i}",
+                target_entity_id="hub",
+                type=DependencyType.DEPENDS_ON,
+                criticality=1.0,
+            )
+            for i in range(6)
+        ]
+        return WorldGraph([hub, *leaves], edges)
+
+    def test_a_critical_hub_is_reported_as_a_single_point_of_failure(self):
+        from app.analysis.material_risk import material_risks
+        from app.models.core import Criticality
+
+        risks = material_risks(self._hub_estate(EntityType.DATABASE, Criticality.CRITICAL), [])
+        assert any("hub" in " ".join(r.focus_entity_ids) for r in risks)
+
+    def test_an_undeclared_redundancy_is_a_coverage_gap_not_a_finding(self):
+        """`None` means nobody said. Calling it a single point of failure invents one."""
+        from app.analysis.material_risk import material_risks
+        from app.models.core import Criticality
+
+        undeclared = _entity(
+            "hub", type=EntityType.DATABASE, criticality=Criticality.CRITICAL
+        )
+        leaves = [_entity(f"leaf{i}", criticality=Criticality.HIGH) for i in range(6)]
+        edges = [
+            DependencyEdge(
+                id=f"leaf{i}--DEPENDS_ON--hub",
+                source_entity_id=f"leaf{i}",
+                target_entity_id="hub",
+                type=DependencyType.DEPENDS_ON,
+                criticality=1.0,
+            )
+            for i in range(6)
+        ]
+        assert undeclared.business.is_single_point_of_failure is None
+        risks = material_risks(WorldGraph([undeclared, *leaves], edges), [])
+        assert not any("hub" in " ".join(r.focus_entity_ids) for r in risks)
+
+    @pytest.mark.parametrize(
+        "hub_type", [EntityType.ORGANIZATION, EntityType.NETWORK_NODE]
+    )
+    def test_some_entity_types_are_never_named_as_a_single_point_of_failure(self, hub_type):
+        """The organization node depends on everything by construction; so does a router.
+
+        Naming either is true and useless, and a rail of useless cards is an ignored rail.
+        """
+        from app.analysis.material_risk import material_risks
+        from app.models.core import Criticality
+
+        risks = material_risks(self._hub_estate(hub_type, Criticality.CRITICAL), [])
+        assert not any("hub" in " ".join(r.focus_entity_ids) for r in risks)
+
+    @pytest.mark.parametrize("criticality_name", ["MEDIUM", "LOW", "UNKNOWN"])
+    def test_a_hub_below_the_criticality_floor_is_not_material(self, criticality_name):
+        """"Material" is the word in the name. An uncritical hub failing is not."""
+        from app.analysis.material_risk import material_risks
+        from app.models.core import Criticality
+
+        estate = self._hub_estate(EntityType.DATABASE, Criticality(criticality_name))
+        risks = material_risks(estate, [])
+        assert not any("hub" in " ".join(r.focus_entity_ids) for r in risks)
+
+    def test_the_same_cve_reported_twice_produces_one_card_not_two(self):
+        """Two feeds can carry the same advisory. The rail must not double it."""
+        from app.analysis.correlation import match_vulnerable_assets
+        from app.analysis.material_risk import material_risks
+        from app.models.core import SoftwareComponent
+
+        vulnerable = SoftwareComponent(name="nginx", version="1.0", cve_ids=["CVE-2024-0001"])
+        graph = WorldGraph([_entity("web", software=[vulnerable])], [])
+        assert match_vulnerable_assets(graph, cve_id="CVE-2024-0001", product_names=[])
+
+        def event(event_id: str) -> WorldEvent:
+            return WorldEvent(
+                id=event_id,
+                category=EventCategory.SECURITY_VULNERABILITY,
+                title="Critical RCE",
+                severity=Severity.CRITICAL,
+                source=SRC,
+                metadata={"cve_id": "CVE-2024-0001", "product_names": ["nginx"]},
+                occurred_at=utcnow(),
+            )
+
+        once = material_risks(graph, [event("kev:1")])
+        twice = material_risks(graph, [event("kev:1"), event("nvd:1")])
+        assert len(twice) == len(once)
+
+    def test_a_known_ransomware_campaign_raises_the_score(self):
+        """CISA KEV flags these, and it is the difference between "patch" and "now"."""
+        from app.analysis.material_risk import material_risks
+        from app.models.core import SoftwareComponent
+
+        vulnerable = SoftwareComponent(name="nginx", version="1.0", cve_ids=["CVE-2024-0001"])
+        graph = WorldGraph([_entity("web", software=[vulnerable])], [])
+
+        def event(*, ransomware: bool) -> WorldEvent:
+            metadata = {"cve_id": "CVE-2024-0001", "product_names": ["nginx"]}
+            if ransomware:
+                metadata["known_ransomware_use"] = True
+            return WorldEvent(
+                id="kev:1",
+                category=EventCategory.SECURITY_VULNERABILITY,
+                title="Critical RCE",
+                severity=Severity.CRITICAL,
+                source=SRC,
+                metadata=metadata,
+                occurred_at=utcnow(),
+            )
+
+        plain = material_risks(graph, [event(ransomware=False)])[0]
+        flagged = material_risks(graph, [event(ransomware=True)])[0]
+        assert flagged.score > plain.score
+        assert any(c.code == "known_ransomware" for c in flagged.contributions)
+        assert not any(c.code == "known_ransomware" for c in plain.contributions)
