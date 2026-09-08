@@ -595,3 +595,78 @@ class TestAnImportFailureReasonCarriesNothingInternal:
         assert _safe_reason(CredentialUnavailableError("token path /home/x/.azure")) == (
             "CredentialUnavailableError while importing inventory"
         )
+
+
+class TestImportLifecycleMessages:
+    """What the registry says when it refuses, and whether `force` actually forces.
+
+    These messages are what an operator sees in place of an estate. Mutation testing found
+    the `force` default, the not-loaded wording and the punctuation branch that appends a
+    reason all unprotected — so "not loaded" and "not loaded: credentials unavailable"
+    could have collapsed into the same sentence.
+    """
+
+    @pytest.mark.anyio
+    async def test_a_second_import_reuses_the_first_unless_forced(self, registry):
+        """`force=False` is the default, and it has to mean something."""
+        first = await registry.load_import("azure-snapshot")
+        again = await registry.load_import("azure-snapshot")
+        assert again is first, "an unforced re-import must not re-read the source"
+
+        forced = await registry.load_import("azure-snapshot", force=True)
+        assert forced is not first
+
+    @pytest.mark.anyio
+    async def test_an_unloaded_workspace_names_itself_and_its_reason(self, registry):
+        workspace = registry.get("azure-snapshot")
+        workspace.message = "Azure SDK is not installed."
+        with pytest.raises(WorkspaceError) as error:
+            registry.state("azure-snapshot")
+        assert str(error.value) == (
+            f"Workspace '{workspace.name}' is not loaded: Azure SDK is not installed."
+        )
+
+    @pytest.mark.anyio
+    async def test_with_no_reason_the_sentence_still_ends(self, registry):
+        workspace = registry.get("azure-snapshot")
+        workspace.message = None
+        with pytest.raises(WorkspaceError) as error:
+            registry.state("azure-snapshot")
+        assert str(error.value) == f"Workspace '{workspace.name}' is not loaded."
+
+    @pytest.mark.anyio
+    async def test_an_unknown_workspace_error_quotes_what_was_asked_for(self, registry):
+        with pytest.raises(WorkspaceError) as error:
+            registry.get("azure-does-not-exist")
+        assert str(error.value) == "No workspace 'azure-does-not-exist' is configured."
+
+    @pytest.mark.anyio
+    async def test_the_demo_refusal_names_the_workspace(self, registry):
+        workspace = registry.get(ATLASPAY_WORKSPACE_ID)
+        with pytest.raises(WorkspaceError) as error:
+            await registry.load_import(ATLASPAY_WORKSPACE_ID)
+        assert str(error.value) == (
+            f"'{workspace.name}' is a built-in demo workspace and cannot be imported."
+        )
+
+    @pytest.mark.anyio
+    async def test_an_import_failure_message_names_the_workspace_and_the_reason(
+        self, multi_settings
+    ):
+        broken = Settings(
+            run_mode=RunMode.OFFLINE,
+            database_path=":memory:",
+            azure_snapshot_path="/nonexistent/snapshot.json",
+        )
+        reg = WorkspaceRegistry(broken, lambda _id: SqliteRepository(":memory:"))
+        await reg.startup()
+        try:
+            workspace = reg.get("azure-snapshot")
+            with pytest.raises(WorkspaceError) as error:
+                await reg.load_import("azure-snapshot")
+            assert str(error.value) == (
+                f"Could not import '{workspace.name}': {workspace.message}"
+            )
+            assert workspace.message
+        finally:
+            await reg.shutdown()
