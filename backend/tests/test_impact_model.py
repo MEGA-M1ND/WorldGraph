@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from app.analysis.blast_radius import MAX_CRITICAL_PATHS, calculate_blast_radius
 from app.analysis.business_impact import business_impact, regional_capacity, snapshot_metrics
 from app.analysis.propagation import (
     IMPACT_THRESHOLD,
@@ -323,3 +324,112 @@ class TestCriticalityWeights:
 
         assert DependencyType.SERVES not in FAILURE_PROPAGATING_TYPES
         assert DependencyType.REPLICATES_TO not in FAILURE_PROPAGATING_TYPES
+
+
+class TestCriticalPathSelection:
+    """Which routes are called critical, how many, and in what order.
+
+    Mutation testing found this whole block unprotected. Every one of these survived:
+    raising `MAX_CRITICAL_PATHS`, inverting the `>=` that enforces it, turning the
+    `customer_facing or CRITICAL` selection rule into `and`, and flipping either `is` in
+    that rule. These paths are what the globe animates and what the explanation quotes, so
+    a silent change here changes what an operator is told to look at.
+    """
+
+    @staticmethod
+    def _singapore(graph: WorldGraph):
+        return calculate_blast_radius(
+            graph,
+            origin_ids=["cloud-region-singapore"],
+            origin_kind="ENTITY",
+            origin_label="probe",
+            proximity=1.0,
+        )
+
+    def test_the_cap_holds_at_six(self, atlaspay_graph: WorldGraph):
+        """Six, written out, not `== MAX_CRITICAL_PATHS`.
+
+        Asserting against the imported constant is self-referential: raising the constant
+        raises the expectation with it, and the test passes at any value. It survived
+        mutation for exactly that reason. The literal is what makes a change to the cap
+        show up as a failing test, which is where the decision belongs.
+        """
+        result = self._singapore(atlaspay_graph)
+        assert len(result.critical_paths) == 6
+        assert MAX_CRITICAL_PATHS == 6, "the cap moved; update the expectation deliberately"
+
+    def test_the_cap_actually_binds_on_this_estate(self, atlaspay_graph: WorldGraph):
+        """Otherwise the test above would pass without the cap doing anything."""
+        result = self._singapore(atlaspay_graph)
+        qualifying = {
+            record.path.hops[-1].entity_id
+            for record in result.direct_impact + result.indirect_impact
+            if (record.customer_facing is True or record.criticality is Criticality.CRITICAL)
+            and record.path.depth >= 1
+        }
+        assert len(qualifying) > 6, "the estate must offer more paths than the cap allows"
+
+    def test_every_critical_path_ends_somewhere_that_qualifies(self, atlaspay_graph: WorldGraph):
+        """The selection rule itself: customer-facing OR critical, never both required."""
+        result = self._singapore(atlaspay_graph)
+        assert result.critical_paths
+        records = {r.entity_id: r for r in result.direct_impact + result.indirect_impact}
+        qualifying = 0
+        for path in result.critical_paths:
+            record = records[path.hops[-1].entity_id]
+            assert record.customer_facing is True or record.criticality is Criticality.CRITICAL
+            if record.customer_facing is True and record.criticality is not Criticality.CRITICAL:
+                qualifying += 1
+        # At least one terminus qualifies on customer-facing alone. Were the rule `and`,
+        # that path would vanish — which is what makes this more than a restatement.
+        assert qualifying >= 1, "the rule must be a disjunction, not a conjunction"
+
+    def test_no_two_critical_paths_share_a_terminus(self, atlaspay_graph: WorldGraph):
+        """Six routes to the same service is one finding, not six."""
+        paths = self._singapore(atlaspay_graph).critical_paths
+        termini = [p.hops[-1].entity_id for p in paths]
+        assert len(set(termini)) == len(termini)
+
+    def test_paths_are_ordered_worst_terminus_first(self, atlaspay_graph: WorldGraph):
+        result = self._singapore(atlaspay_graph)
+        availabilities = [p.terminal_availability for p in result.critical_paths]
+        assert availabilities == sorted(availabilities)
+
+    def test_an_origin_is_never_reported_as_a_path(self, atlaspay_graph: WorldGraph):
+        """`path.depth < 1` is what excludes it; nothing asserted that."""
+        result = self._singapore(atlaspay_graph)
+        for path in result.critical_paths:
+            assert path.depth >= 1
+            assert path.hops, "a path with no hops is an origin, not a route"
+
+
+class TestCustomerExposureReporting:
+    """Which region gets named as the worst, and what is said when a count is missing."""
+
+    @staticmethod
+    def _singapore(graph: WorldGraph):
+        return calculate_blast_radius(
+            graph,
+            origin_ids=["cloud-region-singapore"],
+            origin_kind="ENTITY",
+            origin_label="probe",
+            proximity=1.0,
+        )
+
+    def test_exposure_is_ordered_worst_first(self, atlaspay_graph: WorldGraph):
+        """`exposure[0]` is only the worst region if the list is actually sorted."""
+        exposure = self._singapore(atlaspay_graph).customer_exposure
+        assert len(exposure) >= 2, "needs at least two regions to order"
+        impacts = [e.traffic_impact for e in exposure]
+        assert impacts == sorted(impacts, reverse=True)
+
+    def test_the_explanation_names_the_worst_region_not_another_one(
+        self, atlaspay_graph: WorldGraph
+    ):
+        result = self._singapore(atlaspay_graph)
+        worst = max(result.customer_exposure, key=lambda e: e.traffic_impact)
+        others = [e.region for e in result.customer_exposure if e.region != worst.region]
+        text = " ".join(result.explanations)
+        assert f"{worst.region} sees an estimated" in text
+        for region in others:
+            assert f"{region} sees an estimated" not in text
