@@ -12,6 +12,8 @@ from app.models.analysis import OverrideKind, SimulationOverride, Urgency
 from app.models.core import DataMode, HealthState, Severity
 from app.simulation.engine import (
     SimulationError,
+    _money,
+    _risk_rank,
     compare,
     compile_overrides,
     new_scenario,
@@ -266,3 +268,67 @@ class TestResponsePlan:
         first = generate_response_plan(atlaspay_graph, result)
         second = generate_response_plan(atlaspay_graph, result)
         assert [a.action for a in first.actions] == [a.action for a in second.actions]
+
+
+class TestComparisonRowSemantics:
+    """The compare table's keys, labels, direction arrows and number formatting.
+
+    Mutation testing found these unprotected. `higher_is_better=False` could be flipped on
+    the customers and revenue rows and nothing failed — which would render a simulation
+    that puts 41,500 more customers at risk as an improvement. The row keys and labels are
+    the UI's contract, and the money formatter turns a modelled figure into the string an
+    executive reads.
+    """
+
+    @staticmethod
+    def _cascade(graph: WorldGraph):
+        scenario = new_scenario("probe")
+        scenario.overrides.append(override_for_health("cloud-region-singapore", HealthState.DOWN))
+        return compare(graph, scenario)
+
+    def test_the_rows_are_these_keys_in_this_order(self, atlaspay_graph: WorldGraph):
+        """A renamed or reordered key silently breaks the panel that reads them."""
+        assert [d.key for d in self._cascade(atlaspay_graph).deltas] == [
+            "availability",
+            "infrastructure_availability",
+            "capacity.APAC",
+            "critical_services",
+            "customer_regions",
+            "customers_affected",
+            "revenue_at_risk",
+            "material_risk",
+        ]
+
+    def test_every_row_carries_the_label_the_operator_sees(self, atlaspay_graph: WorldGraph):
+        labels = {d.key: d.label for d in self._cascade(atlaspay_graph).deltas}
+        assert labels["customers_affected"] == "Customers affected"
+        assert labels["revenue_at_risk"] == "Revenue at risk / hour"
+        assert labels["customer_regions"] == "Customer regions impacted"
+
+    def test_more_customers_and_more_revenue_at_risk_read_as_worse(self, atlaspay_graph: WorldGraph):
+        """`higher_is_better=False` on these rows. Flipped, a cascade would look like a win."""
+        by_key = {d.key: d for d in self._cascade(atlaspay_graph).deltas}
+        for key in ("customers_affected", "revenue_at_risk", "critical_services", "customer_regions"):
+            assert by_key[key].direction == "worse", f"{key} moved the wrong way"
+        # And availability falling is worse too, on the opposite polarity.
+        assert by_key["availability"].direction == "worse"
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (None, "UNKNOWN"),
+            (0.0, "$0"),
+            (999.0, "$999"),
+            (1_000.0, "$1K"),
+            (2_260_000.0, "$2.26M"),
+            (999_999.0, "$1000K"),
+        ],
+    )
+    def test_money_formatting_including_its_boundaries(self, value, expected: str):
+        """UNKNOWN is not $0: an undeclared revenue must never render as a number."""
+        assert _money(value) == expected
+
+    def test_risk_rank_orders_the_bands(self):
+        ranks = [_risk_rank(Severity(s)) for s in ("INFO", "LOW", "MODERATE", "HIGH", "CRITICAL")]
+        assert ranks == sorted(ranks), "a reordered band would invert the risk arrow"
+        assert len(set(ranks)) == 5
