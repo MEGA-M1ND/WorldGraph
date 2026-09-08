@@ -551,3 +551,210 @@ class TestDashboardHeadlineNumbers:
         finally:
             state._events.pop(unrelated.id, None)
 
+
+
+class TestTheHttpErrorSurface:
+    """What a client gets when it asks for something that is not there.
+
+    Coverage found most of `routes.py`'s 404 and 422 responses never exercised. These are
+    the contract the frontend codes against: a 404 means "not here", a 422 means "here but
+    not answerable", and either one arriving as a 200 with an empty body would render as a
+    working answer showing nothing.
+    """
+
+    @staticmethod
+    def _scenario(client) -> str:
+        return client.post("/api/simulation", json={"name": "probe"}).json()["id"]
+
+    def test_an_unknown_entity_trace_is_404_and_names_the_id(self, client):
+        response = client.get("/api/world/trace/no-such-entity")
+        assert response.status_code == 404
+        assert "no-such-entity" in response.json()["detail"]
+
+    def test_an_unknown_analysis_is_404(self, client):
+        response = client.get("/api/analysis/blast-nope")
+        assert response.status_code == 404
+        assert response.json()["detail"] == "No analysis 'blast-nope' exists."
+
+    def test_a_blast_radius_for_an_unknown_event_is_404(self, client):
+        response = client.post("/api/analysis/blast-radius", json={"event_id": "evt-nope"})
+        assert response.status_code == 404
+        assert "evt-nope" in response.json()["detail"]
+
+    def test_an_unknown_scenario_is_404_everywhere_it_is_named(self, client):
+        for method, path, body in (
+            ("get", "/api/simulation/scn-nope", None),
+            ("get", "/api/simulation/scn-nope/compare", None),
+            ("post", "/api/simulation/scn-nope/reset", None),
+            ("delete", "/api/simulation/scn-nope", None),
+            (
+                "post",
+                "/api/simulation/scn-nope/overrides",
+                {"kind": "ENTITY_HEALTH", "target_id": "payments-api", "health": "DOWN"},
+            ),
+            ("delete", "/api/simulation/scn-nope/overrides/ov-1", None),
+        ):
+            response = getattr(client, method)(path, **({"json": body} if body else {}))
+            assert response.status_code == 404, f"{method} {path}"
+            assert "scn-nope" in response.json()["detail"], f"{method} {path}"
+
+    def test_a_response_plan_for_an_unknown_analysis_is_404(self, client):
+        response = client.post("/api/analysis/response-plan", json={"analysis_id": "blast-nope"})
+        assert response.status_code == 404
+
+    def test_a_response_plan_for_an_unknown_scenario_is_404(self, client):
+        response = client.post("/api/analysis/response-plan", json={"scenario_id": "scn-nope"})
+        assert response.status_code == 404
+
+    def test_a_response_plan_for_an_unknown_event_is_404(self, client):
+        response = client.post("/api/analysis/response-plan", json={"event_id": "evt-nope"})
+        assert response.status_code == 404
+
+    def test_an_empty_scenario_has_nothing_to_plan_for_and_says_422(self, client):
+        """422, not 404: the scenario exists, the question just has no answer yet."""
+        scenario_id = self._scenario(client)
+        response = client.post(
+            "/api/analysis/response-plan", json={"scenario_id": scenario_id}
+        )
+        assert response.status_code == 422
+        assert "nothing to plan for" in response.json()["detail"]
+
+    def test_a_plan_with_nothing_analysed_yet_is_422(self, client):
+        """A fresh workspace has run nothing; that is a state, not a missing resource."""
+        response = client.post("/api/analysis/response-plan", json={})
+        assert response.status_code == 422
+        assert response.json()["detail"] == (
+            "Nothing has been analysed yet. Analyse an event or a scenario first."
+        )
+
+    def test_a_health_override_without_a_health_state_is_422(self, client):
+        scenario_id = self._scenario(client)
+        response = client.post(
+            f"/api/simulation/{scenario_id}/overrides",
+            json={"kind": "ENTITY_HEALTH", "target_id": "payments-api"},
+        )
+        assert response.status_code == 422
+        assert response.json()["detail"] == "A health override needs a health state."
+
+    def test_an_override_on_an_unknown_target_is_404(self, client):
+        scenario_id = self._scenario(client)
+        response = client.post(
+            f"/api/simulation/{scenario_id}/overrides",
+            json={"kind": "ENTITY_HEALTH", "target_id": "no-such-entity", "health": "DOWN"},
+        )
+        assert response.status_code == 404
+
+    def test_removing_an_override_that_is_not_there_is_404(self, client):
+        scenario_id = self._scenario(client)
+        response = client.delete(f"/api/simulation/{scenario_id}/overrides/ov-never-added")
+        assert response.status_code == 404
+        assert "has no override 'ov-never-added'" in response.json()["detail"]
+
+    def test_an_edge_override_is_accepted_and_carries_its_own_id_shape(self, client):
+        """The third override kind, which had no test at all."""
+        scenario_id = self._scenario(client)
+        edge_id = client.get("/api/world").json()["edges"][0]["id"]
+        response = client.post(
+            f"/api/simulation/{scenario_id}/overrides",
+            json={"kind": "EDGE_DISABLED", "target_id": edge_id, "note": "link cut"},
+        )
+        assert response.status_code == 200
+        override = response.json()["overrides"][0]
+        assert override["kind"] == "EDGE_DISABLED"
+        assert override["target_id"] == edge_id
+        assert override["id"].startswith("ovr-")
+        assert override["health"] is None and override["capacity"] is None
+
+
+class TestTheEndpointsNothingWasCalling:
+    def test_refreshing_the_feeds_returns_their_statuses(self, client):
+        response = client.post("/api/feeds/refresh")
+        assert response.status_code == 200
+        statuses = response.json()
+        assert statuses
+        for row in statuses:
+            assert row["adapter_id"] and row["state"]
+
+    def test_listing_scenarios_starts_empty_and_reflects_a_creation(self, client):
+        assert client.get("/api/simulation").json() == []
+        created = client.post("/api/simulation", json={"name": "probe"}).json()
+        listed = client.get("/api/simulation").json()
+        assert [s["id"] for s in listed] == [created["id"]]
+
+    def test_the_ai_status_endpoint_labels_the_active_backend(self, client):
+        """The UI reads this to say which analyst answered, so it must not be empty."""
+        body = client.get("/api/ai/status").json()
+        assert body
+        assert isinstance(body, dict)
+
+
+class TestThePlanAndCompareEdges:
+    def test_a_plan_with_no_arguments_uses_the_most_recent_analysis(self, client):
+        """The default an operator hits by pressing "plan" after investigating something."""
+        event_id = client.get("/api/events").json()[0]["id"]
+        analysis = client.post(
+            "/api/analysis/blast-radius", json={"event_id": event_id}
+        ).json()
+        plan = client.post("/api/analysis/response-plan", json={}).json()
+        assert plan["summary"]
+        # It planned for what was just analysed, not for something else.
+        assert analysis["origin_label"] in plan["summary"]
+        assert plan["actions"]
+
+    def test_fetching_a_scenario_returns_it_with_its_overrides(self, client):
+        created = client.post("/api/simulation", json={"name": "probe"}).json()
+        client.post(
+            f"/api/simulation/{created['id']}/overrides",
+            json={"kind": "ENTITY_HEALTH", "target_id": "payments-api", "health": "DOWN"},
+        )
+        fetched = client.get(f"/api/simulation/{created['id']}").json()
+        assert fetched["id"] == created["id"]
+        assert len(fetched["overrides"]) == 1
+        assert fetched["mode"] == "SIMULATED"
+
+    def test_a_capacity_override_without_a_capacity_is_422(self, client):
+        scenario_id = client.post("/api/simulation", json={"name": "probe"}).json()["id"]
+        response = client.post(
+            f"/api/simulation/{scenario_id}/overrides",
+            json={"kind": "ENTITY_CAPACITY", "target_id": "payments-api"},
+        )
+        assert response.status_code == 422
+        assert response.json()["detail"] == (
+            "A capacity override needs a capacity value between 0 and 1."
+        )
+
+    def test_a_capacity_override_with_a_capacity_is_accepted(self, client):
+        scenario_id = client.post("/api/simulation", json={"name": "probe"}).json()["id"]
+        response = client.post(
+            f"/api/simulation/{scenario_id}/overrides",
+            json={"kind": "ENTITY_CAPACITY", "target_id": "payments-api", "capacity": 0.4},
+        )
+        assert response.status_code == 200
+        override = response.json()["overrides"][0]
+        assert override["kind"] == "ENTITY_CAPACITY"
+        assert override["capacity"] == 0.4
+        assert override["health"] is None
+
+    def test_a_scenario_whose_target_has_since_vanished_compares_as_422(self, client):
+        """A re-import can remove an entity an older scenario still names.
+
+        The scenario is real and the request is well-formed, so this is a 422 and not a
+        404 — and it must not compare against a world the override no longer fits.
+        """
+        from app.graph.world_graph import WorldGraph
+
+        scenario_id = client.post("/api/simulation", json={"name": "probe"}).json()["id"]
+        client.post(
+            f"/api/simulation/{scenario_id}/overrides",
+            json={"kind": "ENTITY_HEALTH", "target_id": "payments-api", "health": "DOWN"},
+        )
+        assert client.get(f"/api/simulation/{scenario_id}/compare").status_code == 200
+
+        registry = client.app.state.workspaces
+        state = registry.state(None)
+        state.graph = WorldGraph(
+            [e for e in state.graph.entities if e.id != "payments-api"], []
+        )
+        response = client.get(f"/api/simulation/{scenario_id}/compare")
+        assert response.status_code == 422
+        assert "payments-api" in response.json()["detail"]
