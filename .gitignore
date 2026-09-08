@@ -8,6 +8,9 @@ venv/
 .ruff_cache/
 *.egg-info/
 *.db
+# SQLite's WAL sidecars, created whenever the backend runs locally.
+*.db-shm
+*.db-wal
 *.sqlite3
 
 # Node
