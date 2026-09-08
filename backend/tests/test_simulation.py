@@ -327,6 +327,9 @@ class TestComparisonRowSemantics:
             (1_000.0, "$1K"),
             (2_260_000.0, "$2.26M"),
             (999_999.0, "$1000K"),
+            # The two boundaries themselves. Off by one and $1M renders as $1000K.
+            (1_000_000.0, "$1.00M"),
+            (999.99, "$1,000"),
         ],
     )
     def test_money_formatting_including_its_boundaries(self, value, expected: str):
@@ -337,6 +340,17 @@ class TestComparisonRowSemantics:
         ranks = [_risk_rank(Severity(s)) for s in ("INFO", "LOW", "MODERATE", "HIGH", "CRITICAL")]
         assert ranks == sorted(ranks), "a reordered band would invert the risk arrow"
         assert len(set(ranks)) == 5
+        # INFO is the floor, so an unrecognised band must land there and not above it.
+        assert ranks[0] == 0
+
+    def test_an_unrecognised_band_ranks_lowest_rather_than_highest(self):
+        """`else 0`. A new severity ranking above CRITICAL would invert every arrow."""
+
+        class Unknown:
+            value = "APOCALYPTIC"
+
+        assert _risk_rank(Unknown()) == _risk_rank(Severity.INFO) == 0
+        assert _risk_rank(Unknown()) < _risk_rank(Severity.LOW)
 
 
 class TestAnUnknownIsNeverRenderedAsAWin:

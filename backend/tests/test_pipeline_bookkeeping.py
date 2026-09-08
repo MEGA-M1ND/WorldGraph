@@ -791,3 +791,175 @@ class TestChangesSinceOrdersEventsNewestFirst:
             world._events[event.id] = event
         events = world.changes_since(timedelta(hours=1))["new_events"]
         assert [e.id for e in events] == ["seq-0", "seq-1", "seq-2", "seq-3", "seq-4"]
+
+
+class TestTheNoImpactExplanationNamesWhatItLookedAt:
+    """A negative result has to say what kind of negative it is.
+
+    The located and unlocated branches, and the "Inventory searched:" line beneath them,
+    all survived the second pass. An event with no location that matched nothing is a
+    different finding from a facility survey that came back clean, and the two sentences
+    could have collapsed into one.
+    """
+
+    @staticmethod
+    def _explanations(event, coverage=None):
+        from app.services.world_state import _no_impact_explanations
+
+        return _no_impact_explanations(event, None, coverage)
+
+    def test_a_located_event_reports_the_radius_and_the_software_search(self):
+        event = _physical_event(location=GeoPoint(lat=1.3, lon=103.8), radius_km=50.0)
+        lines = self._explanations(event)
+        assert lines[0] == "Magnitude 6.4 offshore does not correlate with any asset in this workspace."
+        assert lines[1] == (
+            "No facility lies inside the modelled exposure radius and no asset runs "
+            "affected software."
+        )
+
+    def test_an_unlocated_event_says_it_had_no_location_to_search_by(self):
+        event = _physical_event(location=None, radius_km=0.0)
+        lines = self._explanations(event)
+        assert lines[1] == "This event carries no location and matched no software inventory."
+
+    def test_the_inventory_line_is_added_only_when_there_is_inventory_to_report(self):
+        from app.models.analysis import InventoryCoverage
+
+        event = _physical_event(location=None, radius_km=0.0)
+        assert len(self._explanations(event)) == 2
+        coverage = InventoryCoverage(assessable_entities=10, entities_with_inventory=7)
+        with_coverage = self._explanations(event, coverage)
+        assert len(with_coverage) == 3
+        assert with_coverage[2] == f"Inventory searched: {coverage.describe()}."
+
+
+class TestTheConfidenceInANegative:
+    def test_a_genuine_negative_discounts_the_feed_it_came_from(self):
+        """`confidence * 0.9`. A negative is never more certain than its source."""
+        from app.services.world_state import _no_impact_confidence
+
+        event = _physical_event(location=None, radius_km=0.0)
+        event.source.confidence = 1.0
+        assert _no_impact_confidence(event, None, None).score == 0.9
+        event.source.confidence = 0.5
+        assert _no_impact_confidence(event, None, None).score == 0.45
+
+    def test_the_score_is_rounded_to_two_places(self):
+        from app.services.world_state import _no_impact_confidence
+
+        event = _physical_event(location=None, radius_km=0.0)
+        event.source.confidence = 0.777
+        assert _no_impact_confidence(event, None, None).score == 0.7
+
+
+class TestGeneratedIdentifiersHaveAShape:
+    """The `ovr-` lesson, applied to the two remaining id prefixes.
+
+    `startswith("blast-")` also passes for `"blast-X…"`. Both of these reach URLs and the
+    repository's primary keys, so the prefix and the length are the contract.
+    """
+
+    @pytest.mark.anyio
+    async def test_an_analysis_id_is_a_prefixed_twelve_character_slug(self, world):
+        import re
+
+        world.graph = WorldGraph([_asset("elsewhere")], [])
+        event = _physical_event(location=GeoPoint(lat=-45.0, lon=170.0), radius_km=5.0)
+        world._events[event.id] = event
+        result = world.analyze_event(event.id)
+        assert re.fullmatch(r"blast-[0-9a-f]{12}", result.id), result.id
+
+    @pytest.mark.anyio
+    async def test_a_timeline_id_is_a_prefixed_twelve_character_slug(self, world):
+        import re
+
+        entry = world._record_timeline(stage="test", message="probe")
+        assert re.fullmatch(r"tl-[0-9a-f]{12}", entry.id), entry.id
+
+    @pytest.mark.anyio
+    async def test_two_timeline_entries_never_share_an_id(self, world):
+        ids = {world._record_timeline(stage="t", message=str(i)).id for i in range(50)}
+        assert len(ids) == 50
+
+
+class TestLookupsFallBackToTheRepository:
+    """An analysis outlives the in-memory cache. Losing that makes a share link dead.
+
+    `self._analyses.get(id) or self.repository.load_analysis(id)` — both halves survived,
+    so the fallback could have been removed with nothing failing.
+    """
+
+    @pytest.mark.anyio
+    async def test_an_analysis_evicted_from_memory_is_still_retrievable(self, world):
+        world.graph = WorldGraph([_asset("elsewhere")], [])
+        event = _physical_event(location=GeoPoint(lat=-45.0, lon=170.0), radius_km=5.0)
+        world._events[event.id] = event
+        result = world.analyze_event(event.id)
+
+        world._analyses.clear()
+        recovered = world.analysis(result.id)
+        assert recovered is not None
+        assert recovered.id == result.id
+
+    @pytest.mark.anyio
+    async def test_an_unknown_analysis_id_is_none_not_an_invention(self, world):
+        assert world.analysis("blast-does-not-exist") is None
+
+    @pytest.mark.anyio
+    async def test_a_scenario_evicted_from_memory_is_still_retrievable(self, world):
+        from app.models.analysis import SimulationScenario
+
+        scenario = SimulationScenario(id="scn-probe", name="Probe")
+        world.put_scenario(scenario)
+        world._scenarios.clear()
+        recovered = world.scenario("scn-probe")
+        assert recovered is not None
+        assert recovered.name == "Probe"
+
+    @pytest.mark.anyio
+    async def test_scenarios_are_listed_newest_first(self, world):
+        from app.models.analysis import SimulationScenario
+
+        for index in range(3):
+            world.put_scenario(
+                SimulationScenario(
+                    id=f"scn-{index}",
+                    name=f"Probe {index}",
+                    updated_at=utcnow() - timedelta(minutes=index),
+                )
+            )
+        assert [s.id for s in world.scenarios()] == ["scn-0", "scn-1", "scn-2"]
+
+    @pytest.mark.anyio
+    async def test_a_dropped_scenario_is_gone_from_both_places(self, world):
+        from app.models.analysis import SimulationScenario
+
+        world.put_scenario(SimulationScenario(id="scn-probe", name="Probe"))
+        world.drop_scenario("scn-probe")
+        assert world.scenario("scn-probe") is None
+
+
+class TestStartupAndEventLookup:
+    @pytest.mark.anyio
+    async def test_an_unknown_event_raises_rather_than_analysing_something_else(self, world):
+        with pytest.raises(KeyError) as error:
+            world.analyze_event("no-such-event")
+        assert "unknown event 'no-such-event'" in str(error.value)
+
+    @pytest.mark.anyio
+    async def test_the_normalize_line_names_the_feed_the_event_came_from(self, world):
+        world.graph = WorldGraph([_asset("elsewhere")], [])
+        event = _physical_event(location=None, radius_km=0.0)
+        world._events[event.id] = event
+        world.analyze_event(event.id)
+        assert _message(world, event.id, "normalize") == (
+            "Magnitude 6.4 offshore normalized from Probe."
+        )
+
+    @pytest.mark.anyio
+    async def test_startup_records_what_was_loaded(self, world):
+        entry = next(e for e in world.timeline() if e.stage == "ingest")
+        assert entry.message == (
+            f"{world.workspace.name} online in {world.settings.run_mode.value} mode — "
+            f"{len(world.graph)} entities, {len(world._events)} events."
+        )
