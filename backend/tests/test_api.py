@@ -406,3 +406,415 @@ class TestPersistence:
             "/api/analysis/blast-radius", json={"event_id": "replay:taiwan-m68"}
         ).json()["id"]
         assert client.get(f"/api/analysis/{analysis_id}").status_code == 200
+
+
+class TestDashboardHeadlineNumbers:
+    """The six figures on the top bar, and the keys the frontend reads them from.
+
+    Mutation testing found all of them unprotected: the `== "CRITICAL"` that counts
+    critical services, the entity-type exclusion set behind the infrastructure count, the
+    severity filter behind active incidents, and every dictionary key. These are the most
+    looked-at numbers in the product — an operator sees them before anything else — and
+    each could have drifted silently.
+    """
+
+    def test_the_demo_estate_reports_these_exact_figures(self, client: TestClient):
+        body = client.get("/api/dashboard").json()
+        assert body["critical_services"] == 5
+        assert body["infrastructure_assets"] == 37
+        assert body["active_incidents"] == 3
+        assert body["material_risks"] == 5
+        assert body["entities"] == 42
+        assert body["edges"] == 56
+        assert body["events"] == 5
+
+    def test_the_contract_with_the_frontend_is_these_keys(self, client: TestClient):
+        """A renamed key blanks a panel; nothing else in the suite reads them all."""
+        assert set(client.get("/api/dashboard").json()) == {
+            "workspace_id",
+            "workspace_name",
+            "workspace_kind",
+            "read_only",
+            "organization",
+            "critical_services",
+            "infrastructure_assets",
+            "active_incidents",
+            "material_risks",
+            "availability",
+            "infrastructure_availability",
+            "unknown_reasons",
+            "entities",
+            "edges",
+            "events",
+            "mode",
+            "data_disclaimer",
+        }
+
+    def test_infrastructure_excludes_the_non_infrastructure_types(self, client: TestClient):
+        """37 of 42: the five excluded entities are organisation and customer regions."""
+        body = client.get("/api/dashboard").json()
+        world = client.get("/api/world").json()["entities"]
+        excluded = {"ORGANIZATION", "CUSTOMER_REGION", "SECURITY_FINDING", "WORLD_EVENT"}
+        expected = sum(1 for e in world if e["type"] not in excluded)
+        assert body["infrastructure_assets"] == expected
+        assert expected < body["entities"], "the exclusion must actually exclude something"
+
+    def test_critical_services_counts_only_critical_service_types(self, client: TestClient):
+        """Both halves of the condition: CRITICAL *and* a service-shaped type."""
+        body = client.get("/api/dashboard").json()
+        world = client.get("/api/world").json()["entities"]
+        service_types = {"BUSINESS_SERVICE", "APPLICATION", "MICROSERVICE", "DATABASE"}
+        critical_anything = [e for e in world if e["criticality"] == "CRITICAL"]
+        critical_services = [e for e in critical_anything if e["type"] in service_types]
+        assert body["critical_services"] == len(critical_services)
+        assert len(critical_anything) > len(critical_services), (
+            "the estate must have a CRITICAL non-service, or the type filter proves nothing"
+        )
+
+    def test_active_incidents_are_severe_and_correlated(self, client: TestClient):
+        """Not every event: only HIGH or CRITICAL ones that touch this estate."""
+        body = client.get("/api/dashboard").json()
+        events = client.get("/api/events").json()
+        severe = [e for e in events if e["severity"] in {"HIGH", "CRITICAL"}]
+        assert body["active_incidents"] == len(severe) <= body["events"]
+        assert body["active_incidents"] < body["events"], (
+            "some event must be filtered out, or the severity filter proves nothing"
+        )
+
+    def test_both_availabilities_are_reported_separately(self, client: TestClient):
+        """The customer view may be None; the infrastructure view never is."""
+        body = client.get("/api/dashboard").json()
+        assert body["infrastructure_availability"] is not None
+        assert "availability" in body
+
+    def test_both_halves_of_the_incident_filter_are_load_bearing(self, client: TestClient):
+        """Severity AND correlation, each excluding a different event.
+
+        The demo estate is well shaped for this: a LOW event that *does* correlate is
+        dropped by severity, and a MODERATE event that does *not* correlate is dropped by
+        correlation. Widening the severity set to MODERATE alone changes nothing — the
+        storm is excluded either way — so that mutation is equivalent here and only the
+        LOW case can prove the severity filter does any work.
+        """
+        events = client.get("/api/events").json()
+        by_severity = {e["severity"] for e in events}
+        assert {"LOW", "MODERATE"} <= by_severity, (
+            "the fixture must carry a LOW and a MODERATE event or neither half is testable"
+        )
+
+        body = client.get("/api/dashboard").json()
+        severe = [e for e in events if e["severity"] in {"HIGH", "CRITICAL"}]
+        with_low = [e for e in events if e["severity"] in {"HIGH", "CRITICAL", "LOW"}]
+        assert body["active_incidents"] == len(severe)
+        assert len(with_low) > len(severe), (
+            "a LOW event must exist and correlate, or the severity bound is unobservable"
+        )
+
+    def test_a_severe_event_that_touches_nothing_is_not_an_active_incident(
+        self, client: TestClient
+    ):
+        """The correlation half of the filter, which the fixture alone cannot show.
+
+        Every HIGH or CRITICAL event in the demo estate happens to correlate, so removing
+        `self._correlates(event)` entirely changes no number — the only non-correlating
+        event is MODERATE and is already dropped by severity. Injecting a CRITICAL event
+        that touches nothing is what makes the second half observable.
+        """
+        from datetime import UTC, datetime
+
+        from app.models.core import DataMode, DataSourceInfo, EventCategory, Severity, WorldEvent
+
+        state = client.app.state.world
+        dashboard = client.get("/api/dashboard").json()
+        before, before_count = dashboard["active_incidents"], dashboard["events"]
+
+        unrelated = WorldEvent(
+            id="synthetic:touches-nothing",
+            category=EventCategory.CLOUD_INCIDENT,
+            title="Outage in a provider this estate does not use",
+            description="Carries no location, names no asset and matches no software.",
+            severity=Severity.CRITICAL,
+            location=None,
+            exposure_radius_km=0.0,
+            occurred_at=datetime.now(UTC),
+            source=DataSourceInfo(
+                source_id="test", source_name="test", mode=DataMode.SYNTHETIC, confidence=1.0
+            ),
+        )
+        state._events[unrelated.id] = unrelated
+        try:
+            after = client.get("/api/dashboard").json()
+            assert after["events"] > before_count, "the event must have been ingested"
+            assert after["active_incidents"] == before, (
+                "a CRITICAL event correlating with nothing is not an active incident"
+            )
+        finally:
+            state._events.pop(unrelated.id, None)
+
+
+
+class TestTheHttpErrorSurface:
+    """What a client gets when it asks for something that is not there.
+
+    Coverage found most of `routes.py`'s 404 and 422 responses never exercised. These are
+    the contract the frontend codes against: a 404 means "not here", a 422 means "here but
+    not answerable", and either one arriving as a 200 with an empty body would render as a
+    working answer showing nothing.
+    """
+
+    @staticmethod
+    def _scenario(client) -> str:
+        return client.post("/api/simulation", json={"name": "probe"}).json()["id"]
+
+    def test_an_unknown_entity_trace_is_404_and_names_the_id(self, client):
+        response = client.get("/api/world/trace/no-such-entity")
+        assert response.status_code == 404
+        assert "no-such-entity" in response.json()["detail"]
+
+    def test_an_unknown_analysis_is_404(self, client):
+        response = client.get("/api/analysis/blast-nope")
+        assert response.status_code == 404
+        assert response.json()["detail"] == "No analysis 'blast-nope' exists."
+
+    def test_a_blast_radius_for_an_unknown_event_is_404(self, client):
+        response = client.post("/api/analysis/blast-radius", json={"event_id": "evt-nope"})
+        assert response.status_code == 404
+        assert "evt-nope" in response.json()["detail"]
+
+    def test_an_unknown_scenario_is_404_everywhere_it_is_named(self, client):
+        for method, path, body in (
+            ("get", "/api/simulation/scn-nope", None),
+            ("get", "/api/simulation/scn-nope/compare", None),
+            ("post", "/api/simulation/scn-nope/reset", None),
+            ("delete", "/api/simulation/scn-nope", None),
+            (
+                "post",
+                "/api/simulation/scn-nope/overrides",
+                {"kind": "ENTITY_HEALTH", "target_id": "payments-api", "health": "DOWN"},
+            ),
+            ("delete", "/api/simulation/scn-nope/overrides/ov-1", None),
+        ):
+            response = getattr(client, method)(path, **({"json": body} if body else {}))
+            assert response.status_code == 404, f"{method} {path}"
+            assert "scn-nope" in response.json()["detail"], f"{method} {path}"
+
+    def test_a_response_plan_for_an_unknown_analysis_is_404(self, client):
+        response = client.post("/api/analysis/response-plan", json={"analysis_id": "blast-nope"})
+        assert response.status_code == 404
+
+    def test_a_response_plan_for_an_unknown_scenario_is_404(self, client):
+        response = client.post("/api/analysis/response-plan", json={"scenario_id": "scn-nope"})
+        assert response.status_code == 404
+
+    def test_a_response_plan_for_an_unknown_event_is_404(self, client):
+        response = client.post("/api/analysis/response-plan", json={"event_id": "evt-nope"})
+        assert response.status_code == 404
+
+    def test_an_empty_scenario_has_nothing_to_plan_for_and_says_422(self, client):
+        """422, not 404: the scenario exists, the question just has no answer yet."""
+        scenario_id = self._scenario(client)
+        response = client.post(
+            "/api/analysis/response-plan", json={"scenario_id": scenario_id}
+        )
+        assert response.status_code == 422
+        assert "nothing to plan for" in response.json()["detail"]
+
+    def test_a_plan_with_nothing_analysed_yet_is_422(self, client):
+        """A fresh workspace has run nothing; that is a state, not a missing resource."""
+        response = client.post("/api/analysis/response-plan", json={})
+        assert response.status_code == 422
+        assert response.json()["detail"] == (
+            "Nothing has been analysed yet. Analyse an event or a scenario first."
+        )
+
+    def test_a_health_override_without_a_health_state_is_422(self, client):
+        scenario_id = self._scenario(client)
+        response = client.post(
+            f"/api/simulation/{scenario_id}/overrides",
+            json={"kind": "ENTITY_HEALTH", "target_id": "payments-api"},
+        )
+        assert response.status_code == 422
+        assert response.json()["detail"] == "A health override needs a health state."
+
+    def test_an_override_on_an_unknown_target_is_404(self, client):
+        scenario_id = self._scenario(client)
+        response = client.post(
+            f"/api/simulation/{scenario_id}/overrides",
+            json={"kind": "ENTITY_HEALTH", "target_id": "no-such-entity", "health": "DOWN"},
+        )
+        assert response.status_code == 404
+
+    def test_removing_an_override_that_is_not_there_is_404(self, client):
+        scenario_id = self._scenario(client)
+        response = client.delete(f"/api/simulation/{scenario_id}/overrides/ov-never-added")
+        assert response.status_code == 404
+        assert "has no override 'ov-never-added'" in response.json()["detail"]
+
+    def test_an_edge_override_is_accepted_and_carries_its_own_id_shape(self, client):
+        """The third override kind, which had no test at all."""
+        scenario_id = self._scenario(client)
+        edge_id = client.get("/api/world").json()["edges"][0]["id"]
+        response = client.post(
+            f"/api/simulation/{scenario_id}/overrides",
+            json={"kind": "EDGE_DISABLED", "target_id": edge_id, "note": "link cut"},
+        )
+        assert response.status_code == 200
+        override = response.json()["overrides"][0]
+        assert override["kind"] == "EDGE_DISABLED"
+        assert override["target_id"] == edge_id
+        assert override["id"].startswith("ovr-")
+        assert override["health"] is None and override["capacity"] is None
+
+
+class TestTheEndpointsNothingWasCalling:
+    def test_refreshing_the_feeds_returns_their_statuses(self, client):
+        response = client.post("/api/feeds/refresh")
+        assert response.status_code == 200
+        statuses = response.json()
+        assert statuses
+        for row in statuses:
+            assert row["adapter_id"] and row["state"]
+
+    def test_listing_scenarios_starts_empty_and_reflects_a_creation(self, client):
+        assert client.get("/api/simulation").json() == []
+        created = client.post("/api/simulation", json={"name": "probe"}).json()
+        listed = client.get("/api/simulation").json()
+        assert [s["id"] for s in listed] == [created["id"]]
+
+    def test_the_ai_status_endpoint_labels_the_active_backend(self, client):
+        """The UI reads this to say which analyst answered, so it must not be empty."""
+        body = client.get("/api/ai/status").json()
+        assert body
+        assert isinstance(body, dict)
+
+
+class TestThePlanAndCompareEdges:
+    def test_a_plan_with_no_arguments_uses_the_most_recent_analysis(self, client):
+        """The default an operator hits by pressing "plan" after investigating something."""
+        event_id = client.get("/api/events").json()[0]["id"]
+        analysis = client.post(
+            "/api/analysis/blast-radius", json={"event_id": event_id}
+        ).json()
+        plan = client.post("/api/analysis/response-plan", json={}).json()
+        assert plan["summary"]
+        # It planned for what was just analysed, not for something else.
+        assert analysis["origin_label"] in plan["summary"]
+        assert plan["actions"]
+
+    def test_fetching_a_scenario_returns_it_with_its_overrides(self, client):
+        created = client.post("/api/simulation", json={"name": "probe"}).json()
+        client.post(
+            f"/api/simulation/{created['id']}/overrides",
+            json={"kind": "ENTITY_HEALTH", "target_id": "payments-api", "health": "DOWN"},
+        )
+        fetched = client.get(f"/api/simulation/{created['id']}").json()
+        assert fetched["id"] == created["id"]
+        assert len(fetched["overrides"]) == 1
+        assert fetched["mode"] == "SIMULATED"
+
+    def test_a_capacity_override_without_a_capacity_is_422(self, client):
+        scenario_id = client.post("/api/simulation", json={"name": "probe"}).json()["id"]
+        response = client.post(
+            f"/api/simulation/{scenario_id}/overrides",
+            json={"kind": "ENTITY_CAPACITY", "target_id": "payments-api"},
+        )
+        assert response.status_code == 422
+        assert response.json()["detail"] == (
+            "A capacity override needs a capacity value between 0 and 1."
+        )
+
+    def test_a_capacity_override_with_a_capacity_is_accepted(self, client):
+        scenario_id = client.post("/api/simulation", json={"name": "probe"}).json()["id"]
+        response = client.post(
+            f"/api/simulation/{scenario_id}/overrides",
+            json={"kind": "ENTITY_CAPACITY", "target_id": "payments-api", "capacity": 0.4},
+        )
+        assert response.status_code == 200
+        override = response.json()["overrides"][0]
+        assert override["kind"] == "ENTITY_CAPACITY"
+        assert override["capacity"] == 0.4
+        assert override["health"] is None
+
+    def test_a_scenario_whose_target_has_since_vanished_compares_as_422(self, client):
+        """A re-import can remove an entity an older scenario still names.
+
+        The scenario is real and the request is well-formed, so this is a 422 and not a
+        404 — and it must not compare against a world the override no longer fits.
+        """
+        from app.graph.world_graph import WorldGraph
+
+        scenario_id = client.post("/api/simulation", json={"name": "probe"}).json()["id"]
+        client.post(
+            f"/api/simulation/{scenario_id}/overrides",
+            json={"kind": "ENTITY_HEALTH", "target_id": "payments-api", "health": "DOWN"},
+        )
+        assert client.get(f"/api/simulation/{scenario_id}/compare").status_code == 200
+
+        registry = client.app.state.workspaces
+        state = registry.state(None)
+        state.graph = WorldGraph(
+            [e for e in state.graph.entities if e.id != "payments-api"], []
+        )
+        response = client.get(f"/api/simulation/{scenario_id}/compare")
+        assert response.status_code == 422
+        assert "payments-api" in response.json()["detail"]
+
+
+class TestStartupAndRateLimitGuards:
+    """What the API does before it is ready, and when a limiter is not configured.
+
+    Coverage found these never executed. A 503 that says "still starting up" is a
+    different fact from a 500, and the frontend retries one and not the other.
+    """
+
+    @staticmethod
+    def _bare_app():
+        from fastapi import FastAPI
+
+        from app.api.routes import router
+
+        app = FastAPI()
+        app.include_router(router, prefix="/api")
+        return app
+
+    def test_a_request_before_the_registry_exists_is_a_503_not_a_crash(self):
+        with TestClient(self._bare_app(), raise_server_exceptions=False) as client:
+            response = client.get("/api/world")
+        assert response.status_code == 503
+        assert response.json()["detail"] == "WorldGraph is still starting up."
+
+    def test_an_ask_before_the_analyst_exists_is_its_own_503(self, client):
+        """A different subsystem, so a different sentence — the UI can say which.
+
+        The registry has to be up to reach this, because `get_state` resolves first.
+        """
+        analysts = client.app.state.analysts
+        del client.app.state.analysts
+        try:
+            response = client.post("/api/ai/ask", json={"message": "hello"})
+        finally:
+            client.app.state.analysts = analysts
+        assert response.status_code == 503
+        assert response.json()["detail"] == "The analyst is still starting up."
+
+    def test_with_no_limiters_configured_requests_are_not_blocked(self):
+        """A missing limiter must fail open, not closed: it is a budget, not a gate."""
+        from app.api.deps import get_settings
+
+        app = self._bare_app()
+        app.dependency_overrides[get_settings] = lambda: Settings(
+            run_mode=RunMode.DEMO, database_path=":memory:", anthropic_api_key=None
+        )
+        with TestClient(app, raise_server_exceptions=False) as client:
+            # Reaches the handler and fails there on the missing registry, not on a 429.
+            for _ in range(5):
+                assert client.get("/api/world").status_code == 503
+
+    def test_an_unknown_limiter_kind_also_fails_open(self, client):
+        """`limiters.get(kind)` returning None must not deny the request."""
+        limiters = client.app.state.limiters
+        client.app.state.limiters = {}
+        try:
+            assert client.get("/api/world").status_code == 200
+        finally:
+            client.app.state.limiters = limiters

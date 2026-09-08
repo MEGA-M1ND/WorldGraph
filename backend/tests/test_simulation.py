@@ -12,11 +12,18 @@ from app.models.analysis import OverrideKind, SimulationOverride, Urgency
 from app.models.core import DataMode, HealthState, Severity
 from app.simulation.engine import (
     SimulationError,
+    _count,
+    _direction,
+    _direction_optional,
+    _money,
+    _percent,
+    _risk_rank,
     compare,
     compile_overrides,
     new_scenario,
     override_for_capacity,
     override_for_health,
+    touch,
     validate_override,
 )
 
@@ -266,3 +273,207 @@ class TestResponsePlan:
         first = generate_response_plan(atlaspay_graph, result)
         second = generate_response_plan(atlaspay_graph, result)
         assert [a.action for a in first.actions] == [a.action for a in second.actions]
+
+
+class TestComparisonRowSemantics:
+    """The compare table's keys, labels, direction arrows and number formatting.
+
+    Mutation testing found these unprotected. `higher_is_better=False` could be flipped on
+    the customers and revenue rows and nothing failed — which would render a simulation
+    that puts 41,500 more customers at risk as an improvement. The row keys and labels are
+    the UI's contract, and the money formatter turns a modelled figure into the string an
+    executive reads.
+    """
+
+    @staticmethod
+    def _cascade(graph: WorldGraph):
+        scenario = new_scenario("probe")
+        scenario.overrides.append(override_for_health("cloud-region-singapore", HealthState.DOWN))
+        return compare(graph, scenario)
+
+    def test_the_rows_are_these_keys_in_this_order(self, atlaspay_graph: WorldGraph):
+        """A renamed or reordered key silently breaks the panel that reads them."""
+        assert [d.key for d in self._cascade(atlaspay_graph).deltas] == [
+            "availability",
+            "infrastructure_availability",
+            "capacity.APAC",
+            "critical_services",
+            "customer_regions",
+            "customers_affected",
+            "revenue_at_risk",
+            "material_risk",
+        ]
+
+    def test_every_row_carries_the_label_the_operator_sees(self, atlaspay_graph: WorldGraph):
+        labels = {d.key: d.label for d in self._cascade(atlaspay_graph).deltas}
+        assert labels["customers_affected"] == "Customers affected"
+        assert labels["revenue_at_risk"] == "Revenue at risk / hour"
+        assert labels["customer_regions"] == "Customer regions impacted"
+
+    def test_more_customers_and_more_revenue_at_risk_read_as_worse(self, atlaspay_graph: WorldGraph):
+        """`higher_is_better=False` on these rows. Flipped, a cascade would look like a win."""
+        by_key = {d.key: d for d in self._cascade(atlaspay_graph).deltas}
+        for key in ("customers_affected", "revenue_at_risk", "critical_services", "customer_regions"):
+            assert by_key[key].direction == "worse", f"{key} moved the wrong way"
+        # And availability falling is worse too, on the opposite polarity.
+        assert by_key["availability"].direction == "worse"
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (None, "UNKNOWN"),
+            (0.0, "$0"),
+            (999.0, "$999"),
+            (1_000.0, "$1K"),
+            (2_260_000.0, "$2.26M"),
+            (999_999.0, "$1000K"),
+            # The two boundaries themselves. Off by one and $1M renders as $1000K.
+            (1_000_000.0, "$1.00M"),
+            (999.99, "$1,000"),
+        ],
+    )
+    def test_money_formatting_including_its_boundaries(self, value, expected: str):
+        """UNKNOWN is not $0: an undeclared revenue must never render as a number."""
+        assert _money(value) == expected
+
+    def test_risk_rank_orders_the_bands(self):
+        ranks = [_risk_rank(Severity(s)) for s in ("INFO", "LOW", "MODERATE", "HIGH", "CRITICAL")]
+        assert ranks == sorted(ranks), "a reordered band would invert the risk arrow"
+        assert len(set(ranks)) == 5
+        # INFO is the floor, so an unrecognised band must land there and not above it.
+        assert ranks[0] == 0
+
+    def test_an_unrecognised_band_ranks_lowest_rather_than_highest(self):
+        """`else 0`. A new severity ranking above CRITICAL would invert every arrow."""
+
+        class Unknown:
+            value = "APOCALYPTIC"
+
+        assert _risk_rank(Unknown()) == _risk_rank(Severity.INFO) == 0
+        assert _risk_rank(Unknown()) < _risk_rank(Severity.LOW)
+
+
+class TestAnUnknownIsNeverRenderedAsAWin:
+    """Reality Pass §13 and §24, in the two functions that decide a table cell.
+
+    `_direction_optional` returning "better" for a missing measurement would paint an
+    undeclared figure green, and `_percent`/`_count` substituting a number for `None`
+    would put a fabricated one next to it. Mutation testing found every branch here
+    unprotected.
+    """
+
+    def test_a_missing_side_reads_as_same_not_better(self):
+        assert _direction_optional(None, 5, higher_is_better=False) == "same"
+        assert _direction_optional(5, None, higher_is_better=False) == "same"
+        assert _direction_optional(None, None, higher_is_better=False) == "same"
+        # Both polarities: an unknown is uncomparable regardless of which way is good.
+        assert _direction_optional(None, 5, higher_is_better=True) == "same"
+
+    def test_two_known_sides_are_compared_normally(self):
+        assert _direction_optional(10, 4, higher_is_better=False) == "better"
+        assert _direction_optional(4, 10, higher_is_better=False) == "worse"
+        assert _direction_optional(4, 10, higher_is_better=True) == "better"
+
+    def test_zero_is_a_measurement_and_none_is_not(self):
+        """The distinction the whole tri-state design exists for."""
+        assert _direction_optional(0, 5, higher_is_better=False) == "worse"
+        assert _percent(0.0) == "0.00%"
+        assert _percent(None) == "UNKNOWN"
+        assert _count(0) == "0"
+        assert _count(None) == "UNKNOWN"
+
+    def test_percent_keeps_two_decimals_because_availability_lives_there(self):
+        """99.9% and 99.99% are 8 hours of downtime a year apart."""
+        assert _percent(0.9999) == "99.99%"
+        assert _percent(0.999) == "99.90%"
+        assert _percent(1.0) == "100.00%"
+
+    def test_counts_are_thousands_separated(self):
+        assert _count(41_500) == "41,500"
+
+
+class TestDirectionIsNotFooledByFloatNoise:
+    def test_an_identical_pair_reads_as_same(self):
+        assert _direction(0.9999, 0.9999, higher_is_better=True) == "same"
+
+    def test_a_difference_below_the_epsilon_reads_as_same(self):
+        """Solver noise must not render as a change the operator can act on."""
+        assert _direction(0.9999, 0.9999 + 1e-12, higher_is_better=True) == "same"
+
+    def test_a_real_difference_still_moves(self):
+        assert _direction(0.99, 0.98, higher_is_better=True) == "worse"
+        assert _direction(0.98, 0.99, higher_is_better=True) == "better"
+        assert _direction(0.98, 0.99, higher_is_better=False) == "worse"
+
+
+class TestOverrideBuildersAndTouch:
+    def test_a_built_override_is_identifiable_and_unique(self, atlaspay_graph: WorldGraph):
+        first = override_for_health("payments-api", HealthState.DOWN)
+        second = override_for_health("payments-api", HealthState.DOWN)
+        # `startswith("ovr-")` is not enough: it also passes for "ovr-Xdeadbeef". The
+        # whole shape, or the prefix can drift with nothing failing — which is what
+        # re-running the mutation harness against this very test found.
+        import re
+
+        assert re.fullmatch(r"ovr-[0-9a-f]{10}", first.id), first.id
+        assert re.fullmatch(r"ovr-[0-9a-f]{10}", second.id), second.id
+        assert first.id != second.id, "two overrides sharing an id would overwrite each other"
+        assert first.kind is OverrideKind.ENTITY_HEALTH
+        assert first.health is HealthState.DOWN
+        assert first.capacity is None
+
+    def test_a_capacity_override_carries_capacity_and_no_health(self):
+        import re
+
+        override = override_for_capacity("payments-api", 0.4, note="half a region")
+        assert re.fullmatch(r"ovr-[0-9a-f]{10}", override.id), override.id
+        assert override.kind is OverrideKind.ENTITY_CAPACITY
+        assert override.capacity == 0.4
+        assert override.health is None
+        assert override.note == "half a region"
+
+    def test_touch_bumps_updated_at_and_changes_nothing_else(self):
+        scenario = new_scenario("probe")
+        bumped = touch(scenario)
+        # Strictly later, not merely "not earlier": `>=` would also hold if the field were
+        # never written, which is the failure this test exists to catch.
+        assert bumped.updated_at > scenario.updated_at
+        assert bumped.created_at == scenario.created_at
+        assert bumped.id == scenario.id
+        assert bumped.overrides == scenario.overrides
+        # A copy, not a mutation: the caller may still be holding the original.
+        assert bumped is not scenario
+        assert scenario.updated_at < bumped.updated_at
+
+
+class TestCascadePathsCarryTheirEdgeTypes:
+    """A path is evidence. Hop availabilities and edge types are what make it readable."""
+
+    def test_the_first_hop_has_no_incoming_edge_and_the_rest_do(self, atlaspay_graph: WorldGraph):
+        scenario = new_scenario("probe")
+        scenario.overrides.append(override_for_health("cloud-region-singapore", HealthState.DOWN))
+        comparison = compare(atlaspay_graph, scenario)
+        multi_hop = [p for p in comparison.cascade_paths if len(p.hops) > 1]
+        assert multi_hop, "a region outage must cascade through at least one edge"
+        for path in multi_hop:
+            assert path.hops[0].edge_type is None
+            assert all(hop.edge_type is not None for hop in path.hops[1:])
+
+    def test_hop_availabilities_are_rounded_but_not_flattened(self, atlaspay_graph: WorldGraph):
+        scenario = new_scenario("probe")
+        scenario.overrides.append(override_for_health("cloud-region-singapore", HealthState.DOWN))
+        comparison = compare(atlaspay_graph, scenario)
+        values = [hop.availability for path in comparison.cascade_paths for hop in path.hops]
+        assert values
+        assert all(0.0 <= v <= 1.0 for v in values)
+        assert all(round(v, 4) == v for v in values), "4dp, so the UI never prints 0.9999999"
+        # The cascade must actually depress something — all-1.0 would mean the override
+        # never propagated and the path is decoration.
+        assert any(v < 1.0 for v in values)
+
+    def test_a_paths_terminal_availability_is_its_last_hop(self, atlaspay_graph: WorldGraph):
+        scenario = new_scenario("probe")
+        scenario.overrides.append(override_for_health("cloud-region-singapore", HealthState.DOWN))
+        comparison = compare(atlaspay_graph, scenario)
+        for path in comparison.cascade_paths:
+            assert path.terminal_availability == path.hops[-1].availability

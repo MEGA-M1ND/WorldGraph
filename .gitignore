@@ -8,6 +8,9 @@ venv/
 .ruff_cache/
 *.egg-info/
 *.db
+# SQLite's WAL sidecars, created whenever the backend runs locally.
+*.db-shm
+*.db-wal
 *.sqlite3
 
 # Node
@@ -35,3 +38,8 @@ screenshots/
 
 # Playwright browser override used by the local E2E runner
 .playwright-env
+
+# Coverage database, written by the audit tooling. Generated, never committed.
+.coverage
+.coverage.*
+htmlcov/

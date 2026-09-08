@@ -74,7 +74,12 @@ class JsonFormatter(logging.Formatter):
                 value = str(value)
             payload[key] = _redact(value)
         if record.exc_info:
-            payload["exception"] = self.formatException(record.exc_info)
+            # Redacted like every other value. A traceback is text that reaches the same
+            # log line, and the two `logger.exception` call sites in this codebase — the
+            # unhandled-request handler and `ai_tool_failed` — are precisely where a
+            # credential-bearing exception arrives: an HTTP error carrying a key in its
+            # URL, or a cloud SDK error carrying a bearer fragment.
+            payload["exception"] = _redact(self.formatException(record.exc_info))
         return json.dumps(payload, default=str)
 
 

@@ -23,7 +23,17 @@ from app.geo.spatial import (
     within_radius,
 )
 from app.graph.world_graph import WorldGraph
-from app.models.core import EventCategory, GeoPoint
+from app.models.core import (
+    DataMode,
+    DataSourceInfo,
+    DependencyEdge,
+    DependencyType,
+    EntityType,
+    EventCategory,
+    GeoPoint,
+    Severity,
+    WorldEntity,
+)
 
 SINGAPORE = GeoPoint(lat=1.3521, lon=103.8198)
 FRANKFURT = GeoPoint(lat=50.1109, lon=8.6821)
@@ -35,8 +45,32 @@ class TestDistance:
         assert haversine_km(SINGAPORE, SINGAPORE) == pytest.approx(0.0, abs=1e-9)
 
     def test_known_distance(self):
-        """Singapore → Frankfurt is ~10,270 km great-circle."""
-        assert haversine_km(SINGAPORE, FRANKFURT) == pytest.approx(10_270, rel=0.01)
+        """Singapore → Frankfurt is ~10,258 km great-circle.
+
+        `rel=0.01` used to be the tolerance here, which is ±103 km — wide enough that the
+        Earth radius constant itself could drift by a kilometre with nothing failing, on a
+        figure that decides whether an asset sits inside a 50 km exposure radius.
+        Mutation testing found exactly that. 0.05 % is float noise; 1 % is a different
+        planet.
+        """
+        assert haversine_km(SINGAPORE, FRANKFURT) == pytest.approx(10_258.05, rel=5e-4)
+
+    def test_the_earth_radius_is_the_iugg_mean(self):
+        """6371.0088 km. Written out rather than imported, or it would pin itself."""
+        from app.geo.spatial import EARTH_RADIUS_KM
+
+        assert EARTH_RADIUS_KM == 6371.0088
+
+    def test_a_degree_of_latitude_is_a_hundred_and_eleven_kilometres(self):
+        """The schoolbook figure, and an independent check on the radius."""
+        assert haversine_km(
+            GeoPoint(lat=0.0, lon=0.0), GeoPoint(lat=1.0, lon=0.0)
+        ) == pytest.approx(111.195, rel=5e-4)
+
+    def test_the_equator_to_the_pole_is_a_quarter_of_the_circumference(self):
+        assert haversine_km(
+            GeoPoint(lat=0.0, lon=0.0), GeoPoint(lat=90.0, lon=0.0)
+        ) == pytest.approx(10_007.56, rel=5e-4)
 
     def test_symmetry(self):
         assert haversine_km(SINGAPORE, FRANKFURT) == pytest.approx(
@@ -47,7 +81,7 @@ class TestDistance:
         """The sqrt clamp exists for exactly this input."""
         north = GeoPoint(lat=90.0, lon=0.0)
         south = GeoPoint(lat=-90.0, lon=0.0)
-        assert haversine_km(north, south) == pytest.approx(20_015, rel=0.01)
+        assert haversine_km(north, south) == pytest.approx(20_015.11, rel=5e-4)
 
     def test_dateline_is_a_short_hop_not_a_lap(self):
         west = GeoPoint(lat=0.0, lon=179.9)
@@ -70,12 +104,33 @@ class TestBearing:
         origin = GeoPoint(lat=0.0, lon=0.0)
         assert bearing_degrees(origin, GeoPoint(lat=0.0, lon=10.0)) == pytest.approx(90.0, abs=0.1)
 
+    def test_due_south_and_west(self):
+        origin = GeoPoint(lat=0.0, lon=0.0)
+        assert bearing_degrees(origin, GeoPoint(lat=-10.0, lon=0.0)) == pytest.approx(180.0, abs=0.1)
+        assert bearing_degrees(origin, GeoPoint(lat=0.0, lon=-10.0)) == pytest.approx(270.0, abs=0.1)
+
     @pytest.mark.parametrize(
         ("bearing", "expected"),
-        [(0, "N"), (45, "NE"), (90, "E"), (180, "S"), (270, "W"), (359, "N")],
+        [
+            # All eight labels. Only four were tested; SE, SW and NW were unreachable by
+            # any assertion, so the table could have been reordered — and "42 km SW of the
+            # epicentre" is a factual claim in an answer, not decoration.
+            (0, "N"), (45, "NE"), (90, "E"), (135, "SE"),
+            (180, "S"), (225, "SW"), (270, "W"), (315, "NW"),
+            # Each sector's own boundaries: the label changes 22.5° either side of centre.
+            (22.4, "N"), (22.5, "NE"), (67.4, "NE"), (67.5, "E"),
+            (337.4, "NW"), (337.5, "N"), (359, "N"),
+            # Angles outside 0-360 wrap rather than falling off the end of the table.
+            (360, "N"), (405, "NE"), (-45, "NW"), (-90, "W"), (720, "N"),
+        ],
     )
     def test_compass_labels(self, bearing: float, expected: str):
         assert compass_point(bearing) == expected
+
+    def test_the_eight_labels_are_eight_distinct_labels(self):
+        """A duplicated entry would silently merge two sectors."""
+        labels = [compass_point(b) for b in range(0, 360, 45)]
+        assert len(set(labels)) == 8
 
 
 class TestExposureRadius:
@@ -95,6 +150,29 @@ class TestExposureRadius:
         shallow = earthquake_exposure_radius_km(6.5, depth_km=10.0)
         deep = earthquake_exposure_radius_km(6.5, depth_km=300.0)
         assert deep < shallow
+        # A quarter narrower, not an arbitrary amount.
+        assert deep == pytest.approx(shallow * 0.75, rel=1e-9)
+
+    @pytest.mark.parametrize(
+        ("depth_km", "is_deep"),
+        [(10.0, False), (69.9, False), (70.0, False), (70.1, True), (300.0, True)],
+    )
+    def test_the_deep_focus_boundary_is_seventy_kilometres(self, depth_km, is_deep):
+        """The seismological convention. Either side of it is a different footprint."""
+        shallow = earthquake_exposure_radius_km(6.5, depth_km=10.0)
+        radius = earthquake_exposure_radius_km(6.5, depth_km=depth_km)
+        assert (radius < shallow) is is_deep
+
+    def test_the_default_depth_is_shallow(self):
+        """USGS feeds omit depth often enough that the default has to be the common case."""
+        assert earthquake_exposure_radius_km(6.5) == earthquake_exposure_radius_km(
+            6.5, depth_km=10.0
+        )
+
+    def test_a_nonsensical_magnitude_floors_at_zero_rather_than_going_negative(self):
+        """`max(0.0, …)`. A negative magnitude is malformed feed data, not a tiny quake."""
+        assert earthquake_exposure_radius_km(-5.0) == earthquake_exposure_radius_km(0.0)
+        assert earthquake_exposure_radius_km(-5.0) == 10.0
 
     def test_radius_is_clamped(self):
         assert earthquake_exposure_radius_km(0.0) == 10.0
@@ -103,6 +181,48 @@ class TestExposureRadius:
     def test_non_geographic_categories_have_no_radius(self):
         assert exposure_radius_for(EventCategory.SECURITY_VULNERABILITY) == 0.0
         assert exposure_radius_for(EventCategory.CLOUD_INCIDENT) == 0.0
+        assert exposure_radius_for(EventCategory.SERVICE_INCIDENT) == 0.0
+
+    @pytest.mark.parametrize(
+        ("category", "expected_km"),
+        [
+            (EventCategory.WILDFIRE, 30.0),
+            (EventCategory.SEVERE_WEATHER, 150.0),
+            (EventCategory.FLOOD, 60.0),
+            (EventCategory.POWER_OUTAGE, 50.0),
+            (EventCategory.NETWORK_OUTAGE, 250.0),
+            (EventCategory.SUPPLY_CHAIN, 200.0),
+            (EventCategory.OTHER, 50.0),
+            # Zero means "not geographic at all" — these correlate by named region or by
+            # software inventory. A non-zero here would make a cloud status page start
+            # matching assets by distance, which is precisely the §21 confusion.
+            (EventCategory.CLOUD_INCIDENT, 0.0),
+            (EventCategory.SERVICE_INCIDENT, 0.0),
+            (EventCategory.SECURITY_VULNERABILITY, 0.0),
+        ],
+    )
+    def test_the_category_baselines_are_these_figures(self, category, expected_km):
+        """The fallback footprint decides which assets correlate at all.
+
+        Written out as literals rather than read from `_CATEGORY_BASE_RADIUS_KM`, which
+        would assert the table against itself.
+        """
+        assert exposure_radius_for(category) == expected_km
+
+    def test_every_category_has_a_declared_radius(self):
+        """A new category must not silently inherit the 50 km `.get` default."""
+        from app.geo.spatial import _CATEGORY_BASE_RADIUS_KM
+
+        assert set(_CATEGORY_BASE_RADIUS_KM) == set(EventCategory)
+
+    def test_an_earthquake_ignores_the_category_baseline(self):
+        """It has its own model; the 100 km entry is a fallback that must never be used."""
+        assert exposure_radius_for(
+            EventCategory.EARTHQUAKE, {"magnitude": 6.0}
+        ) == pytest.approx(63.1, rel=0.01)
+
+    def test_a_negative_explicit_radius_is_floored_at_zero(self):
+        assert exposure_radius_for(EventCategory.WILDFIRE, {"radius_km": -5.0}) == 0.0
 
     def test_explicit_radius_metadata_wins(self):
         assert exposure_radius_for(EventCategory.WILDFIRE, {"radius_km": 12.5}) == 12.5
@@ -243,3 +363,169 @@ class TestSecurityCorrelation:
 
     def test_unknown_origin_yields_no_paths(self, atlaspay_graph: WorldGraph):
         assert attack_paths(atlaspay_graph, from_entity_id="nowhere") == []
+
+
+class TestSeverityFloorsArePinned:
+    """The floors themselves, not just that they are ordered.
+
+    Found by mutation testing: changing `_SEVERITY_FLOOR[CRITICAL]` from 0.10 to 1.10 —
+    which says a facility at the centre of a CRITICAL event is completely unaffected —
+    failed no test. Four of the five floors survived the same treatment. Only HIGH was
+    pinned, and only because the AtlasPay fixture happens to be a HIGH event.
+
+    Three assertions covered this table: that availability falls off with distance, that it
+    is 1.0 at zero proximity, and that it is greater than zero at the centre. All three are
+    relative or one-sided, and none of them names a number.
+
+    These floors are a deliberate modelling decision — the comment above the table argues
+    that a magnitude number alone cannot justify claiming a facility is gone — so they are
+    exactly the kind of value that should not be able to drift unnoticed.
+    """
+
+    @pytest.mark.parametrize(
+        ("severity", "floor"),
+        [
+            (Severity.CRITICAL, 0.10),
+            (Severity.HIGH, 0.30),
+            (Severity.MODERATE, 0.60),
+            (Severity.LOW, 0.85),
+            (Severity.INFO, 0.97),
+        ],
+    )
+    def test_each_floor_is_the_documented_value(self, severity: Severity, floor: float):
+        """At full proximity an asset retains exactly the floor for its severity."""
+        event = demo_vulnerability().model_copy(update={"severity": severity})
+        assert modelled_availability(event, 1.0) == pytest.approx(floor)
+
+    def test_every_severity_is_covered(self):
+        """A new severity must not silently inherit someone else's floor."""
+        for severity in Severity:
+            event = demo_vulnerability().model_copy(update={"severity": severity})
+            assert 0.0 < modelled_availability(event, 1.0) <= 1.0
+
+    def test_the_floors_are_ordered_by_severity(self):
+        floors = [
+            modelled_availability(
+                demo_vulnerability().model_copy(update={"severity": s}), 1.0
+            )
+            for s in (Severity.CRITICAL, Severity.HIGH, Severity.MODERATE, Severity.LOW, Severity.INFO)
+        ]
+        assert floors == sorted(floors), "a worse event must not leave more availability"
+
+    def test_no_severity_models_total_destruction(self):
+        """The property the original test asserted, now for every severity, not just HIGH."""
+        for severity in Severity:
+            event = demo_vulnerability().model_copy(update={"severity": severity})
+            assert modelled_availability(event, 1.0) > 0.0
+
+
+class TestProximitySummaryIsPinned:
+    """The numbers on the event card, not just that they are at least one.
+
+    Found by mutation testing. `test_proximity_summary_counts_facilities_and_suppliers`
+    asserted `>= 1` for each count, which survives almost any error: flipping
+    `== "SUPPLIER"` to `!=`, starting `dependent` at 1 instead of 0, changing the traversal
+    depth from 4 to 5, or dropping any single entity type from either classification set
+    all left the suite green.
+
+    These four numbers are the "Enterprise proximity" panel an operator reads first when an
+    event is selected. They should not be able to drift.
+    """
+
+    def test_the_taiwan_quake_summary_is_exactly_this(self, atlaspay_graph: WorldGraph):
+        assert proximity_summary(atlaspay_graph, taiwan_earthquake()) == {
+            "critical_facilities": 2,   # dc-taiwan-hsinchu, factory-taiwan-assembly
+            "suppliers": 1,             # supplier-taiwan-hardware
+            "dependent_services": 8,
+            "assets_in_radius": 3,
+        }
+
+    def test_facilities_and_suppliers_partition_the_matches(self, atlaspay_graph: WorldGraph):
+        """A supplier is not a facility, and together they account for everything matched.
+
+        This is what makes the two counts independent: if `== "SUPPLIER"` were inverted,
+        or a type moved between the sets, the parts would stop summing to the whole.
+        """
+        summary = proximity_summary(atlaspay_graph, taiwan_earthquake())
+        assert summary["critical_facilities"] + summary["suppliers"] == summary["assets_in_radius"]
+
+    def test_every_matched_entity_is_classified(self, atlaspay_graph: WorldGraph):
+        """No matched asset falls through both sets and is silently uncounted."""
+        matches = find_assets_near_event(atlaspay_graph, taiwan_earthquake())
+        assert matches, "the fixture must match something or this proves nothing"
+        facility_types = {"DATACENTER", "OFFICE", "CLOUD_REGION", "FACTORY", "NETWORK_NODE"}
+        for match in matches:
+            kind = match.entity.type.value
+            assert kind in facility_types or kind == "SUPPLIER", f"{kind} is counted by nothing"
+
+    def test_the_traversal_depth_bound_is_observable(self):
+        """A chain longer than the bound is cut at the bound, and the number says so.
+
+        Built rather than reimplemented. My first attempt at this test recomputed the
+        count with the same expression the code uses, so it moved in lockstep with the
+        implementation and could not detect a change in it — the very fault this audit is
+        about. A constructed graph with a known answer has no such coupling.
+        """
+        source = DataSourceInfo(source_id="t", source_name="t", mode=DataMode.SYNTHETIC)
+        entities = [
+            WorldEntity(
+                id="dc",
+                name="dc",
+                type=EntityType.DATACENTER,
+                source=source,
+                location=HSINCHU,
+            )
+        ]
+        edges = []
+        previous = "dc"
+        for depth in range(1, 7):  # six hops, two beyond the bound of four
+            entities.append(
+                WorldEntity(
+                    id=f"svc{depth}",
+                    name=f"svc{depth}",
+                    type=EntityType.MICROSERVICE,
+                    source=source,
+                )
+            )
+            edges.append(
+                DependencyEdge(
+                    id=f"e{depth}",
+                    source_entity_id=f"svc{depth}",
+                    target_entity_id=previous,
+                    type=DependencyType.DEPENDS_ON,
+                )
+            )
+            previous = f"svc{depth}"
+
+        summary = proximity_summary(WorldGraph(entities, edges), taiwan_earthquake())
+        assert summary["dependent_services"] == 4, "the depth-4 bound must be what stops the walk"
+        assert summary["critical_facilities"] == 1
+        assert summary["assets_in_radius"] == 1
+
+    def test_the_depth_guard_is_redundant_given_physical_only_matching(
+        self, atlaspay_graph: WorldGraph
+    ):
+        """Why `step.depth > 0` cannot be pinned, recorded so nobody re-chases it.
+
+        Mutating that guard to `>= 0` survives, and it is an equivalent mutant rather than
+        a gap: `find_assets_near_event` matches `physical_only`, so every origin is a
+        physical type, and the service set the walk counts contains none of them. A depth-0
+        entry can never be counted whichever way the guard reads.
+
+        The guard is kept because it stops being redundant the moment anything matches a
+        logical entity, and this test states the assumption it depends on.
+        """
+        matches = find_assets_near_event(atlaspay_graph, taiwan_earthquake())
+        assert matches
+        service_types = {"MICROSERVICE", "APPLICATION", "BUSINESS_SERVICE", "DATABASE"}
+        for match in matches:
+            assert match.entity.type.value not in service_types
+
+    def test_an_event_matching_nothing_summarises_to_zero(self, atlaspay_graph: WorldGraph):
+        """The `if exposed_ids` branch, which no test reached."""
+        assert proximity_summary(atlaspay_graph, demo_vulnerability()) == {
+            "critical_facilities": 0,
+            "suppliers": 0,
+            "dependent_services": 0,
+            "assets_in_radius": 0,
+        }

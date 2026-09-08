@@ -22,11 +22,13 @@ import json
 import logging
 import re
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
 from app.adapters.azure_inventory import (
     FORBIDDEN_RESOURCE_SEGMENTS,
+    SENSITIVE_PROPERTY_HINTS,
     SUPPORTED_TYPES,
     assess_coverage,
     build_region_entity,
@@ -47,6 +49,7 @@ from app.adapters.azure_regions import (
     CLOUD_REGION_APPROXIMATION,
     is_known_region,
     normalize_region,
+    region_display_name,
     region_location,
 )
 from app.adapters.azure_tags import (
@@ -165,6 +168,46 @@ class TestSanitization:
         for _ in range(30):
             node = {"child": node}
         assert "[truncated]" in json.dumps(sanitize_properties(node))
+
+    def test_the_depth_bound_is_deep_enough_to_be_useful(self):
+        """Cutting too early would redact ordinary Azure config as though it were secret.
+
+        Azure property trees nest several levels before anything interesting appears, so
+        the bound has to sit past that. A shallow tree must survive whole.
+        """
+        shallow = {"a": {"b": {"c": {"d": {"e": "value"}}}}}
+        assert sanitize_properties(shallow) == shallow
+
+    def test_a_long_string_is_truncated_rather_than_stored_whole(self):
+        """An unbounded property value is how a snapshot grows a secret-sized blob."""
+        cleaned = sanitize_properties({"note": "x" * 2000})
+        assert len(cleaned["note"]) <= 512
+        assert cleaned["note"].startswith("x")
+
+    def test_a_long_list_is_capped(self):
+        cleaned = sanitize_properties({"items": [f"item-{i}" for i in range(400)]})
+        assert len(cleaned["items"]) == 50
+        # The head, not an arbitrary slice.
+        assert cleaned["items"][0] == "item-0"
+
+    def test_scalars_pass_through_with_their_types_intact(self):
+        """`0` and `False` must not be coerced into strings or dropped."""
+        cleaned = sanitize_properties(
+            {"count": 0, "ratio": 0.0, "enabled": False, "absent": None}
+        )
+        assert cleaned == {"count": 0, "ratio": 0.0, "enabled": False, "absent": None}
+        assert cleaned["enabled"] is False
+
+    def test_the_page_size_respects_what_resource_graph_will_actually_return(self):
+        """Resource Graph caps a response at 1000 rows regardless of what KQL asks for.
+
+        Asking for more does not fail — it silently returns 1000 and the paging loop
+        reads the short page as the end of the estate.
+        """
+        from app.adapters.azure_inventory import MAX_RESOURCES, PAGE_SIZE
+
+        assert PAGE_SIZE == 1000
+        assert MAX_RESOURCES > PAGE_SIZE, "a ceiling below one page could never page"
 
     def test_entities_carry_no_secret_from_the_snapshot(self, snapshot_resources, azure_workspace):
         blob = ""
@@ -1023,3 +1066,470 @@ class TestBrokenOptionalDependency:
         )
         for forbidden in ("token", "secret", "tenant", "https://", "Bearer"):
             assert forbidden.lower() not in message.lower()
+
+
+class TestEverySensitiveHintActuallyRedacts:
+    """Each hint in the redaction list, exercised by name.
+
+    Mutation testing found most of `SENSITIVE_PROPERTY_HINTS` unprotected: appending a
+    character to `clientsecret`, `accountkey`, `privatekey`, `token` or `key` stopped that
+    hint matching, and no test failed. The existing secret tests use a fixture containing a
+    password, a connection string and a service-principal secret — real, but only a few of
+    the eighteen hints, so the rest of the list was decoration.
+
+    The property names below are written out rather than iterated from the module. Looping
+    over `SENSITIVE_PROPERTY_HINTS` would mutate with it: a hint changed to `keyX` would be
+    tested as `keyX` and would still redact, proving nothing.
+    """
+
+    SECRET_VALUE = "MARKER-VALUE-THAT-MUST-NOT-SURVIVE"
+
+    #: One realistic Azure property name per hint, in Azure's own casing.
+    NAMES: ClassVar[list[str]] = [
+        "administratorLoginPassword",
+        "clientSecret",
+        "storageAccountKey",
+        "sasToken",
+        "credentialRef",
+        "connectionString",
+        "certificateBody",
+        "certificateThumbprint",
+        "sasUrl",
+        "accountKey",
+        "primaryKey",
+        "secondaryKey",
+        "sharedAccessPolicyKey",
+        "adminLogin",
+        "administratorLogin",
+        "sshPublicKey",
+        "privateKeyPem",
+        "sshFingerprint",
+    ]
+
+    @pytest.mark.parametrize("name", NAMES)
+    def test_the_value_is_redacted(self, name: str):
+        cleaned = sanitize_properties({name: self.SECRET_VALUE})
+        assert cleaned[name] == "[redacted]", f"{name} leaked its value"
+        assert self.SECRET_VALUE not in json.dumps(cleaned)
+
+    @pytest.mark.parametrize("name", NAMES)
+    def test_the_key_is_kept_so_removal_is_visible(self, name: str):
+        """Redacted, not dropped: a silently absent key looks like one that never existed."""
+        assert name in sanitize_properties({name: self.SECRET_VALUE})
+
+    @pytest.mark.parametrize(
+        "name",
+        ["admin_login_password", "CLIENT-SECRET", "Account_Key", "private-key"],
+    )
+    def test_separators_and_casing_do_not_evade_it(self, name: str):
+        """`lower()` plus stripping `_` and `-` is what makes the substring match work."""
+        assert sanitize_properties({name: self.SECRET_VALUE})[name] == "[redacted]"
+
+    def test_a_nested_secret_is_reached(self):
+        payload = {"outer": {"inner": {"clientSecret": self.SECRET_VALUE}}}
+        assert self.SECRET_VALUE not in json.dumps(sanitize_properties(payload))
+
+    def test_a_secret_inside_a_list_is_reached(self):
+        payload = {"items": [{"accountKey": self.SECRET_VALUE}, {"ok": "fine"}]}
+        assert self.SECRET_VALUE not in json.dumps(sanitize_properties(payload))
+
+    def test_an_ordinary_property_is_left_alone(self):
+        """The list must not be so broad that it redacts the inventory itself."""
+        cleaned = sanitize_properties({"location": "westeurope", "nodeCount": 3})
+        assert cleaned == {"location": "westeurope", "nodeCount": 3}
+
+    def test_the_load_bearing_hints_are_the_only_ones_that_can_leak(self):
+        """Why breaking most hints survives mutation, stated rather than left a mystery.
+
+        The list overlaps heavily: `clientSecret` is caught by both `clientsecret` and
+        `secret`, `accountKey` by both `accountkey` and `key`. Breaking the specific hint
+        changes nothing, because the general one still matches — which is defence in depth
+        working, not a gap.
+
+        Seven hints have no backup. Those are the ones where a typo would cause an actual
+        leak, and each has a case above that fails if it breaks.
+        """
+        solo = {
+            "credentialRef": "credential",
+            "connectionString": "connectionstring",
+            "certificateBody": "certificate",
+            "sasUrl": "sas",
+            "adminLogin": "adminlogin",
+            "administratorLogin": "administratorlogin",
+            "sshFingerprint": "fingerprint",
+        }
+        for name, expected_hint in solo.items():
+            lowered = name.lower().replace("_", "").replace("-", "")
+            matching = [h for h in SENSITIVE_PROPERTY_HINTS if h in lowered]
+            assert matching == [expected_hint], (
+                f"{name} is now caught by {matching}; if a second hint covers it the entry "
+                "is no longer load-bearing, and if none does it leaks"
+            )
+            assert sanitize_properties({name: self.SECRET_VALUE})[name] == "[redacted]"
+
+
+class TestTheReferenceWalkerHasBounds:
+    """`collect_references` is the only automatic evidence WorldGraph accepts for an edge.
+
+    Reality Pass §2: dependencies come from explicit configuration, never from resources
+    merely resembling each other. That makes this walker's bounds load-bearing in two
+    directions — too narrow and real references are missed, too wide and a hostile or
+    malformed property tree becomes the import's cost centre. Every bound survived
+    mutation.
+    """
+
+    SUB = "/subscriptions/00000000-0000-0000-0000-000000000001"
+
+    def _ref(self, index: int) -> str:
+        return f"{self.SUB}/resourceGroups/rg/providers/Microsoft.Web/sites/app-{index}"
+
+    def test_a_reference_is_found_however_deeply_it_is_nested(self):
+        tree = {"a": {"b": {"c": [{"d": {"targetId": self._ref(1)}}]}}}
+        assert collect_references(tree) == [self._ref(1)]
+
+    def test_the_walk_stops_before_a_pathological_tree_exhausts_the_stack(self):
+        """Azure property trees are deep and occasionally self-referential."""
+        node: dict = {"targetId": self._ref(1)}
+        for _ in range(30):
+            node = {"child": node}
+        assert collect_references(node) == []
+
+    @pytest.mark.parametrize(
+        ("wrappers", "expected_found"),
+        [(6, True), (7, True), (8, False), (9, False)],
+    )
+    def test_the_depth_bound_sits_exactly_where_it_claims_to(self, wrappers, expected_found):
+        """`vnetSubnetID` inside an AKS agent pool sits several levels down.
+
+        Both sides of the boundary: too shallow and real Azure shapes are missed, too deep
+        and a self-referential tree is walked further than it needs to be.
+        """
+        node: dict = {"targetId": self._ref(1)}
+        for _ in range(wrappers):
+            node = {"child": node}
+        found = collect_references(node)
+        assert bool(found) is expected_found
+
+    def test_the_result_count_is_capped(self):
+        """A dict, not a list — the 50-element list slice must not do this work instead."""
+        tree = {f"ref{i}": self._ref(i) for i in range(400)}
+        assert len(collect_references(tree)) == 200
+        assert len(collect_references(tree, limit=5)) == 5
+
+    def test_only_the_head_of_a_long_list_is_walked(self):
+        """A 10 000-element array must not be traversed to find the same few references."""
+        tree = {"refs": [{"id": self._ref(i)} for i in range(400)]}
+        assert len(collect_references(tree)) == 50
+
+    def test_a_string_that_is_not_a_resource_id_is_not_a_reference(self):
+        found = collect_references(
+            {
+                "note": "see /subscriptions elsewhere",
+                "url": "https://example.invalid/subscriptions/abc",
+                "name": "app-1",
+                "id": self._ref(1),
+            }
+        )
+        assert found == [self._ref(1)]
+
+    def test_a_reference_is_recognised_in_azures_own_casing(self):
+        upper = self._ref(1).replace("/subscriptions/", "/SUBSCRIPTIONS/")
+        assert collect_references({"id": upper}) == [upper]
+
+    def test_surrounding_whitespace_does_not_hide_a_reference(self):
+        assert collect_references({"id": f"  {self._ref(1)}  "}) == [self._ref(1)]
+
+    def test_an_absurdly_long_string_is_not_treated_as_an_id(self):
+        """A blob that merely starts like an id is a payload, not a dependency."""
+        assert collect_references({"id": self.SUB + "/" + "x" * 2000}) == []
+        # And one comfortably under the bound still is.
+        long_but_plausible = self.SUB + "/" + "x" * 200
+        assert collect_references({"id": long_but_plausible}) == [long_but_plausible]
+
+    def test_nothing_is_found_in_an_empty_or_scalar_tree(self):
+        for empty in ({}, [], "", None, 0, 42):
+            assert collect_references(empty) == []
+
+
+class TestEntityIdsAreSlugsNotAzureIds:
+    """Ids reach URLs and shared screens. Every part of the derivation survived mutation."""
+
+    SUB = "/subscriptions/00000000-0000-0000-0000-000000000001"
+
+    def test_the_full_derivation(self):
+        resource_id = f"{self.SUB}/resourceGroups/rg-prod/providers/Microsoft.Web/sites/storefront"
+        # Subscription and resource-group prefix dropped, the provider segment collapsed,
+        # slashes become dots, lower-cased, prefixed.
+        assert entity_id_for(resource_id) == "az.rg-prod.sites.storefront"
+
+    def test_the_provider_segment_is_collapsed_not_kept(self):
+        """`Microsoft.Web` in the id would make every slug longer and no more distinct."""
+        slug = entity_id_for(
+            f"{self.SUB}/resourceGroups/rg/providers/Microsoft.Network/virtualNetworks/vnet"
+        )
+        assert "microsoft" not in slug
+        assert slug == "az.rg.virtualnetworks.vnet"
+
+    def test_two_resources_of_different_types_in_one_group_do_not_collide(self):
+        first = entity_id_for(f"{self.SUB}/resourceGroups/rg/providers/Microsoft.Web/sites/x")
+        second = entity_id_for(
+            f"{self.SUB}/resourceGroups/rg/providers/Microsoft.Sql/servers/x"
+        )
+        assert first != second
+
+    def test_the_same_name_in_two_resource_groups_does_not_collide(self):
+        first = entity_id_for(f"{self.SUB}/resourceGroups/rg-a/providers/Microsoft.Web/sites/x")
+        second = entity_id_for(f"{self.SUB}/resourceGroups/rg-b/providers/Microsoft.Web/sites/x")
+        assert first != second
+
+    def test_the_slug_is_bounded(self):
+        long_id = f"{self.SUB}/resourceGroups/rg/providers/Microsoft.Web/sites/" + "n" * 400
+        slug = entity_id_for(long_id)
+        assert len(slug) <= 124  # "az." + a 120-character slug
+        assert slug.startswith("az.")
+
+    def test_the_subscription_guid_never_appears(self):
+        slug = entity_id_for(f"{self.SUB}/resourceGroups/rg/providers/Microsoft.Web/sites/x")
+        assert "00000000" not in slug
+        assert "subscriptions" not in slug
+
+
+class TestNormalizationBoundsAndFallbacks:
+    """A row from Resource Graph is untrusted input with optional fields.
+
+    Re-running the mutation harness left every metadata key, every length cap and every
+    fallback in `normalize_resource` standing. A misspelled key does not raise — it silently
+    produces an entity missing the field the UI reads.
+    """
+
+    SUB = "/subscriptions/00000000-0000-0000-0000-000000000001"
+
+    def _row(self, **overrides) -> dict:
+        row = {
+            "id": f"{self.SUB}/resourceGroups/rg-prod/providers/Microsoft.Web/sites/store",
+            "name": "store",
+            "type": "microsoft.web/sites",
+            "location": "westeurope",
+            "resourceGroup": "rg-prod",
+            "subscriptionId": "00000000-0000-0000-0000-000000000001",
+            "tags": {},
+            "properties": {},
+        }
+        row.update(overrides)
+        return row
+
+    def test_a_row_with_no_type_is_reported_as_unknown_not_dropped(self, azure_workspace):
+        """The caller counts what it could not model. A silent drop hides the gap."""
+        entity, tags, raw_type = normalize_resource(self._row(type=""), azure_workspace)
+        assert entity is None and tags is None
+        assert raw_type == "unknown"
+
+    def test_a_row_with_no_id_is_the_same(self, azure_workspace):
+        _entity, _tags, raw_type = normalize_resource(self._row(id=""), azure_workspace)
+        assert raw_type == "microsoft.web/sites"
+
+    def test_a_nameless_resource_falls_back_to_the_last_id_segment(self, azure_workspace):
+        """Resource Graph omits `name` on some row shapes; the id always carries it."""
+        entity, _tags, _type = normalize_resource(self._row(name=None), azure_workspace)
+        assert entity is not None
+        assert entity.name == "store"
+
+    def test_the_metadata_keys_the_ui_reads_are_all_present(self, azure_workspace):
+        entity, _tags, _type = normalize_resource(self._row(kind="app,linux"), azure_workspace)
+        assert entity is not None
+        assert entity.metadata["provider"] == "azure"
+        assert entity.metadata["resourceGroup"] == "rg-prod"
+        assert entity.metadata["subscriptionId"] == "00000000-0000-0000-0000-000000000001"
+        assert entity.metadata["resourceType"] == "microsoft.web/sites"
+        assert entity.metadata["locationDisplay"] == region_display_name("westeurope")
+        assert entity.metadata["kind"] == "app,linux"
+
+    def test_kind_is_omitted_rather_than_stored_empty(self, azure_workspace):
+        entity, _tags, _type = normalize_resource(self._row(), azure_workspace)
+        assert entity is not None
+        assert "kind" not in entity.metadata
+
+    def test_every_imported_entity_sits_in_the_azure_network_zone(self, azure_workspace):
+        entity, _tags, _type = normalize_resource(self._row(), azure_workspace)
+        assert entity is not None
+        assert entity.exposure.network_zone == "azure"
+
+    def test_the_tag_map_is_capped(self, azure_workspace):
+        """A resource with a hundred tags must not carry a hundred into the graph."""
+        entity, _tags, _type = normalize_resource(
+            self._row(tags={f"tag{i}": str(i) for i in range(100)}), azure_workspace
+        )
+        assert entity is not None
+        assert len(entity.metadata["tags"]) == 40
+
+    def test_a_non_dict_tag_field_is_ignored_rather_than_crashing(self, azure_workspace):
+        entity, _tags, _type = normalize_resource(self._row(tags="not-a-dict"), azure_workspace)
+        assert entity is not None
+        assert entity.metadata["tags"] == {}
+
+    def test_the_description_names_the_type_and_where_it_runs(self, azure_workspace):
+        entity, _tags, _type = normalize_resource(self._row(), azure_workspace)
+        assert entity is not None
+        assert entity.description == (
+            f"microsoft.web/sites in {region_display_name('westeurope')}"
+        )
+
+    def test_a_resource_with_no_location_says_only_what_it_is(self, azure_workspace):
+        entity, _tags, _type = normalize_resource(self._row(location=""), azure_workspace)
+        assert entity is not None
+        assert entity.description == "microsoft.web/sites"
+        assert entity.business.region == ""
+
+
+class TestInferredEdgesCarryNoRedundancyClaim:
+    """`redundancy=0.0` on every inferred edge is a statement, not a placeholder.
+
+    Azure inventory does not say whether a dependency has a fallback path. Claiming any
+    redundancy would make the impact model treat a single point of failure as survivable.
+    """
+
+    def test_no_inferred_edge_claims_redundancy(self, snapshot_resources, azure_workspace):
+        entities = {}
+        tags = {}
+        for resource in snapshot_resources:
+            entity, parsed, _type = normalize_resource(resource, azure_workspace)
+            if entity is None:
+                continue
+            entities[str(resource["id"])] = entity
+            if parsed is not None:
+                tags[entity.id] = parsed
+        edges, explicit, declared = infer_edges(entities, tags, azure_workspace)
+        assert edges
+        assert all(edge.redundancy == 0.0 for edge in edges)
+        assert explicit + declared <= len(edges)
+
+    def test_edge_ids_encode_both_ends_and_the_relationship(self, azure_workspace):
+        entity, _tags, _type = normalize_resource(
+            {
+                "id": "/subscriptions/x/resourceGroups/rg/providers/Microsoft.Web/sites/a",
+                "name": "a",
+                "type": "microsoft.web/sites",
+                "location": "westeurope",
+                "tags": {},
+                "properties": {},
+            },
+            azure_workspace,
+        )
+        assert entity is not None
+        edges, _explicit, _declared = infer_edges({"x": entity}, {}, azure_workspace)
+        hosting = [e for e in edges if e.type is DependencyType.HOSTED_IN]
+        assert hosting
+        for edge in hosting:
+            assert edge.id == f"{edge.source_entity_id}--{edge.type.value}--{edge.target_entity_id}"
+        # Distinct ends, distinct ids: a shared id would silently overwrite.
+        assert len({e.id for e in edges}) == len(edges)
+
+    def test_a_resource_declaring_itself_gets_no_self_dependency(self, azure_workspace):
+        """A tag pointing at its own resource is a mistake, not a cycle to model."""
+        azure_id = "/subscriptions/x/resourceGroups/rg/providers/Microsoft.Web/sites/a"
+        row = {
+            "id": azure_id,
+            "name": "a",
+            "type": "microsoft.web/sites",
+            "location": "westeurope",
+            "tags": {"worldgraph.depends_on": azure_id},
+            "properties": {},
+        }
+        entity, parsed, _type = normalize_resource(row, azure_workspace)
+        assert entity is not None and parsed is not None
+        edges, _explicit, declared = infer_edges({azure_id: entity}, {entity.id: parsed}, azure_workspace)
+        assert declared == 0
+        assert all(e.source_entity_id != e.target_entity_id for e in edges)
+
+
+class TestImportSummaryBounds:
+    @pytest.mark.anyio
+    async def test_unsupported_types_are_counted_and_ranked(self, tmp_path, azure_workspace):
+        """The count is what tells an operator how much of the estate is unmodelled."""
+        rows = [
+            {"id": f"/subscriptions/x/a{i}", "type": "microsoft.unknown/thing",
+             "name": f"a{i}", "location": "westeurope", "tags": {}, "properties": {}}
+            for i in range(3)
+        ] + [
+            {"id": "/subscriptions/x/b", "type": "microsoft.other/thing",
+             "name": "b", "location": "westeurope", "tags": {}, "properties": {}}
+        ]
+        snapshot = tmp_path / "s.json"
+        snapshot.write_text(json.dumps({"resources": rows}))
+        settings = Settings(
+            run_mode=RunMode.OFFLINE, database_path=":memory:", anthropic_api_key=None,
+            azure_snapshot_path=str(snapshot),
+        )
+        _entities, _edges, summary = await import_azure_workspace(settings, azure_workspace)
+        assert summary.resources_discovered == 4
+        assert summary.resources_supported == 0
+        assert summary.resources_unsupported == 4
+        # Ranked by count, so the biggest gap leads.
+        assert list(summary.unsupported_types) == [
+            "microsoft.unknown/thing", "microsoft.other/thing"
+        ]
+        assert summary.unsupported_types["microsoft.unknown/thing"] == 3
+
+    @pytest.mark.anyio
+    async def test_a_dangling_edge_never_survives_into_the_graph(self, imported):
+        """A dangling edge would let the graph claim reachability into nothing."""
+        entities, edges, _summary = imported
+        known = {e.id for e in entities}
+        assert edges
+        for edge in edges:
+            assert edge.source_entity_id in known
+            assert edge.target_entity_id in known
+
+
+class TestConfiguredWorkspacesAreReadOnly:
+    """Reality Pass §4: WorldGraph holds no write permission on a real subscription."""
+
+    @staticmethod
+    def _settings(**kwargs):
+        from app.config import RunMode, Settings
+
+        return Settings(
+            run_mode=RunMode.OFFLINE,
+            database_path=":memory:",
+            anthropic_api_key=None,
+            cesium_ion_token=None,
+            google_maps_api_key=None,
+            **kwargs,
+        )
+
+    def test_every_configured_workspace_declares_itself_read_only(self):
+        workspaces = configured_azure_workspaces(
+            self._settings(azure_subscriptions=["prod", "staging"], azure_snapshot_path="/tmp/s.json")
+        )
+        assert len(workspaces) == 3
+        assert all(w.read_only is True for w in workspaces)
+
+    def test_a_snapshot_is_replay_and_a_subscription_is_live(self):
+        """Calling a recording LIVE is the dishonesty the provenance model prevents."""
+        from app.models.core import DataMode
+
+        workspaces = configured_azure_workspaces(
+            self._settings(azure_subscriptions=["prod"], azure_snapshot_path="/tmp/s.json")
+        )
+        by_id = {w.id: w for w in workspaces}
+        assert by_id["azure-prod"].mode is DataMode.LIVE
+        assert by_id["azure-snapshot"].mode is DataMode.REPLAY
+
+    def test_two_subscriptions_never_share_a_workspace_id(self):
+        workspaces = configured_azure_workspaces(
+            self._settings(azure_subscriptions=["Prod EU", "Prod US"])
+        )
+        assert len({w.id for w in workspaces}) == 2
+        assert workspaces[0].name == "Azure — Prod EU"
+
+    def test_an_unusable_label_still_produces_a_usable_workspace(self):
+        """`or "subscription"`. An empty id would collide with every other empty id."""
+        workspaces = configured_azure_workspaces(self._settings(azure_subscriptions=["///"]))
+        # `sanitize_identifier` already reduces an unusable label to "unknown"; the
+        # `or "subscription"` beneath it is the second net. Either way the id is usable
+        # and distinct from the empty string.
+        assert workspaces[0].id == "azure-unknown"
+        assert workspaces[0].read_only is True
+
+    def test_no_subscriptions_configured_means_no_workspaces(self):
+        assert configured_azure_workspaces(self._settings()) == []

@@ -297,3 +297,377 @@ class TestAdapterContract:
             "SIMULATED",
             "UNAVAILABLE",
         }
+
+
+class TestEveryErrorBranchIsSafeToShow:
+    """`_describe_error` is deliberately narrow: an upstream body can contain anything and
+    a request URL can contain a key. Only the exception *type* and a fixed explanation
+    escape.
+
+    Coverage found four of its seven branches never executed. Each is tested here with a
+    payload that would be damaging if it leaked.
+    """
+
+    LEAKY_URL = "https://api.example.invalid/v1/feed?api_key=sk-live-abc123&tenant=acme"
+
+    @staticmethod
+    def _adapter():
+        return ReplayEventAdapter()
+
+    def test_no_error_at_all_still_produces_a_message(self):
+        adapter = self._adapter()
+        assert adapter._describe_error(None) == f"{adapter.name} request failed"
+
+    def test_an_http_status_error_reports_the_code_and_nothing_else(self):
+        adapter = self._adapter()
+        request = httpx.Request("GET", self.LEAKY_URL)
+        response = httpx.Response(503, request=request, text="upstream stack trace here")
+        message = adapter._describe_error(
+            httpx.HTTPStatusError("boom", request=request, response=response)
+        )
+        assert message == f"{adapter.name} returned HTTP 503"
+        for leak in ("api_key", "sk-live-abc123", "acme", "stack trace"):
+            assert leak not in message
+
+    def test_a_transport_error_says_unreachable_without_the_url(self):
+        adapter = self._adapter()
+        message = adapter._describe_error(
+            httpx.ConnectError("failed to connect", request=httpx.Request("GET", self.LEAKY_URL))
+        )
+        assert message == f"{adapter.name} is unreachable"
+        assert "sk-live-abc123" not in message
+
+    def test_a_decode_failure_says_malformed_without_the_body(self):
+        adapter = self._adapter()
+        message = adapter._describe_error(ValueError('{"secret": "hunter2" — truncated'))
+        assert message == f"{adapter.name} returned a malformed response"
+        assert "hunter2" not in message
+
+    def test_a_timeout_names_the_budget_it_exceeded(self):
+        from app.adapters.base import DEFAULT_TIMEOUT_SECONDS
+
+        adapter = self._adapter()
+        message = adapter._describe_error(httpx.TimeoutException("x"))
+        assert message == f"{adapter.name} timed out after {DEFAULT_TIMEOUT_SECONDS:.0f}s"
+
+    def test_every_branch_names_the_adapter_so_a_status_row_is_attributable(self):
+        adapter = self._adapter()
+        for error in (
+            None,
+            httpx.TimeoutException("x"),
+            httpx.ConnectError("x", request=httpx.Request("GET", self.LEAKY_URL)),
+            ValueError("x"),
+            RuntimeError("x"),
+        ):
+            assert adapter.name in adapter._describe_error(error)
+
+
+class TestFreshnessBands:
+    """The provenance panel's age label. Every band above "minutes" was uncovered."""
+
+    @pytest.mark.parametrize(
+        ("seconds", "expected"),
+        [
+            (0, "0 seconds"),
+            (59, "59 seconds"),
+            (60, "1 minutes"),
+            (3599, "59 minutes"),
+            (3600, "1 hours"),
+            (86_399, "23 hours"),
+            (86_400, "1 days"),
+            (172_800, "2 days"),
+        ],
+    )
+    def test_the_bands_sit_where_they_claim_to(self, seconds: int, expected: str):
+        adapter = ReplayEventAdapter()
+        now = utcnow()
+        adapter._last_success = now - timedelta(seconds=seconds)
+        assert adapter.freshness_label(now=now) == expected
+
+    def test_never_is_not_zero_seconds(self):
+        """A feed that has never succeeded has no age, and must not read as a fresh one."""
+        assert ReplayEventAdapter().freshness_label() == "never"
+
+
+class TestFallbackIsDeclaredNotSilent:
+    def test_marking_fallback_changes_the_state_and_says_why(self):
+        """A feed serving bundled data must not present as LIVE."""
+        adapter = ReplayEventAdapter()
+        adapter.mark_fallback("upstream unreachable; serving the bundled snapshot")
+        status = adapter.get_status()
+        assert status.state is FeedState.FALLBACK
+        assert status.message == "upstream unreachable; serving the bundled snapshot"
+
+
+class TestTheResponseSizeCap:
+    @pytest.mark.anyio
+    async def test_an_oversized_response_is_refused_rather_than_parsed(self, monkeypatch):
+        """A feed returning hundreds of megabytes is a denial of service, not data."""
+        from app.adapters.base import MAX_RESPONSE_BYTES
+
+        adapter = ReplayEventAdapter()
+        oversized = b"x" * (MAX_RESPONSE_BYTES + 1)
+
+        class FakeResponse:
+            content = oversized
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):  # pragma: no cover - must never be reached
+                raise AssertionError("an oversized body must not be parsed")
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def get(self, url, headers=None):
+                return FakeResponse()
+
+        monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+        with pytest.raises(AdapterError) as error:
+            await adapter.http_get_json("https://example.invalid/feed")
+        assert "oversized response" in str(error.value)
+        assert "MB" in str(error.value)
+
+    @pytest.mark.anyio
+    async def test_a_response_inside_the_cap_is_parsed(self, monkeypatch):
+        adapter = ReplayEventAdapter()
+
+        class FakeResponse:
+            content = b'{"ok": true}'
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"ok": True}
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def get(self, url, headers=None):
+                return FakeResponse()
+
+        monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+        assert await adapter.http_get_json("https://example.invalid/feed") == {"ok": True}
+
+
+class TestThePollLoop:
+    @pytest.mark.anyio
+    async def test_a_started_adapter_polls_and_a_stopped_one_stops(self):
+        """`stop()` must not raise even if a poll is mid-flight."""
+        import asyncio
+
+        class Counting(ReplayEventAdapter):
+            refresh_interval_seconds = 0.01
+
+            def __init__(self):
+                super().__init__()
+                self.refreshes = 0
+
+            async def refresh(self):
+                self.refreshes += 1
+                await super().refresh()
+
+        adapter = Counting()
+        await adapter.initialize()
+        await adapter.start()
+        await asyncio.sleep(0.05)
+        await adapter.stop()
+        polled = adapter.refreshes
+        assert polled > 1, "the loop must have run beyond the initial refresh"
+
+        # And nothing runs after stop.
+        await asyncio.sleep(0.05)
+        assert adapter.refreshes == polled
+
+    @pytest.mark.anyio
+    async def test_stopping_an_adapter_that_never_started_is_safe(self):
+        adapter = ReplayEventAdapter()
+        await adapter.stop()
+        assert adapter.get_status().state is not FeedState.LIVE
+
+    @pytest.mark.anyio
+    async def test_the_loop_checks_again_after_waking_rather_than_refreshing_blind(self):
+        """The window between the sleep ending and the refresh starting.
+
+        Without the second check, an adapter told to stop during a long interval still
+        fires one more upstream request after the shutdown it acknowledged.
+        """
+        import asyncio
+
+        class Counting(ReplayEventAdapter):
+            refresh_interval_seconds = 0.08
+
+            def __init__(self):
+                super().__init__()
+                self.refreshes = 0
+
+            async def refresh(self):
+                self.refreshes += 1
+                await super().refresh()
+
+        adapter = Counting()
+        await adapter.initialize()
+        await adapter.start()
+        after_start = adapter.refreshes
+        # Let the loop reach its sleep first, then clear the flag without cancelling the
+        # task, then let the sleep end. Clearing it before the task runs would exit at the
+        # `while`, which is a different line and a different guarantee.
+        await asyncio.sleep(0.01)
+        adapter._running = False
+        await asyncio.sleep(0.15)
+        assert adapter.refreshes == after_start
+        assert adapter._task is not None and adapter._task.done()
+        await adapter.stop()
+
+    @pytest.mark.anyio
+    async def test_a_zero_interval_adapter_refreshes_once_and_starts_no_loop(self):
+        class OneShot(ReplayEventAdapter):
+            refresh_interval_seconds = 0.0
+
+        adapter = OneShot()
+        await adapter.initialize()
+        await adapter.start()
+        assert adapter._task is None
+        await adapter.stop()
+
+
+class TestAMalformedFeedYieldsNothingRatherThanFiction:
+    """The guards that stop an unusable upstream record reaching an operator's globe.
+
+    `normalize_feature`'s docstring puts it exactly: a feature missing its magnitude is not
+    a smaller earthquake, it is an unusable record, and inventing a default for it would
+    put a fictional event on the map. Every one of these branches was uncovered.
+    """
+
+    @respx.mock
+    @pytest.mark.anyio
+    async def test_a_payload_that_is_not_an_object_is_refused(self):
+        respx.get(USGS_URL).mock(return_value=httpx.Response(200, json=["not", "an", "object"]))
+        adapter = UsgsEarthquakeAdapter()
+        with pytest.raises(AdapterError) as error:
+            await adapter.fetch()
+        assert "unexpected payload shape" in str(error.value)
+
+    @respx.mock
+    @pytest.mark.anyio
+    async def test_a_payload_with_no_feature_list_is_refused(self):
+        respx.get(USGS_URL).mock(return_value=httpx.Response(200, json={"features": "nope"}))
+        adapter = UsgsEarthquakeAdapter()
+        with pytest.raises(AdapterError):
+            await adapter.fetch()
+
+    @respx.mock
+    @pytest.mark.anyio
+    async def test_features_that_all_fail_to_normalize_are_an_error_not_an_empty_globe(self):
+        """Silence here would read as "no earthquakes", which is a claim about the world."""
+        respx.get(USGS_URL).mock(
+            return_value=httpx.Response(200, json={"features": [{"nonsense": True}] * 3})
+        )
+        adapter = UsgsEarthquakeAdapter()
+        with pytest.raises(AdapterError) as error:
+            await adapter.fetch()
+        assert "none could be normalized" in str(error.value)
+
+    @respx.mock
+    @pytest.mark.anyio
+    async def test_a_genuinely_empty_feed_is_not_an_error(self):
+        """No features at all is a quiet day, not a broken upstream."""
+        respx.get(USGS_URL).mock(return_value=httpx.Response(200, json={"features": []}))
+        events, entities = await UsgsEarthquakeAdapter().fetch()
+        assert events == [] and entities == []
+
+    @respx.mock
+    @pytest.mark.anyio
+    async def test_one_bad_feature_among_good_ones_is_dropped_not_fatal(self):
+        respx.get(USGS_URL).mock(
+            return_value=httpx.Response(
+                200, json={"features": [QUAKE_FEATURE, {"nonsense": True}]}
+            )
+        )
+        events, _entities = await UsgsEarthquakeAdapter().fetch()
+        assert len(events) == 1
+
+    @pytest.mark.anyio
+    async def test_a_disabled_feed_says_it_is_disabled_rather_than_failing_silently(self):
+        with pytest.raises(AdapterError) as error:
+            await UsgsEarthquakeAdapter(enabled=False).fetch()
+        assert "disabled in this deployment" in str(error.value)
+
+        with pytest.raises(AdapterError) as error:
+            await CisaKevAdapter(enabled=False).fetch()
+        assert "disabled in this deployment" in str(error.value)
+
+    @respx.mock
+    @pytest.mark.anyio
+    async def test_the_kev_catalog_must_be_an_object_with_a_vulnerability_list(self):
+        respx.get(KEV_URL).mock(return_value=httpx.Response(200, json=[1, 2, 3]))
+        with pytest.raises(AdapterError) as error:
+            await CisaKevAdapter().fetch()
+        assert "unexpected payload shape" in str(error.value)
+
+        respx.get(KEV_URL).mock(return_value=httpx.Response(200, json={"other": []}))
+        with pytest.raises(AdapterError) as error:
+            await CisaKevAdapter().fetch()
+        assert "no vulnerability list" in str(error.value)
+
+    @pytest.mark.parametrize(
+        "feature",
+        [
+            "not a dict",
+            None,
+            42,
+            {"properties": {"mag": 6.0}, "geometry": None},
+            {"properties": None, "geometry": {"coordinates": [1, 2, 3]}},
+        ],
+    )
+    def test_a_feature_of_the_wrong_shape_normalizes_to_nothing(self, feature):
+        assert normalize_feature(feature, mode=DataMode.LIVE) is None
+
+    @pytest.mark.parametrize(
+        "coordinates",
+        [
+            ["not", "numbers", "here"],
+            [None, None],
+            [200.0, 10.0],   # longitude past the meridian
+            [10.0, 200.0],   # latitude past the pole
+            [-181.0, 0.0],
+            [0.0, -91.0],
+        ],
+    )
+    def test_impossible_coordinates_are_refused(self, coordinates):
+        """A quake at latitude 200 is a parsing bug, not a place."""
+        feature = {
+            "id": "probe",
+            "properties": {"mag": 6.0, "place": "somewhere", "time": 1_700_000_000_000},
+            "geometry": {"coordinates": coordinates},
+        }
+        assert normalize_feature(feature, mode=DataMode.LIVE) is None
+
+    def test_a_two_element_coordinate_defaults_the_depth_rather_than_failing(self):
+        """USGS omits depth occasionally; the default is documented as 10 km."""
+        feature = {
+            "id": "probe",
+            "properties": {"mag": 6.0, "place": "somewhere", "time": 1_700_000_000_000},
+            "geometry": {"coordinates": [103.8, 1.3]},
+        }
+        event = normalize_feature(feature, mode=DataMode.LIVE)
+        assert event is not None
+        assert event.metadata["depth_km"] == 10.0

@@ -21,6 +21,14 @@ what they cost, and the section that matters most is [§9](#9-what-is-still-not-
 > records what they were and what they say about the rest of this document.** Counts and
 > claims throughout have been corrected to the current state, except where a figure is
 > explicitly historical; the substance of §1–§11 is otherwise as written.
+>
+> §12 closes by saying that reverting a fix and watching a test go red is the only thing
+> separating a test from a comment. **[§13](#13-mutation-testing-what-the-test-suite-could-not-tell-apart)
+> applies that standard to the whole suite by machine** — mutating every constant,
+> comparison and boolean in the code under audit and asking whether any test notices. It
+> found that the nine prompt-injection patterns, the reachability factor in CVE scoring,
+> and the function that *is* workspace isolation were all unprotected, and that an
+> exception's text bypassed log redaction entirely. 597 tests → 1,456, 92 % → 99 % coverage.
 
 ---
 
@@ -596,3 +604,202 @@ paging fixed in #7 was validated against a fake client — a test of the loop th
 written, not of Resource Graph. The largest claim in this repository remains unverified,
 and thirteen merged fixes have not moved it one step closer to being verified; they have
 only made the code around it more honest about what it does not know.
+
+---
+
+## 13. Mutation testing: what the test suite could not tell apart
+
+§12 ends by saying that reverting a fix and watching the test go red "is the only thing
+separating a test from a comment". That was true for the thirteen fixes it describes. It
+said nothing about the other several hundred tests, which had never been subjected to it.
+
+So they were. Every constant, comparison and boolean operator in the code under audit was
+changed one at a time — a `>` to a `<=`, an `and` to an `or`, `1.0` to `2.0`, a string to
+that string with an `X` on the end — and the whole suite was run against each. A change
+that no test notices is a behaviour no test protects. That is not an opinion about test
+quality; it is a decision procedure with a yes or no answer.
+
+The suite went from **597 tests to 1,456** as a result, plus 32 → 39 on the frontend, and
+backend line coverage from 92 % to 99 %. Almost none of that is new product code — one line
+is, and §13.5 is about that line. The rest is behaviour that was already shipping and could
+have been altered silently.
+
+### The five shapes a vacuous assertion takes
+
+Every one of these was written **during this audit, by the same process auditing for
+them**, and caught before it was committed. That is the useful part: they are not exotic.
+
+1. **Recomputing the implementation's own expression in the assertion.** A depth test that
+   derived the expected depth the same way the code did. It passes for every possible
+   implementation, including a wrong one.
+2. **Importing the constant under test.** `assert len(paths) == MAX_CRITICAL_PATHS` moves
+   with the constant. Replaced by the literal `6`, plus a separate test that the constant
+   is 6.
+3. **Over-lenient disjunctions.** `assert not found or points == 0` — satisfied by either
+   half, so it pins neither.
+4. **Inputs below the threshold under test.** A grounding check compared "0.42" against
+   `42.0`, but both figures sat under the checker's triviality floor, so the rule being
+   tested never ran.
+5. **Substring containment on generated prose.** `assert "1 established" in headline`
+   passes against `"1 establishedX"`. It can detect deletion and nothing else. Whole-string
+   equality or nothing.
+
+### Two blind spots that belong to fixture-based testing itself
+
+These are not careless assertions. They are what happens when one realistic fixture is the
+only world a test suite ever sees.
+
+**Saturation.** Three of the four concentration contributions in `material_risk` are pinned
+at their ceilings on AtlasPay — the traffic term computes to 73.7 against a cap of 45. Every
+multiplier underneath is therefore invisible: change any of them and the output does not
+move, because the cap absorbs it. Reaching them needed an estate constructed to sit *below*
+every ceiling, which no realistic demo fixture does.
+
+**Overlapping conditions masking each other.** The active-incident filter is severity **and**
+correlation. On AtlasPay every severe event correlates, and the one non-correlating event is
+`MODERATE` — already excluded by severity. So each half of the condition hid the absence of
+the other, and deleting either changed nothing. It took a `LOW` event and an injected
+non-correlating `CRITICAL` one to separate them.
+
+### What the survivors were, by module
+
+Ordered by what the finding costs if it goes wrong, not by count.
+
+| Module | What was unprotected |
+|---|---|
+| `security/sanitize.py` | **All nine prompt-injection patterns.** Each could be broken so it matched nothing; the suite passed on the strength of two example payloads. Also the redaction marker, the NFKC folding path, and every structural cap. |
+| `services/world_state.py` | `proximity = 1.0 if internet_facing else 0.0` — the reachability distinction that is the entire point of the security path lived in prose and nowhere in the score. Plus the whole timeline audit trail, including the "none executed" clause that is the product's promise not to touch infrastructure. |
+| `services/workspaces.py` | `default_repository_for`, which *is* workspace isolation — one SQLite file per workspace — had no direct test. Two workspaces resolving to the same file would not have been noticed. `_safe_reason`, the only thing between an Azure SDK exception and an API response, was untested. |
+| `ai/tools.py` | `MAX_ROWS` and every argument ceiling. These stop one query dumping the estate into a context window and stop an unbounded string reaching the graph lookup and the prompt. |
+| `ai/router.py` | The time-window parser (`in the last 2 hours` could resolve to 2 minutes), the CVE and place-name extractors that decide *which* asset is discussed, and the evidence markers — `[INFERRED]` vs `[ESTABLISHED]`, `? (product name only — unverified)`, `MODELLED ESTIMATE`, and the `▲`/`▼` direction arrows. |
+| `simulation/engine.py` | `_direction_optional` returning "better" for a missing measurement — painting an undeclared figure green. `_percent` and `_count` substituting a number for `None`. |
+| `security/ratelimit.py` | The `max(1, …)` floor, without which a misconfigured limit of 0 locks an endpoint out entirely; per-key isolation; the retry-after figure. |
+| `adapters/azure_inventory.py` | Every truncation reason — "Azure said it truncated" and "WorldGraph stopped at its own ceiling" call for opposite responses and could have collapsed onto one string. Every threshold in `level()`, which turns a ratio into a word an operator reads as a verdict. The sanitizer's bounds, and `PAGE_SIZE` — Resource Graph returns at most 1 000 rows whatever KQL asks for, so a larger page size makes the paging loop read a full page as the end of the estate. |
+| `geo/spatial.py` | The Earth's radius. The distance tests were there, at `rel=0.01` — ±103 km on a 10 000 km figure, on the number that decides whether an asset sits inside a 50 km exposure radius. Also half the compass table, and the per-category exposure radii whose zeros mean "not geographic at all". |
+| `frontend/src/ui/dom.ts` | The `el()` XSS chokepoint, and the codebase-wide property it depends on. The module's own docstring claimed both; nothing tested either. |
+| `observability/logging.py` | Log redaction, where the exception branch was not merely unprotected but **wrong** — see §13.5. |
+| `storage/repository.py` | Whole methods no test called: `load_events`, `recent_analyses`, `list_scenarios`, `delete_scenario`, `save_plan`, `load_plan`, `load_timeline`, and the transaction rollback. This is what makes a share link work after a restart. |
+| `ai/analyst.py` | The entire model-backed tool-use loop and its fallback. It only runs when an API key is configured, which is exactly why it needed testing: code that runs only in a configuration nobody tests fails the first time somebody uses it. |
+
+### What was left alone, and why
+
+Not every survivor is a gap. Three categories were classified rather than closed, because
+padding the suite to drive a number to zero is the same failure as writing a vacuous
+assertion — it produces a green metric that means nothing.
+
+- **Prose.** Most of the router's survivors are wording inside answer text. Where a phrase
+  carries a *claim* — "MODELLED ESTIMATE", "none executed", "[INFERRED]" — it is pinned.
+  Where it is only phrasing, it is not, and a test asserting the exact sentence would break
+  on every copy edit while protecting nothing.
+- **Provably equivalent mutants.** A branch that cannot be reached, or a constant that is
+  clamped downstream so the change cannot propagate. These are documented where they were
+  examined.
+- **Layout, not behaviour.** `@dataclass(slots=True)` and docstrings are filtered by the
+  harness before a mutant is generated.
+
+### Pointing it back at its own output
+
+Re-running the harness against the suite the audit had already grown found survivors
+inside the audit's own new tests. The clearest: `assert override.id.startswith("ovr-")`
+also passes for `"ovr-Xdeadbeef"`, so the id prefix it was written to pin could still
+drift. That is vacuous shape 5 again — containment where equality was meant — committed by
+the process auditing for it, and caught only because the machine was pointed back at the
+work rather than the work being trusted once it was green.
+
+This is the argument for the technique in one line. Careful review had already passed that
+assertion twice.
+
+### Where the survivor count actually landed
+
+The harness was run back over its own output at the end: all **666 recorded survivors**,
+re-applied one at a time against the grown suite.
+
+| Verdict | Count |
+|---|---|
+| Now killed by a test written during this audit | **379** |
+| No longer exists (the line changed) | 48 |
+| Still surviving | **239** |
+
+Of the 239, 130 are in `ai/router.py` and are overwhelmingly prose — wording inside answer
+text where no claim is attached. The measurement was taken against a checkout that already
+lagged the branch head by several commits, so the true current figure is lower; it is
+reported as measured rather than as estimated, because an estimate is exactly the kind of
+number this document exists to refuse.
+
+**Zero would be the wrong target.** Driving it there means pinning sentences, and a test
+that breaks on every copy edit while protecting nothing is a vacuous assertion wearing a
+different hat.
+
+### 13.5 — the one defect this found in shipped code
+
+Everything above is a test gap: behaviour that was correct and unprotected. One thing was
+not.
+
+`app/observability/logging.py` opens with **"Secrets never enter a log record"**, and §5 of
+this document lists logs as one of three places a credential must never reach.
+`JsonFormatter.format` redacted the message and every structured field — and then wrote the
+formatted traceback straight into the payload without passing it through `_redact`.
+
+Both `logger.exception` call sites in the codebase are precisely where a credential-bearing
+exception arrives: the unhandled-request handler, and `ai_tool_failed`. An HTTP error
+carrying a key in its URL, or a cloud SDK error carrying a bearer fragment, reached the log
+verbatim.
+
+It was found by *covering* the module, not by reading it. Five of its branches had never
+been executed and the exception branch was one of them. Nothing in the mutation audit would
+have found it either — a mutant cannot be killed on a line no test runs.
+
+That is the argument for measuring coverage alongside mutation score, and it is why the
+second half of this audit switched technique. A surviving mutant means "no test can tell the
+difference". An uncovered line means "no test runs this", which is strictly worse and was
+strictly more productive to chase: `storage/repository.py` (76 %), `ai/tools.py` (77 %),
+`ai/analyst.py` (54 %), `adapters/base.py` (83 %) and `api/routes.py` (91 %) were all whole
+methods and error paths that no test called — persistence, the tool failure surface, the
+model-backed analyst, feed error sanitisation, and every HTTP 404 and 422 the frontend codes
+against.
+
+### 13.6 — a second finding: an explanation that can never fire
+
+Chasing the last uncovered lines in `analysis/blast_radius.py` turned up dead code rather
+than a missing test.
+
+`_explain` builds a line reading *"X's largest single dependency loss comes from Y"* by
+looking up each origin in the propagation state's `dominant_cause` map. It never fires.
+`calculate_blast_radius` pins every origin, a pinned entity is a boundary condition the
+solver deliberately refuses to attribute a cause to — *"otherwise 'Singapore is DOWN' would
+quietly become 'mostly up'"* — and `_explain` has exactly one caller. So the branch is
+unreachable, and `dominant_cause` is computed by the propagation engine and consumed
+nowhere.
+
+This is not a wrong answer, it is a missing one: an explanation somebody wrote and nobody
+has ever seen. It is recorded rather than fixed, because making it fire is a change to what
+every analysis says, and that is a product decision rather than a test one.
+
+The invariant underneath it — a pinned origin cannot be healed by its own dependencies — is
+real and is now pinned by a test. The dead branch is left as it is, named here.
+
+### What the two techniques cost, and which paid
+
+Roughly in proportion: the mutation pass took most of the wall clock — a full run is
+~1,100 mutants, each one a complete suite execution — and produced the sharper individual
+findings, the ones about a specific constant carrying a specific claim. The coverage pass
+took minutes and produced more of them, because "no test runs this line" is a cheaper
+question to answer than "can any test tell this apart", and on a suite this size it was
+still true of about eight per cent of the code.
+
+Both were needed. Coverage would never have found the reachability factor in CVE scoring —
+that line runs on every security analysis, it just runs unchecked. Mutation would never have
+found the log-redaction defect, because a mutant cannot be killed on a line no test runs.
+
+### The honest limit of this
+
+Mutation testing proves a test *can* fail. It does not prove the behaviour is correct — a
+wrong constant pinned by a test is still wrong, now with a test defending it. Four of the
+new tests failed on first run against the real implementation and were corrected: a
+tri-state polarity inverted, two comparison keys guessed rather than measured, and a
+scenario builder called with the wrong keyword. Each of those was the test being wrong, not
+the code. That is the failure mode this technique replaces the old one with, and it is a
+better one to have, but it is not nothing.
+
+**And it changes nothing about §2.** Every mutant in this audit ran against fixtures and
+fakes. Not one of them ran against an Azure subscription.
