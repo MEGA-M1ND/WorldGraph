@@ -177,14 +177,19 @@ button {
   font-variant-numeric: tabular-nums;
 }
 
-.mode-switch {
-  display: flex;
+/**
+ * Which side rail to show. Only meaningful below the three-column breakpoint, where one
+ * rail has to give way — so it is hidden above that width rather than sitting in the top
+ * bar offering a choice that changes nothing.
+ */
+.rail-switch {
+  display: none;
   background: var(--bg-input);
   border: 1px solid var(--line);
   border-radius: var(--radius);
   padding: 2px;
 }
-.mode-switch__button {
+.rail-switch__button {
   border: 0;
   background: transparent;
   color: var(--text-muted);
@@ -194,11 +199,11 @@ button {
   border-radius: var(--radius-sm);
   transition: var(--transition);
 }
-.mode-switch__button.is-active {
+.rail-switch__button.is-active {
   background: var(--bg-active);
   color: var(--text-primary);
 }
-.mode-switch__button:hover:not(.is-active) {
+.rail-switch__button:hover:not(.is-active) {
   color: var(--text-secondary);
 }
 
@@ -634,20 +639,24 @@ button {
 
 @media (max-width: 1180px) {
   /* Below this the three-column layout starves the globe. Drop the right rail into the
-     dock area rather than shrinking every column into uselessness. */
+     dock area rather than shrinking every column into uselessness. This is the only width
+     at which the rail switch does anything, so it is also the only width it appears at. */
+  .rail-switch {
+    display: flex;
+  }
   .workspace {
     grid-template-columns: 280px 1fr;
   }
   .rail--right {
     display: none;
   }
-  .app[data-view-mode="engineer"] .rail--right {
+  .app[data-rail-focus="analyst"] .rail--right {
     display: flex;
   }
-  .app[data-view-mode="engineer"] .workspace {
+  .app[data-rail-focus="analyst"] .workspace {
     grid-template-columns: 1fr 280px;
   }
-  .app[data-view-mode="engineer"] .rail--left {
+  .app[data-rail-focus="analyst"] .rail--left {
     display: none;
   }
 }

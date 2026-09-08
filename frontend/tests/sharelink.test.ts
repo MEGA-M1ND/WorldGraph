@@ -19,7 +19,7 @@ function state(overrides: Partial<ShareState> = {}): ShareState {
     camera: null,
     path: [],
     showDependencies: true,
-    viewMode: 'executive',
+    railFocus: 'risks',
     ...overrides,
   };
 }
@@ -33,7 +33,7 @@ describe('share links', () => {
       camera: { lat: 24.61, lon: 121.03, height: 900000, heading: 42, pitch: -55 },
       path: ['supplier-taiwan-hardware', 'payments-k8s-singapore', 'payments-api'],
       showDependencies: false,
-      viewMode: 'engineer',
+      railFocus: 'analyst',
     });
     const decoded = decodeShareState(encodeShareState(original));
     assert.ok(decoded);
@@ -42,9 +42,25 @@ describe('share links', () => {
     assert.equal(decoded.scenarioId, original.scenarioId);
     assert.deepEqual(decoded.path, original.path);
     assert.equal(decoded.showDependencies, false);
-    assert.equal(decoded.viewMode, 'engineer');
+    assert.equal(decoded.railFocus, 'analyst');
     assert.equal(decoded.camera?.lat.toFixed(2), '24.61');
     assert.equal(decoded.camera?.heading, 42);
+  });
+
+  it('still understands a link copied when the control said "Engineer"', () => {
+    // The parameter used to carry `eng`/`exec`. A link someone already copied must keep
+    // opening the same rail rather than being rejected as malformed.
+    const legacy = decodeShareState(new URLSearchParams('m=eng').toString());
+    assert.ok(legacy, 'a legacy link must not be rejected');
+    assert.equal(legacy.railFocus, 'analyst');
+
+    const legacyDefault = decodeShareState(new URLSearchParams('m=exec').toString());
+    assert.ok(legacyDefault);
+    assert.equal(legacyDefault.railFocus, 'risks');
+  });
+
+  it('rejects a rail value it does not recognise', () => {
+    assert.equal(decodeShareState(new URLSearchParams('m=wizard').toString()), null);
   });
 
   it('produces an empty query for empty state', () => {

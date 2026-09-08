@@ -51,7 +51,8 @@ export interface Notice {
   detail: string;
 }
 
-export type ViewMode = 'executive' | 'engineer';
+/** Which side rail to show when the viewport is too narrow for both. */
+export type RailFocus = 'risks' | 'analyst';
 
 export interface AppState {
   config: AppConfig | null;
@@ -92,7 +93,7 @@ export interface AppState {
   focusedPath: string[];
   showDependencies: boolean;
 
-  viewMode: ViewMode;
+  railFocus: RailFocus;
   transcript: AnalystMessage[];
   notices: Notice[];
   /** Named in-flight operations, so the UI can show precise progress rather than a spinner. */
@@ -130,7 +131,7 @@ function initialState(): AppState {
     highlightedEntityIds: [],
     focusedPath: [],
     showDependencies: true,
-    viewMode: 'executive',
+    railFocus: 'risks',
     transcript: [],
     notices: [],
     busy: new Set(),

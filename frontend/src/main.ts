@@ -671,7 +671,7 @@ class WorldGraphApp {
       camera: this.globe ? this.globe.cameraState() : null,
       path: state.focusedPath,
       showDependencies: state.showDependencies,
-      viewMode: state.viewMode,
+      railFocus: state.railFocus,
     });
   }
 
@@ -702,7 +702,7 @@ class WorldGraphApp {
     // A share link author already chose the experience; never interrupt them with the
     // first-run dialog.
     this.dismissFirstRun();
-    store.update({ viewMode: shared.viewMode, showDependencies: shared.showDependencies });
+    store.update({ railFocus: shared.railFocus, showDependencies: shared.showDependencies });
     this.layer.setEdgesVisible(shared.showDependencies);
 
     if (shared.camera) this.globe.setCameraState(shared.camera);
@@ -848,10 +848,10 @@ class WorldGraphApp {
       void this.ask(value);
     });
 
-    for (const button of bindAll<HTMLButtonElement>('.mode-switch__button')) {
+    for (const button of bindAll<HTMLButtonElement>('.rail-switch__button')) {
       button.addEventListener('click', () => {
-        const mode = button.dataset['view'] === 'engineer' ? 'engineer' : 'executive';
-        store.update({ viewMode: mode });
+        const focus = button.dataset['rail'] === 'analyst' ? 'analyst' : 'risks';
+        store.update({ railFocus: focus });
         this.persistShareState();
       });
     }
@@ -869,7 +869,7 @@ class WorldGraphApp {
         camera: this.globe ? this.globe.cameraState() : null,
         path: state.focusedPath,
         showDependencies: state.showDependencies,
-        viewMode: state.viewMode,
+        railFocus: state.railFocus,
       });
       void navigator.clipboard
         ?.writeText(url)
@@ -980,9 +980,9 @@ class WorldGraphApp {
       generatePlan: () => void this.generatePlan(),
     };
 
-    document.getElementById('app')?.setAttribute('data-view-mode', state.viewMode);
-    for (const button of bindAll<HTMLButtonElement>('.mode-switch__button')) {
-      button.classList.toggle('is-active', button.dataset['view'] === state.viewMode);
+    document.getElementById('app')?.setAttribute('data-rail-focus', state.railFocus);
+    for (const button of bindAll<HTMLButtonElement>('.rail-switch__button')) {
+      button.classList.toggle('is-active', button.dataset['rail'] === state.railFocus);
     }
 
     // -- top bar ---------------------------------------------------------------------
