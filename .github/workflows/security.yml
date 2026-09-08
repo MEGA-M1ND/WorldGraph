@@ -2,7 +2,18 @@ name: Security
 
 on:
   push:
-    branches: ["**"]
+    # The default branch only. A change on any other branch reaches CI through its pull
+    # request, and listening for both events ran the entire suite twice for every commit
+    # on a branch with a PR open — including the browser job, the most expensive one we
+    # have, which was paid for twice and proved the same thing both times.
+    #
+    # Concurrency does not collapse them: a push is `refs/heads/<branch>` and a pull
+    # request is `refs/pull/<n>/merge`, so the two runs sit in different groups by
+    # construction.
+    #
+    # The cost is real and accepted: a branch pushed without a pull request now gets no
+    # run at all. Use `workflow_dispatch` to check one deliberately.
+    branches: ["claude/worldgraph-resilience-platform-5bcaxi"]
   pull_request:
   schedule:
     # Weekly, so a dependency advisory published after merge is still caught.
