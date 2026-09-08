@@ -349,6 +349,46 @@ test.describe('WorldGraph hero demo', () => {
     await expect(page.locator('.notice')).toContainText('Share link not understood');
   });
 
+  test('the top bar fits every viewport instead of clipping', async ({ page }) => {
+    test.slow();
+    await page.goto('/');
+    await waitForBoot(page);
+    await dismissFirstRun(page);
+
+    // The bar's contents come to 1439px at their narrowest, and a flex item does not
+    // shrink below its content, so below about 1280px it forced itself wider than its
+    // grid column. Nothing looked wrong until you clicked a control on the right: the
+    // focus scrolled the brand and the workspace selector off the left edge.
+    for (const width of [1600, 1280, 1100, 960, 820]) {
+      await page.setViewportSize({ width, height: 900 });
+      await page.waitForTimeout(300);
+
+      const overflow = await page.evaluate(
+        () => Math.round(document.querySelector('.topbar')!.getBoundingClientRect().width) -
+          window.innerWidth,
+      );
+      expect(overflow, `top bar overflows by ${overflow}px at ${width}px`).toBeLessThanOrEqual(0);
+
+      // Nothing is dropped to achieve that. Every figure is still rendered, and the two
+      // things that must never be lost — which estate this is, and whether it is real —
+      // are still on screen.
+      await expect(page.locator('[data-bind="headline-stats"] .stat')).toHaveCount(6);
+      for (const selector of [
+        '[data-bind="workspace-badge"]',
+        '[data-bind="run-mode"]',
+        '[data-bind="workspace-select"]',
+      ]) {
+        const box = await page.locator(selector).boundingBox();
+        expect(box, `${selector} missing at ${width}px`).not.toBeNull();
+        expect(box!.x, `${selector} is off the left edge at ${width}px`).toBeGreaterThanOrEqual(0);
+        expect(
+          box!.x + box!.width,
+          `${selector} is off the right edge at ${width}px`,
+        ).toBeLessThanOrEqual(width);
+      }
+    }
+  });
+
   test('the rail switch is absent at a width where both rails fit', async ({ page }) => {
     // Its predecessor asserted only that a `data-view-mode` attribute flipped, which was
     // true while the two "modes" rendered byte-identically at this viewport: every rule
