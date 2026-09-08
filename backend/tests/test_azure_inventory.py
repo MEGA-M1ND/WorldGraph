@@ -22,11 +22,13 @@ import json
 import logging
 import re
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
 from app.adapters.azure_inventory import (
     FORBIDDEN_RESOURCE_SEGMENTS,
+    SENSITIVE_PROPERTY_HINTS,
     SUPPORTED_TYPES,
     assess_coverage,
     build_region_entity,
@@ -1023,3 +1025,103 @@ class TestBrokenOptionalDependency:
         )
         for forbidden in ("token", "secret", "tenant", "https://", "Bearer"):
             assert forbidden.lower() not in message.lower()
+
+
+class TestEverySensitiveHintActuallyRedacts:
+    """Each hint in the redaction list, exercised by name.
+
+    Mutation testing found most of `SENSITIVE_PROPERTY_HINTS` unprotected: appending a
+    character to `clientsecret`, `accountkey`, `privatekey`, `token` or `key` stopped that
+    hint matching, and no test failed. The existing secret tests use a fixture containing a
+    password, a connection string and a service-principal secret — real, but only a few of
+    the eighteen hints, so the rest of the list was decoration.
+
+    The property names below are written out rather than iterated from the module. Looping
+    over `SENSITIVE_PROPERTY_HINTS` would mutate with it: a hint changed to `keyX` would be
+    tested as `keyX` and would still redact, proving nothing.
+    """
+
+    SECRET_VALUE = "MARKER-VALUE-THAT-MUST-NOT-SURVIVE"
+
+    #: One realistic Azure property name per hint, in Azure's own casing.
+    NAMES: ClassVar[list[str]] = [
+        "administratorLoginPassword",
+        "clientSecret",
+        "storageAccountKey",
+        "sasToken",
+        "credentialRef",
+        "connectionString",
+        "certificateBody",
+        "certificateThumbprint",
+        "sasUrl",
+        "accountKey",
+        "primaryKey",
+        "secondaryKey",
+        "sharedAccessPolicyKey",
+        "adminLogin",
+        "administratorLogin",
+        "sshPublicKey",
+        "privateKeyPem",
+        "sshFingerprint",
+    ]
+
+    @pytest.mark.parametrize("name", NAMES)
+    def test_the_value_is_redacted(self, name: str):
+        cleaned = sanitize_properties({name: self.SECRET_VALUE})
+        assert cleaned[name] == "[redacted]", f"{name} leaked its value"
+        assert self.SECRET_VALUE not in json.dumps(cleaned)
+
+    @pytest.mark.parametrize("name", NAMES)
+    def test_the_key_is_kept_so_removal_is_visible(self, name: str):
+        """Redacted, not dropped: a silently absent key looks like one that never existed."""
+        assert name in sanitize_properties({name: self.SECRET_VALUE})
+
+    @pytest.mark.parametrize(
+        "name",
+        ["admin_login_password", "CLIENT-SECRET", "Account_Key", "private-key"],
+    )
+    def test_separators_and_casing_do_not_evade_it(self, name: str):
+        """`lower()` plus stripping `_` and `-` is what makes the substring match work."""
+        assert sanitize_properties({name: self.SECRET_VALUE})[name] == "[redacted]"
+
+    def test_a_nested_secret_is_reached(self):
+        payload = {"outer": {"inner": {"clientSecret": self.SECRET_VALUE}}}
+        assert self.SECRET_VALUE not in json.dumps(sanitize_properties(payload))
+
+    def test_a_secret_inside_a_list_is_reached(self):
+        payload = {"items": [{"accountKey": self.SECRET_VALUE}, {"ok": "fine"}]}
+        assert self.SECRET_VALUE not in json.dumps(sanitize_properties(payload))
+
+    def test_an_ordinary_property_is_left_alone(self):
+        """The list must not be so broad that it redacts the inventory itself."""
+        cleaned = sanitize_properties({"location": "westeurope", "nodeCount": 3})
+        assert cleaned == {"location": "westeurope", "nodeCount": 3}
+
+    def test_the_load_bearing_hints_are_the_only_ones_that_can_leak(self):
+        """Why breaking most hints survives mutation, stated rather than left a mystery.
+
+        The list overlaps heavily: `clientSecret` is caught by both `clientsecret` and
+        `secret`, `accountKey` by both `accountkey` and `key`. Breaking the specific hint
+        changes nothing, because the general one still matches — which is defence in depth
+        working, not a gap.
+
+        Seven hints have no backup. Those are the ones where a typo would cause an actual
+        leak, and each has a case above that fails if it breaks.
+        """
+        solo = {
+            "credentialRef": "credential",
+            "connectionString": "connectionstring",
+            "certificateBody": "certificate",
+            "sasUrl": "sas",
+            "adminLogin": "adminlogin",
+            "administratorLogin": "administratorlogin",
+            "sshFingerprint": "fingerprint",
+        }
+        for name, expected_hint in solo.items():
+            lowered = name.lower().replace("_", "").replace("-", "")
+            matching = [h for h in SENSITIVE_PROPERTY_HINTS if h in lowered]
+            assert matching == [expected_hint], (
+                f"{name} is now caught by {matching}; if a second hint covers it the entry "
+                "is no longer load-bearing, and if none does it leaks"
+            )
+            assert sanitize_properties({name: self.SECRET_VALUE})[name] == "[redacted]"

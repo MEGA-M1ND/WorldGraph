@@ -127,6 +127,10 @@ SENSITIVE_PROPERTY_HINTS: tuple[str, ...] = (
     "clientsecret",
     "sharedaccess",
     "adminlogin",
+    # Azure SQL spells it in full, and "adminlogin" is not a substring of
+    # "administratorlogin" — so the hint above missed the one property name Azure
+    # actually returns. Found by mutation testing the redaction list.
+    "administratorlogin",
     "publickey",
     "privatekey",
     "fingerprint",
