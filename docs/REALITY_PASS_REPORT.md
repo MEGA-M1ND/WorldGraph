@@ -27,7 +27,7 @@ what they cost, and the section that matters most is [§9](#9-what-is-still-not-
 > applies that standard to the whole suite by machine** — mutating every constant,
 > comparison and boolean in the code under audit and asking whether any test notices. It
 > found that the nine prompt-injection patterns, the reachability factor in CVE scoring,
-> and the function that *is* workspace isolation were all unprotected. 597 tests → 928.
+> and the function that *is* workspace isolation were all unprotected. 597 tests → 1,068.
 
 ---
 
@@ -618,8 +618,9 @@ that string with an `X` on the end — and the whole suite was run against each.
 that no test notices is a behaviour no test protects. That is not an opinion about test
 quality; it is a decision procedure with a yes or no answer.
 
-The suite went from **597 tests to 928** as a result. None of that is new product code.
-All of it is behaviour that was already shipping and could have been altered silently.
+The suite went from **597 tests to 1,068** as a result, plus 32 → 39 on the frontend. None
+of that is new product code. All of it is behaviour that was already shipping and could
+have been altered silently.
 
 ### The five shapes a vacuous assertion takes
 
@@ -671,7 +672,9 @@ Ordered by what the finding costs if it goes wrong, not by count.
 | `ai/router.py` | The time-window parser (`in the last 2 hours` could resolve to 2 minutes), the CVE and place-name extractors that decide *which* asset is discussed, and the evidence markers — `[INFERRED]` vs `[ESTABLISHED]`, `? (product name only — unverified)`, `MODELLED ESTIMATE`, and the `▲`/`▼` direction arrows. |
 | `simulation/engine.py` | `_direction_optional` returning "better" for a missing measurement — painting an undeclared figure green. `_percent` and `_count` substituting a number for `None`. |
 | `security/ratelimit.py` | The `max(1, …)` floor, without which a misconfigured limit of 0 locks an endpoint out entirely; per-key isolation; the retry-after figure. |
-| `adapters/azure_inventory.py` | The sanitizer's depth, string and list bounds, and `PAGE_SIZE` — Resource Graph returns at most 1 000 rows whatever KQL asks for, so a larger page size makes the paging loop read a full page as the end of the estate. |
+| `adapters/azure_inventory.py` | Every truncation reason — "Azure said it truncated" and "WorldGraph stopped at its own ceiling" call for opposite responses and could have collapsed onto one string. Every threshold in `level()`, which turns a ratio into a word an operator reads as a verdict. The sanitizer's bounds, and `PAGE_SIZE` — Resource Graph returns at most 1 000 rows whatever KQL asks for, so a larger page size makes the paging loop read a full page as the end of the estate. |
+| `geo/spatial.py` | The Earth's radius. The distance tests were there, at `rel=0.01` — ±103 km on a 10 000 km figure, on the number that decides whether an asset sits inside a 50 km exposure radius. Also half the compass table, and the per-category exposure radii whose zeros mean "not geographic at all". |
+| `frontend/src/ui/dom.ts` | The `el()` XSS chokepoint, and the codebase-wide property it depends on. The module's own docstring claimed both; nothing tested either. |
 
 ### What was left alone, and why
 
@@ -688,6 +691,18 @@ assertion — it produces a green metric that means nothing.
   examined.
 - **Layout, not behaviour.** `@dataclass(slots=True)` and docstrings are filtered by the
   harness before a mutant is generated.
+
+### Pointing it back at its own output
+
+Re-running the harness against the suite the audit had already grown found survivors
+inside the audit's own new tests. The clearest: `assert override.id.startswith("ovr-")`
+also passes for `"ovr-Xdeadbeef"`, so the id prefix it was written to pin could still
+drift. That is vacuous shape 5 again — containment where equality was meant — committed by
+the process auditing for it, and caught only because the machine was pointed back at the
+work rather than the work being trusted once it was green.
+
+This is the argument for the technique in one line. Careful review had already passed that
+assertion twice.
 
 ### The honest limit of this
 

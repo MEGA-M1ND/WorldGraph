@@ -150,6 +150,29 @@ class TestExposureRadius:
         shallow = earthquake_exposure_radius_km(6.5, depth_km=10.0)
         deep = earthquake_exposure_radius_km(6.5, depth_km=300.0)
         assert deep < shallow
+        # A quarter narrower, not an arbitrary amount.
+        assert deep == pytest.approx(shallow * 0.75, rel=1e-9)
+
+    @pytest.mark.parametrize(
+        ("depth_km", "is_deep"),
+        [(10.0, False), (69.9, False), (70.0, False), (70.1, True), (300.0, True)],
+    )
+    def test_the_deep_focus_boundary_is_seventy_kilometres(self, depth_km, is_deep):
+        """The seismological convention. Either side of it is a different footprint."""
+        shallow = earthquake_exposure_radius_km(6.5, depth_km=10.0)
+        radius = earthquake_exposure_radius_km(6.5, depth_km=depth_km)
+        assert (radius < shallow) is is_deep
+
+    def test_the_default_depth_is_shallow(self):
+        """USGS feeds omit depth often enough that the default has to be the common case."""
+        assert earthquake_exposure_radius_km(6.5) == earthquake_exposure_radius_km(
+            6.5, depth_km=10.0
+        )
+
+    def test_a_nonsensical_magnitude_floors_at_zero_rather_than_going_negative(self):
+        """`max(0.0, …)`. A negative magnitude is malformed feed data, not a tiny quake."""
+        assert earthquake_exposure_radius_km(-5.0) == earthquake_exposure_radius_km(0.0)
+        assert earthquake_exposure_radius_km(-5.0) == 10.0
 
     def test_radius_is_clamped(self):
         assert earthquake_exposure_radius_km(0.0) == 10.0
