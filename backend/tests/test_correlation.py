@@ -104,12 +104,33 @@ class TestBearing:
         origin = GeoPoint(lat=0.0, lon=0.0)
         assert bearing_degrees(origin, GeoPoint(lat=0.0, lon=10.0)) == pytest.approx(90.0, abs=0.1)
 
+    def test_due_south_and_west(self):
+        origin = GeoPoint(lat=0.0, lon=0.0)
+        assert bearing_degrees(origin, GeoPoint(lat=-10.0, lon=0.0)) == pytest.approx(180.0, abs=0.1)
+        assert bearing_degrees(origin, GeoPoint(lat=0.0, lon=-10.0)) == pytest.approx(270.0, abs=0.1)
+
     @pytest.mark.parametrize(
         ("bearing", "expected"),
-        [(0, "N"), (45, "NE"), (90, "E"), (180, "S"), (270, "W"), (359, "N")],
+        [
+            # All eight labels. Only four were tested; SE, SW and NW were unreachable by
+            # any assertion, so the table could have been reordered — and "42 km SW of the
+            # epicentre" is a factual claim in an answer, not decoration.
+            (0, "N"), (45, "NE"), (90, "E"), (135, "SE"),
+            (180, "S"), (225, "SW"), (270, "W"), (315, "NW"),
+            # Each sector's own boundaries: the label changes 22.5° either side of centre.
+            (22.4, "N"), (22.5, "NE"), (67.4, "NE"), (67.5, "E"),
+            (337.4, "NW"), (337.5, "N"), (359, "N"),
+            # Angles outside 0-360 wrap rather than falling off the end of the table.
+            (360, "N"), (405, "NE"), (-45, "NW"), (-90, "W"), (720, "N"),
+        ],
     )
     def test_compass_labels(self, bearing: float, expected: str):
         assert compass_point(bearing) == expected
+
+    def test_the_eight_labels_are_eight_distinct_labels(self):
+        """A duplicated entry would silently merge two sectors."""
+        labels = [compass_point(b) for b in range(0, 360, 45)]
+        assert len(set(labels)) == 8
 
 
 class TestExposureRadius:
