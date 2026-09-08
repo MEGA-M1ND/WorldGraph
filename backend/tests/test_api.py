@@ -406,3 +406,148 @@ class TestPersistence:
             "/api/analysis/blast-radius", json={"event_id": "replay:taiwan-m68"}
         ).json()["id"]
         assert client.get(f"/api/analysis/{analysis_id}").status_code == 200
+
+
+class TestDashboardHeadlineNumbers:
+    """The six figures on the top bar, and the keys the frontend reads them from.
+
+    Mutation testing found all of them unprotected: the `== "CRITICAL"` that counts
+    critical services, the entity-type exclusion set behind the infrastructure count, the
+    severity filter behind active incidents, and every dictionary key. These are the most
+    looked-at numbers in the product — an operator sees them before anything else — and
+    each could have drifted silently.
+    """
+
+    def test_the_demo_estate_reports_these_exact_figures(self, client: TestClient):
+        body = client.get("/api/dashboard").json()
+        assert body["critical_services"] == 5
+        assert body["infrastructure_assets"] == 37
+        assert body["active_incidents"] == 3
+        assert body["material_risks"] == 5
+        assert body["entities"] == 42
+        assert body["edges"] == 56
+        assert body["events"] == 5
+
+    def test_the_contract_with_the_frontend_is_these_keys(self, client: TestClient):
+        """A renamed key blanks a panel; nothing else in the suite reads them all."""
+        assert set(client.get("/api/dashboard").json()) == {
+            "workspace_id",
+            "workspace_name",
+            "workspace_kind",
+            "read_only",
+            "organization",
+            "critical_services",
+            "infrastructure_assets",
+            "active_incidents",
+            "material_risks",
+            "availability",
+            "infrastructure_availability",
+            "unknown_reasons",
+            "entities",
+            "edges",
+            "events",
+            "mode",
+            "data_disclaimer",
+        }
+
+    def test_infrastructure_excludes_the_non_infrastructure_types(self, client: TestClient):
+        """37 of 42: the five excluded entities are organisation and customer regions."""
+        body = client.get("/api/dashboard").json()
+        world = client.get("/api/world").json()["entities"]
+        excluded = {"ORGANIZATION", "CUSTOMER_REGION", "SECURITY_FINDING", "WORLD_EVENT"}
+        expected = sum(1 for e in world if e["type"] not in excluded)
+        assert body["infrastructure_assets"] == expected
+        assert expected < body["entities"], "the exclusion must actually exclude something"
+
+    def test_critical_services_counts_only_critical_service_types(self, client: TestClient):
+        """Both halves of the condition: CRITICAL *and* a service-shaped type."""
+        body = client.get("/api/dashboard").json()
+        world = client.get("/api/world").json()["entities"]
+        service_types = {"BUSINESS_SERVICE", "APPLICATION", "MICROSERVICE", "DATABASE"}
+        critical_anything = [e for e in world if e["criticality"] == "CRITICAL"]
+        critical_services = [e for e in critical_anything if e["type"] in service_types]
+        assert body["critical_services"] == len(critical_services)
+        assert len(critical_anything) > len(critical_services), (
+            "the estate must have a CRITICAL non-service, or the type filter proves nothing"
+        )
+
+    def test_active_incidents_are_severe_and_correlated(self, client: TestClient):
+        """Not every event: only HIGH or CRITICAL ones that touch this estate."""
+        body = client.get("/api/dashboard").json()
+        events = client.get("/api/events").json()
+        severe = [e for e in events if e["severity"] in {"HIGH", "CRITICAL"}]
+        assert body["active_incidents"] == len(severe) <= body["events"]
+        assert body["active_incidents"] < body["events"], (
+            "some event must be filtered out, or the severity filter proves nothing"
+        )
+
+    def test_both_availabilities_are_reported_separately(self, client: TestClient):
+        """The customer view may be None; the infrastructure view never is."""
+        body = client.get("/api/dashboard").json()
+        assert body["infrastructure_availability"] is not None
+        assert "availability" in body
+
+    def test_both_halves_of_the_incident_filter_are_load_bearing(self, client: TestClient):
+        """Severity AND correlation, each excluding a different event.
+
+        The demo estate is well shaped for this: a LOW event that *does* correlate is
+        dropped by severity, and a MODERATE event that does *not* correlate is dropped by
+        correlation. Widening the severity set to MODERATE alone changes nothing — the
+        storm is excluded either way — so that mutation is equivalent here and only the
+        LOW case can prove the severity filter does any work.
+        """
+        events = client.get("/api/events").json()
+        by_severity = {e["severity"] for e in events}
+        assert {"LOW", "MODERATE"} <= by_severity, (
+            "the fixture must carry a LOW and a MODERATE event or neither half is testable"
+        )
+
+        body = client.get("/api/dashboard").json()
+        severe = [e for e in events if e["severity"] in {"HIGH", "CRITICAL"}]
+        with_low = [e for e in events if e["severity"] in {"HIGH", "CRITICAL", "LOW"}]
+        assert body["active_incidents"] == len(severe)
+        assert len(with_low) > len(severe), (
+            "a LOW event must exist and correlate, or the severity bound is unobservable"
+        )
+
+    def test_a_severe_event_that_touches_nothing_is_not_an_active_incident(
+        self, client: TestClient
+    ):
+        """The correlation half of the filter, which the fixture alone cannot show.
+
+        Every HIGH or CRITICAL event in the demo estate happens to correlate, so removing
+        `self._correlates(event)` entirely changes no number — the only non-correlating
+        event is MODERATE and is already dropped by severity. Injecting a CRITICAL event
+        that touches nothing is what makes the second half observable.
+        """
+        from datetime import UTC, datetime
+
+        from app.models.core import DataMode, DataSourceInfo, EventCategory, Severity, WorldEvent
+
+        state = client.app.state.world
+        dashboard = client.get("/api/dashboard").json()
+        before, before_count = dashboard["active_incidents"], dashboard["events"]
+
+        unrelated = WorldEvent(
+            id="synthetic:touches-nothing",
+            category=EventCategory.CLOUD_INCIDENT,
+            title="Outage in a provider this estate does not use",
+            description="Carries no location, names no asset and matches no software.",
+            severity=Severity.CRITICAL,
+            location=None,
+            exposure_radius_km=0.0,
+            occurred_at=datetime.now(UTC),
+            source=DataSourceInfo(
+                source_id="test", source_name="test", mode=DataMode.SYNTHETIC, confidence=1.0
+            ),
+        )
+        state._events[unrelated.id] = unrelated
+        try:
+            after = client.get("/api/dashboard").json()
+            assert after["events"] > before_count, "the event must have been ingested"
+            assert after["active_incidents"] == before, (
+                "a CRITICAL event correlating with nothing is not an active incident"
+            )
+        finally:
+            state._events.pop(unrelated.id, None)
+
