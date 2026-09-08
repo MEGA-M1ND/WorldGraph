@@ -547,3 +547,127 @@ class TestThePollLoop:
         await adapter.start()
         assert adapter._task is None
         await adapter.stop()
+
+
+class TestAMalformedFeedYieldsNothingRatherThanFiction:
+    """The guards that stop an unusable upstream record reaching an operator's globe.
+
+    `normalize_feature`'s docstring puts it exactly: a feature missing its magnitude is not
+    a smaller earthquake, it is an unusable record, and inventing a default for it would
+    put a fictional event on the map. Every one of these branches was uncovered.
+    """
+
+    @respx.mock
+    @pytest.mark.anyio
+    async def test_a_payload_that_is_not_an_object_is_refused(self):
+        respx.get(USGS_URL).mock(return_value=httpx.Response(200, json=["not", "an", "object"]))
+        adapter = UsgsEarthquakeAdapter()
+        with pytest.raises(AdapterError) as error:
+            await adapter.fetch()
+        assert "unexpected payload shape" in str(error.value)
+
+    @respx.mock
+    @pytest.mark.anyio
+    async def test_a_payload_with_no_feature_list_is_refused(self):
+        respx.get(USGS_URL).mock(return_value=httpx.Response(200, json={"features": "nope"}))
+        adapter = UsgsEarthquakeAdapter()
+        with pytest.raises(AdapterError):
+            await adapter.fetch()
+
+    @respx.mock
+    @pytest.mark.anyio
+    async def test_features_that_all_fail_to_normalize_are_an_error_not_an_empty_globe(self):
+        """Silence here would read as "no earthquakes", which is a claim about the world."""
+        respx.get(USGS_URL).mock(
+            return_value=httpx.Response(200, json={"features": [{"nonsense": True}] * 3})
+        )
+        adapter = UsgsEarthquakeAdapter()
+        with pytest.raises(AdapterError) as error:
+            await adapter.fetch()
+        assert "none could be normalized" in str(error.value)
+
+    @respx.mock
+    @pytest.mark.anyio
+    async def test_a_genuinely_empty_feed_is_not_an_error(self):
+        """No features at all is a quiet day, not a broken upstream."""
+        respx.get(USGS_URL).mock(return_value=httpx.Response(200, json={"features": []}))
+        events, entities = await UsgsEarthquakeAdapter().fetch()
+        assert events == [] and entities == []
+
+    @respx.mock
+    @pytest.mark.anyio
+    async def test_one_bad_feature_among_good_ones_is_dropped_not_fatal(self):
+        respx.get(USGS_URL).mock(
+            return_value=httpx.Response(
+                200, json={"features": [QUAKE_FEATURE, {"nonsense": True}]}
+            )
+        )
+        events, _entities = await UsgsEarthquakeAdapter().fetch()
+        assert len(events) == 1
+
+    @pytest.mark.anyio
+    async def test_a_disabled_feed_says_it_is_disabled_rather_than_failing_silently(self):
+        with pytest.raises(AdapterError) as error:
+            await UsgsEarthquakeAdapter(enabled=False).fetch()
+        assert "disabled in this deployment" in str(error.value)
+
+        with pytest.raises(AdapterError) as error:
+            await CisaKevAdapter(enabled=False).fetch()
+        assert "disabled in this deployment" in str(error.value)
+
+    @respx.mock
+    @pytest.mark.anyio
+    async def test_the_kev_catalog_must_be_an_object_with_a_vulnerability_list(self):
+        respx.get(KEV_URL).mock(return_value=httpx.Response(200, json=[1, 2, 3]))
+        with pytest.raises(AdapterError) as error:
+            await CisaKevAdapter().fetch()
+        assert "unexpected payload shape" in str(error.value)
+
+        respx.get(KEV_URL).mock(return_value=httpx.Response(200, json={"other": []}))
+        with pytest.raises(AdapterError) as error:
+            await CisaKevAdapter().fetch()
+        assert "no vulnerability list" in str(error.value)
+
+    @pytest.mark.parametrize(
+        "feature",
+        [
+            "not a dict",
+            None,
+            42,
+            {"properties": {"mag": 6.0}, "geometry": None},
+            {"properties": None, "geometry": {"coordinates": [1, 2, 3]}},
+        ],
+    )
+    def test_a_feature_of_the_wrong_shape_normalizes_to_nothing(self, feature):
+        assert normalize_feature(feature, mode=DataMode.LIVE) is None
+
+    @pytest.mark.parametrize(
+        "coordinates",
+        [
+            ["not", "numbers", "here"],
+            [None, None],
+            [200.0, 10.0],   # longitude past the meridian
+            [10.0, 200.0],   # latitude past the pole
+            [-181.0, 0.0],
+            [0.0, -91.0],
+        ],
+    )
+    def test_impossible_coordinates_are_refused(self, coordinates):
+        """A quake at latitude 200 is a parsing bug, not a place."""
+        feature = {
+            "id": "probe",
+            "properties": {"mag": 6.0, "place": "somewhere", "time": 1_700_000_000_000},
+            "geometry": {"coordinates": coordinates},
+        }
+        assert normalize_feature(feature, mode=DataMode.LIVE) is None
+
+    def test_a_two_element_coordinate_defaults_the_depth_rather_than_failing(self):
+        """USGS omits depth occasionally; the default is documented as 10 km."""
+        feature = {
+            "id": "probe",
+            "properties": {"mag": 6.0, "place": "somewhere", "time": 1_700_000_000_000},
+            "geometry": {"coordinates": [103.8, 1.3]},
+        }
+        event = normalize_feature(feature, mode=DataMode.LIVE)
+        assert event is not None
+        assert event.metadata["depth_km"] == 10.0
