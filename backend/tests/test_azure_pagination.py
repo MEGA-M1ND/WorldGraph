@@ -338,3 +338,197 @@ class TestTheRequestShapeItself:
         assert client.tokens_seen == [None, "token-one"]
         # And the recorded requests are the shape this environment actually builds.
         assert all(token_of(r) == t for r, t in zip(client.requests_seen, client.tokens_seen))
+
+
+class TestEachTruncationReasonIsItsOwnReason:
+    """Four different ways a read stops short, and they are not interchangeable.
+
+    Every reason string survived mutation, so all four could have collapsed onto one — and
+    the reason is what an operator acts on. "Azure said it truncated" and "WorldGraph
+    stopped at its own ceiling" call for opposite responses: one is a query to narrow, the
+    other is a limit to raise.
+    """
+
+    def test_azure_reporting_truncation_says_azure_said_so(self):
+        result, _client = collect(
+            [FakePage([resource(0)], skip_token=None, result_truncated="true")]
+        )
+        assert result.truncation_reason == "Azure reported the result set as truncated."
+
+    def test_a_boolean_truncation_flag_is_honoured_too(self):
+        """The real SDK returns an enum, most fakes a string, some a bool. All three."""
+        for flag in ("true", "True", True):
+            result, _client = collect(
+                [FakePage([resource(0)], skip_token=None, result_truncated=flag)]
+            )
+            assert result.complete is False, flag
+
+    def test_an_unset_or_false_flag_is_not_truncation(self):
+        for flag in (None, False, "false"):
+            result, _client = collect(
+                [FakePage([resource(0)], skip_token=None, result_truncated=flag)]
+            )
+            assert result.complete is True, flag
+            assert result.truncation_reason == ""
+
+    def test_the_worldgraph_ceiling_names_worldgraph(self):
+        pages = [
+            FakePage([resource(i) for i in range(PAGE_SIZE)], skip_token=f"t{n}")
+            for n in range(MAX_RESOURCES // PAGE_SIZE + 2)
+        ]
+        result, _client = collect(pages)
+        assert result.truncation_reason == (
+            f"Collection stopped at WorldGraph's ceiling of {MAX_RESOURCES:,} "
+            "resources; this subscription holds more."
+        )
+
+    def test_the_page_budget_is_a_distinct_reason_from_the_row_ceiling(self):
+        """A source that pages forever with small pages exhausts the loop, not the ceiling."""
+        result, client = collect([FakePage([resource(0)], skip_token="always")])
+        assert result.complete is False
+        assert result.retrieved < MAX_RESOURCES
+        assert result.truncation_reason == "Collection stopped after the maximum number of pages."
+        assert client.calls == MAX_RESOURCES // PAGE_SIZE + 1
+
+    def test_the_count_mismatch_reason_quotes_both_figures(self):
+        result, _client = collect(
+            [FakePage([resource(i) for i in range(1000)], skip_token=None, total_records=5000)]
+        )
+        assert result.truncation_reason == (
+            "Azure reports 5,000 resources; 1,000 were retrieved."
+        )
+
+    def test_an_earlier_reason_is_not_overwritten_by_the_count_check(self):
+        """`reason = reason or …`. The first cause is the one that explains the stop."""
+        result, _client = collect(
+            [
+                FakePage(
+                    [resource(0)], skip_token=None, total_records=5000, result_truncated="true"
+                )
+            ]
+        )
+        assert result.complete is False
+        assert result.truncation_reason == "Azure reported the result set as truncated."
+
+    def test_a_complete_read_carries_no_reason_at_all(self):
+        result, _client = collect(
+            [FakePage([resource(i) for i in range(5)], skip_token=None, total_records=5)]
+        )
+        assert result.complete is True
+        assert result.truncation_reason == ""
+
+
+class TestASdkFailureLeaksNothing:
+    def test_only_the_exception_type_escapes(self):
+        from app.adapters.base import AdapterError
+
+        class Exploding:
+            def resources(self, request):
+                raise RuntimeError(
+                    "GET https://management.azure.com/subscriptions/"
+                    "00000000-1111-2222-3333-444444444444/resources "
+                    "failed: Authorization Bearer eyJ0eXAiOiJKV1Qi"
+                )
+
+        settings = Settings(run_mode=RunMode.OFFLINE, database_path=":memory:")
+        with pytest.raises(AdapterError) as raised:
+            asyncio.run(
+                fetch_resources(settings, live_workspace(), client_factory=Exploding)
+            )
+        message = str(raised.value)
+        assert "RuntimeError" in message
+        for leak in ("management.azure.com", "00000000-1111", "Bearer", "eyJ0eXAiOiJKV1Qi"):
+            assert leak not in message
+        # And it tells the operator what to actually do about it.
+        assert "az login" in message
+
+
+class TestTheCoverageLevelThresholds:
+    """`level()` turns a ratio into a word an operator reads as a verdict.
+
+    0.9, 0.4 and "greater than zero" all survived. A drifted threshold reports HIGH over
+    an estate that is half undeclared, which is precisely the misreading §8 exists to stop.
+    """
+
+    @staticmethod
+    def _level(count: int, total: int) -> str:
+        """Driven through `assess_coverage`, not through a copy of the threshold table."""
+        from app.adapters.azure_inventory import normalize_resource
+
+        workspace = live_workspace()
+        resources = []
+        for index in range(total):
+            row = resource(index)
+            if index < count:
+                row["tags"] = {"worldgraph.criticality": "CRITICAL"}
+            resources.append(row)
+        entities = [normalize_resource(r, workspace)[0] for r in resources]
+        entities = [e for e in entities if e is not None]
+        rows = assess_coverage(entities, [], {})
+        return next(r for r in rows if r.dimension == "criticality").level
+
+    @pytest.mark.parametrize(
+        ("count", "total", "expected"),
+        [
+            (10, 10, "HIGH"),      # 1.00
+            (9, 10, "HIGH"),       # 0.90 — the boundary is inclusive
+            (89, 100, "PARTIAL"),  # 0.89 — one below it
+            (4, 10, "PARTIAL"),    # 0.40 — inclusive here too
+            (39, 100, "LOW"),      # 0.39
+            (1, 100, "LOW"),       # anything above nothing is LOW, never NONE
+            (0, 10, "NONE"),       # nothing declared is NONE, never LOW
+        ],
+    )
+    def test_the_bands_sit_where_they_claim_to(self, count, total, expected):
+        assert self._level(count, total) == expected
+
+    def test_an_empty_estate_reports_none_rather_than_dividing_by_zero(self):
+        rows = assess_coverage([], [], {})
+        assert {r.level for r in rows} == {"NONE"}
+
+
+class TestTheCollectionRowWordsItsOwnUncertainty:
+    @staticmethod
+    def _collection_row(collection):
+        rows = assess_coverage([], [], {}, collection=collection)
+        return next(r for r in rows if r.dimension == "collection")
+
+    def test_a_complete_read_states_both_figures(self):
+        row = self._collection_row(
+            Collection(resources=[resource(0)], reported_total=1, complete=True)
+        )
+        assert row.level == "HIGH"
+        assert row.detail == "1 of 1 resources retrieved"
+        assert row.remedy == ""
+
+    def test_a_complete_read_with_no_reported_total_omits_the_denominator(self):
+        """It must not invent one, and must not print "1 of None"."""
+        row = self._collection_row(
+            Collection(resources=[resource(0)], reported_total=None, complete=True)
+        )
+        assert row.detail == "1 resources retrieved"
+        assert "None" not in row.detail
+
+    def test_an_incomplete_read_with_an_unknown_total_says_unknown(self):
+        row = self._collection_row(
+            Collection(resources=[resource(0)], reported_total=None, complete=False)
+        )
+        assert row.level == "LOW"
+        assert row.detail == "INCOMPLETE — 1 of an unknown number of resources retrieved"
+        # With no reason from the source, the remedy still warns off every figure below.
+        assert row.remedy == (
+            "Collection stopped short. Every figure below describes only what was "
+            "retrieved, not the estate."
+        )
+
+    def test_a_source_supplied_reason_replaces_the_generic_remedy(self):
+        row = self._collection_row(
+            Collection(
+                resources=[resource(0)],
+                reported_total=5000,
+                complete=False,
+                truncation_reason="Azure reported the result set as truncated.",
+            )
+        )
+        assert row.remedy == "Azure reported the result set as truncated."
+        assert row.detail == "INCOMPLETE — 1 of 5000 resources retrieved"

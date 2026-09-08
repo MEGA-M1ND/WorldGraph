@@ -285,6 +285,28 @@ class TestRateLimiter:
         _allowed, _remaining, retry_after = limiter.check("a")
         assert 0 < retry_after <= 2.0
 
+    def test_the_default_window_is_a_minute(self):
+        """`limit_per_minute` has to mean per minute, so the default window is 60s."""
+        limiter = RateLimiter(limit_per_minute=1)
+        limiter.check("a")
+        _allowed, _remaining, retry_after = limiter.check("a")
+        assert 59.0 < retry_after <= 60.0
+
+    def test_a_sub_second_delay_is_reported_as_itself(self):
+        """`max(0.0, …)` is a floor of zero, not of one — it must not round a short wait up."""
+        limiter = RateLimiter(limit_per_minute=1, window_seconds=0.5)
+        limiter.check("a")
+        _allowed, _remaining, retry_after = limiter.check("a")
+        assert 0 < retry_after <= 0.5
+
+    def test_the_delay_is_reported_to_one_decimal(self):
+        """It goes in a Retry-After header. Clock jitter past the first decimal is noise."""
+        limiter = RateLimiter(limit_per_minute=1, window_seconds=5.0)
+        limiter.check("a")
+        _allowed, _remaining, retry_after = limiter.check("a")
+        assert retry_after == round(retry_after, 1)
+        assert 4.5 <= retry_after <= 5.0
+
     def test_a_nonsensical_limit_still_admits_one_request(self):
         """`max(1, …)`: a limit of 0 would lock the endpoint out entirely."""
         for configured in (0, -5):
