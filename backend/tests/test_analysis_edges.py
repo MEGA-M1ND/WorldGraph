@@ -341,3 +341,157 @@ class TestConfidenceReflectsWhereTheDataCameFrom:
         ))
         notes = provenance_notes(WorldGraph([live], []))
         assert not any("mixes live inventory" in note for note in notes)
+
+
+class TestImpactDirectionAndCycleBounds:
+    """Which way failure flows along each edge type, and the bound on cycle enumeration."""
+
+    @staticmethod
+    def _edge(source: str, target: str, edge_type: DependencyType) -> DependencyEdge:
+        return DependencyEdge(
+            id=f"{source}--{edge_type.value}--{target}",
+            source_entity_id=source,
+            target_entity_id=target,
+            type=edge_type,
+        )
+
+    def test_a_replica_failing_does_not_take_down_its_primary(self):
+        """That asymmetry is the whole point of a replica.
+
+        `primary REPLICATES_TO standby` — the standby degrading must not propagate back.
+        """
+        graph = WorldGraph(
+            [_entity("primary"), _entity("standby")],
+            [self._edge("primary", "standby", DependencyType.REPLICATES_TO)],
+        )
+        assert graph._failure_successors("standby", None) == []
+        # And the primary's own dependents are unaffected by the replica edge.
+        assert graph._failure_successors("primary", None) == []
+
+    def test_a_dependent_is_impacted_when_what_it_needs_fails(self):
+        graph = WorldGraph(
+            [_entity("app"), _entity("db")],
+            [self._edge("app", "db", DependencyType.DEPENDS_ON)],
+        )
+        assert graph._failure_successors("db", None) == [("app", DependencyType.DEPENDS_ON)]
+
+    def test_a_served_customer_region_is_impacted_by_the_service(self):
+        """SERVES points forward: the region suffers when the service does."""
+        graph = WorldGraph(
+            [_entity("svc"), _entity("apac", type=EntityType.CUSTOMER_REGION)],
+            [self._edge("svc", "apac", DependencyType.SERVES)],
+        )
+        assert graph._failure_successors("svc", None) == [("apac", DependencyType.SERVES)]
+
+    def test_an_edge_type_filter_narrows_both_directions(self):
+        graph = WorldGraph(
+            [_entity("app"), _entity("db"), _entity("apac", type=EntityType.CUSTOMER_REGION)],
+            [
+                self._edge("app", "db", DependencyType.DEPENDS_ON),
+                self._edge("app", "apac", DependencyType.SERVES),
+            ],
+        )
+        assert graph._failure_successors("app", frozenset({DependencyType.SERVES})) == [
+            ("apac", DependencyType.SERVES)
+        ]
+        assert graph._failure_successors("db", frozenset({DependencyType.SERVES})) == []
+        assert graph._failure_successors("db", frozenset({DependencyType.DEPENDS_ON})) == [
+            ("app", DependencyType.DEPENDS_ON)
+        ]
+
+    def test_cycle_enumeration_is_bounded(self):
+        """`simple_cycles` is exponential in the worst case; a UI needs the first handful."""
+        entities = [_entity(f"n{i}") for i in range(8)]
+        edges = [
+            self._edge(f"n{i}", f"n{(i + step) % 8}", DependencyType.DEPENDS_ON)
+            for step in (1, 2, 3)
+            for i in range(8)
+        ]
+        graph = WorldGraph(entities, edges)
+        assert len(graph.cycles(limit=3)) == 3
+        assert len(graph.cycles(limit=1)) == 1
+        # The bound is a ceiling, not a target: an acyclic graph returns nothing.
+        acyclic = WorldGraph(
+            [_entity("a"), _entity("b")],
+            [self._edge("a", "b", DependencyType.DEPENDS_ON)],
+        )
+        assert acyclic.cycles() == []
+
+
+class TestTheBlastRadiusExplanation:
+    """Explanations say what could not be computed in the same breath as what could."""
+
+    @staticmethod
+    def _estate() -> WorldGraph:
+        return WorldGraph(
+            [
+                _entity("app", health=HealthState.DOWN),
+                _entity("db"),
+                _entity("region", type=EntityType.CLOUD_REGION),
+            ],
+            [
+                DependencyEdge(
+                    id="app--DEPENDS_ON--db",
+                    source_entity_id="app",
+                    target_entity_id="db",
+                    type=DependencyType.DEPENDS_ON,
+                    criticality=1.0,
+                ),
+                DependencyEdge(
+                    id="db--HOSTED_IN--region",
+                    source_entity_id="db",
+                    target_entity_id="region",
+                    type=DependencyType.HOSTED_IN,
+                    criticality=1.0,
+                ),
+            ],
+        )
+
+    def test_a_pinned_origin_cannot_be_healed_by_its_own_dependencies(self):
+        """"Singapore is DOWN" must not quietly become "Singapore is mostly up".
+
+        A pinned entity is a boundary condition, so the solver never attributes a
+        dominant cause to it. **That makes `_explain`'s "largest single dependency loss"
+        branch unreachable through `calculate_blast_radius`**, which pins every origin —
+        the line can never appear in an analysis. Recorded here rather than worked around:
+        the invariant below is real and worth pinning, and the dead branch is a finding
+        for the author to decide about, not something a test should paper over.
+        """
+        from app.analysis.blast_radius import calculate_blast_radius
+
+        graph = self._estate()
+        state = propagate(graph, initial_availability={"region": 0.0})
+        # Unpinned, `app` does have a dominant cause: it is down because `db` is.
+        assert state.dominant_cause["app"] == ("db", 1.0)
+
+        # Pinned as an origin, it has none — and so the explanation never fires.
+        pinned_state = propagate(graph, initial_availability={"region": 0.0, "app": 0.0})
+        assert "app" not in pinned_state.dominant_cause
+
+        result = calculate_blast_radius(
+            graph, origin_ids=["region", "app"], origin_kind="ENTITY"
+        )
+        assert not any("largest single dependency loss" in line for line in result.explanations)
+
+    def test_an_unknown_origin_is_refused_rather_than_analysed_as_nothing(self):
+        """The guard that makes "No origin entity resolved." unreachable.
+
+        That line stays uncovered on purpose: `origins` is non-empty by the time
+        explanations are built, because this raise is what guarantees it. Reaching the
+        line would mean removing the guard.
+        """
+        from app.analysis.blast_radius import calculate_blast_radius
+
+        graph = WorldGraph([_entity("a")], [])
+        for origins in ([], ["ghost"], ["ghost", "phantom"]):
+            with pytest.raises(KeyError) as error:
+                calculate_blast_radius(graph, origin_ids=origins, origin_kind="ENTITY")
+            assert "no known origin entities" in str(error.value)
+
+    def test_every_explanation_carries_the_modelled_estimate_marker(self):
+        from app.analysis.blast_radius import calculate_blast_radius
+
+        result = calculate_blast_radius(
+            self._estate(), origin_ids=["region"], origin_kind="ENTITY"
+        )
+        assert any("MODELLED ESTIMATE" in line for line in result.explanations)

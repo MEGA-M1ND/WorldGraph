@@ -963,3 +963,80 @@ class TestStartupAndEventLookup:
             f"{world.workspace.name} online in {world.settings.run_mode.value} mode — "
             f"{len(world.graph)} entities, {len(world._events)} events."
         )
+
+
+class TestStartupSurvivesABrokenFeed:
+    """A feed that cannot start must not stop the application.
+
+    The `try/except` around `adapter.start()` was uncovered. Without it — or with it
+    swallowing the wrong thing — one unreachable upstream at boot takes the whole product
+    down, which is the opposite of what a resilience tool should do about a partial
+    outage.
+    """
+
+    @pytest.mark.anyio
+    async def test_an_adapter_that_fails_to_start_is_logged_and_stepped_over(self, world, caplog):
+        import logging
+
+        from app.adapters.fixtures import ReplayEventAdapter
+
+        class Broken(ReplayEventAdapter):
+            id = "broken-feed"
+
+            async def start(self):
+                raise RuntimeError("upstream refused the connection")
+
+        fresh = type(world)(world.settings, world.repository)
+        fresh._adapters = [Broken()]
+        fresh._register_adapters = lambda: None
+        with caplog.at_level(logging.WARNING, logger="worldgraph.state"):
+            await fresh.startup()
+        try:
+            assert "adapter_start_failed" in caplog.text
+            assert "broken-feed" in caplog.text
+            # The world still came up.
+            assert len(fresh.graph) > 0
+            assert any(e.stage == "ingest" for e in fresh.timeline())
+        finally:
+            await fresh.shutdown()
+
+    @pytest.mark.anyio
+    async def test_starting_twice_does_not_ingest_twice(self, world):
+        """`if self._started: return`. A second startup would duplicate every feed record."""
+        before_events = len(world._events)
+        before_entities = len(world.graph)
+        await world.startup()
+        assert len(world._events) == before_events
+        assert len(world.graph) == before_entities
+
+    @pytest.mark.anyio
+    async def test_live_mode_registers_the_live_feeds_and_demo_mode_does_not(self, world):
+        from app.adapters.kev import CisaKevAdapter
+        from app.adapters.usgs import UsgsEarthquakeAdapter
+        from app.config import RunMode
+
+        demo_ids = {type(a) for a in world._adapters}
+        assert UsgsEarthquakeAdapter not in demo_ids
+        assert CisaKevAdapter not in demo_ids
+
+        live = type(world)(
+            world.settings.model_copy(update={"run_mode": RunMode.LIVE}), world.repository
+        )
+        live._register_adapters()
+        live_types = {type(a) for a in live._adapters}
+        assert UsgsEarthquakeAdapter in live_types
+        assert CisaKevAdapter in live_types
+
+    @pytest.mark.anyio
+    async def test_entities_an_adapter_carries_are_ingested_into_the_graph(self, world):
+        """A feed may bring entities as well as events — a supplier, a facility."""
+        from app.adapters.fixtures import ReplayEventAdapter
+
+        class WithEntity(ReplayEventAdapter):
+            id = "entity-feed"
+
+            def get_entities(self):
+                return [_asset("feed-brought-this")]
+
+        world._ingest_from(WithEntity())
+        assert world.graph.entity("feed-brought-this") is not None

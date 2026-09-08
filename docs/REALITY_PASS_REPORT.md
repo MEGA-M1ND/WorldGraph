@@ -28,7 +28,7 @@ what they cost, and the section that matters most is [§9](#9-what-is-still-not-
 > comparison and boolean in the code under audit and asking whether any test notices. It
 > found that the nine prompt-injection patterns, the reachability factor in CVE scoring,
 > and the function that *is* workspace isolation were all unprotected, and that an
-> exception's text bypassed log redaction entirely. 597 tests → 1,351.
+> exception's text bypassed log redaction entirely. 597 tests → 1,413, 92 % → 99 % coverage.
 
 ---
 
@@ -619,8 +619,8 @@ that string with an `X` on the end — and the whole suite was run against each.
 that no test notices is a behaviour no test protects. That is not an opinion about test
 quality; it is a decision procedure with a yes or no answer.
 
-The suite went from **597 tests to 1,351** as a result, plus 32 → 39 on the frontend, and
-backend line coverage from 92 % to 98 %. Almost none of that is new product code — one line
+The suite went from **597 tests to 1,413** as a result, plus 32 → 39 on the frontend, and
+backend line coverage from 92 % to 99 %. Almost none of that is new product code — one line
 is, and §13.5 is about that line. The rest is behaviour that was already shipping and could
 have been altered silently.
 
@@ -757,6 +757,26 @@ strictly more productive to chase: `storage/repository.py` (76 %), `ai/tools.py`
 methods and error paths that no test called — persistence, the tool failure surface, the
 model-backed analyst, feed error sanitisation, and every HTTP 404 and 422 the frontend codes
 against.
+
+### 13.6 — a second finding: an explanation that can never fire
+
+Chasing the last uncovered lines in `analysis/blast_radius.py` turned up dead code rather
+than a missing test.
+
+`_explain` builds a line reading *"X's largest single dependency loss comes from Y"* by
+looking up each origin in the propagation state's `dominant_cause` map. It never fires.
+`calculate_blast_radius` pins every origin, a pinned entity is a boundary condition the
+solver deliberately refuses to attribute a cause to — *"otherwise 'Singapore is DOWN' would
+quietly become 'mostly up'"* — and `_explain` has exactly one caller. So the branch is
+unreachable, and `dominant_cause` is computed by the propagation engine and consumed
+nowhere.
+
+This is not a wrong answer, it is a missing one: an explanation somebody wrote and nobody
+has ever seen. It is recorded rather than fixed, because making it fire is a change to what
+every analysis says, and that is a product decision rather than a test one.
+
+The invariant underneath it — a pinned origin cannot be healed by its own dependencies — is
+real and is now pinned by a test. The dead branch is left as it is, named here.
 
 ### The honest limit of this
 
