@@ -488,3 +488,133 @@ class TestTheBlastRadiusRenderingKeepsItsQualifiers:
         assert "Indirectly exposed (1):" in rendered
         assert "  payments-api — 25% availability" in rendered
         assert "  checkout-platform — 40% (depth 2)" in rendered
+
+
+class TestTheDirectivesAndFiltersBehindAnAnswer:
+    """What the router asks for, and what it tells the UI to show.
+
+    These are not prose. A criticality filter with the wrong value returns a different set
+    of entities; a traversal depth decides how much of the estate an answer covers; an
+    emitted directive is what actually moves the globe. Re-running the mutation harness
+    after the first router batch left these still standing.
+    """
+
+    @staticmethod
+    def _run(world, question: str):
+        return IntentRouter(ToolContext(state=world)).handle(question)
+
+    @pytest.mark.anyio
+    async def test_the_critical_listing_filters_on_criticality_not_on_something_else(
+        self, world
+    ):
+        result = self._run(world, "show me our critical infrastructure")
+        listed = {
+            line.split("  [")[0].strip()
+            for line in result.answer.splitlines()
+            if line.startswith("  ")
+        }
+        expected = {
+            e.name for e in world.entities() if e.criticality.value == "CRITICAL"
+        }
+        assert listed == expected
+        assert result.answer.startswith(f"{len(expected)} CRITICAL entities in this workspace:")
+
+    @pytest.mark.anyio
+    async def test_the_critical_listing_turns_the_dependency_layer_on(self, world):
+        result = self._run(world, "show me our critical infrastructure")
+        kinds = {d["kind"] for d in result.directives}
+        assert "annotate" in kinds
+        layer = next(d for d in result.directives if d["kind"] == "show_layer")
+        assert layer["layer"] == "dependencies"
+        assert layer["visible"] is True
+
+    @pytest.mark.anyio
+    async def test_a_dependency_answer_reaches_four_hops(self, world):
+        """`max_depth=4`. A shallower traversal quietly answers a smaller question."""
+        answer = self._run(world, "what depends on cloud-region-singapore?").answer
+        depths = {
+            int(line.split("(depth ")[1].rstrip(")"))
+            for line in answer.splitlines()
+            if "(depth " in line
+        }
+        assert depths, "the demo estate must cascade at least one hop"
+        assert max(depths) <= 4
+        assert min(depths) == 1, "depth 0 is the origin and must not be listed"
+
+    @pytest.mark.anyio
+    async def test_an_entity_lookup_flies_the_camera_to_a_located_entity(self, world):
+        located = next(e for e in world.entities() if e.location is not None)
+        result = self._run(world, f"tell me about {located.name}")
+        assert result.answer.startswith(f"{located.name} — {located.type.value}")
+        assert any(call["tool"] == "focus_entity" for call in result.tool_calls)
+
+    @pytest.mark.anyio
+    async def test_an_unlocated_entity_does_not_move_the_camera(self, world):
+        """The shape an Azure import produces for a resource in an unmapped region."""
+        from app.graph.world_graph import WorldGraph
+        from app.models.core import (
+            BusinessProfile,
+            DataMode,
+            DataSourceInfo,
+            EntityType,
+            ExposureProfile,
+            WorldEntity,
+        )
+
+        world.graph = WorldGraph(
+            [
+                WorldEntity(
+                    id="ghostwriter",
+                    type=EntityType.APPLICATION,
+                    name="ghostwriter",
+                    source=DataSourceInfo(source_id="s", source_name="S", mode=DataMode.LIVE),
+                    location=None,
+                    business=BusinessProfile(region="westeurope"),
+                    exposure=ExposureProfile(internet_facing=False, network_zone="z"),
+                )
+            ],
+            [],
+        )
+        result = self._run(world, "tell me about ghostwriter")
+        assert result.answer.startswith("ghostwriter — APPLICATION")
+        assert not any(call["tool"] == "focus_entity" for call in result.tool_calls)
+
+    @pytest.mark.anyio
+    async def test_a_declined_question_is_marked_as_declined(self, world):
+        """`matched` is how the caller tells "no answer" from "an answer of no"."""
+        assert self._run(world, "what is the capital of France").matched is False
+        assert self._run(world, "show me our critical infrastructure").matched is True
+
+
+class TestThePlanRendering:
+    @pytest.mark.anyio
+    async def test_actions_are_numbered_from_one_and_carry_their_rationale(self, world):
+        event_id = next(iter(world._events))
+        router = IntentRouter(ToolContext(state=world, selected_event_id=event_id))
+        router.handle("investigate this event")
+        answer = IntentRouter(
+            ToolContext(state=world, selected_event_id=event_id)
+        ).handle("what should we do about it?").answer
+
+        lines = answer.splitlines()
+        assert lines[0] == "RESPONSE PLAN"
+        numbered = [line for line in lines if line[:2] in {"1.", "2.", "3.", "4.", "5."}]
+        assert numbered, "a plan with no actions is not a plan"
+        assert numbered[0].startswith("1. [")
+        # Every action states why, and how sure, as a percentage.
+        assert sum(1 for line in lines if line.startswith("   Why: ")) == len(numbered)
+        confidences = [line for line in lines if line.startswith("   Confidence ")]
+        assert len(confidences) == len(numbered)
+        assert all(line.rstrip().split()[1].endswith("%") for line in confidences)
+
+    @pytest.mark.anyio
+    async def test_a_plan_states_its_assumptions_under_their_own_heading(self, world):
+        event_id = next(iter(world._events))
+        router = IntentRouter(ToolContext(state=world, selected_event_id=event_id))
+        router.handle("investigate this event")
+        answer = IntentRouter(
+            ToolContext(state=world, selected_event_id=event_id)
+        ).handle("what should we do about it?").answer
+        assert "Assumptions:" in answer
+        assumption_lines = [line for line in answer.splitlines() if line.startswith("  - ")]
+        assert assumption_lines

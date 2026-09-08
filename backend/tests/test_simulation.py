@@ -396,15 +396,23 @@ class TestOverrideBuildersAndTouch:
     def test_a_built_override_is_identifiable_and_unique(self, atlaspay_graph: WorldGraph):
         first = override_for_health("payments-api", HealthState.DOWN)
         second = override_for_health("payments-api", HealthState.DOWN)
-        assert first.id.startswith("ovr-") and second.id.startswith("ovr-")
+        # `startswith("ovr-")` is not enough: it also passes for "ovr-Xdeadbeef". The
+        # whole shape, or the prefix can drift with nothing failing — which is what
+        # re-running the mutation harness against this very test found.
+        import re
+
+        assert re.fullmatch(r"ovr-[0-9a-f]{10}", first.id), first.id
+        assert re.fullmatch(r"ovr-[0-9a-f]{10}", second.id), second.id
         assert first.id != second.id, "two overrides sharing an id would overwrite each other"
         assert first.kind is OverrideKind.ENTITY_HEALTH
         assert first.health is HealthState.DOWN
         assert first.capacity is None
 
     def test_a_capacity_override_carries_capacity_and_no_health(self):
+        import re
+
         override = override_for_capacity("payments-api", 0.4, note="half a region")
-        assert override.id.startswith("ovr-")
+        assert re.fullmatch(r"ovr-[0-9a-f]{10}", override.id), override.id
         assert override.kind is OverrideKind.ENTITY_CAPACITY
         assert override.capacity == 0.4
         assert override.health is None

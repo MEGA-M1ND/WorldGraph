@@ -642,3 +642,152 @@ class TestWhatCountsAsAnActiveIncident:
         bare = _physical_event(location=None, radius_km=0.0)
         assert bare.metadata == {}
         assert not world._correlates(bare)
+
+
+class TestTheAvailabilityMoveIsQuotedInFull:
+    """"availability 100.00% → 90.45%", against whichever figure the estate supports.
+
+    Re-running the mutation harness after the first pass left the percentages and the
+    fallback branch standing: the simulate line's prefix and suffix were pinned, the number
+    in the middle was not. Reporting an infrastructure figure under a customer heading is
+    the same fabrication in a different sentence, so both halves are pinned here.
+    """
+
+    @staticmethod
+    def _metrics(availability, infrastructure):
+        from app.models.analysis import WorldSnapshotMetrics
+
+        return WorldSnapshotMetrics(
+            availability=availability, infrastructure_availability=infrastructure
+        )
+
+    def test_a_customer_figure_is_quoted_when_the_estate_has_one(self):
+        from app.services.world_state import _availability_move
+
+        assert _availability_move(
+            self._metrics(1.0, 1.0), self._metrics(0.9045, 0.8)
+        ) == "availability 100.00% → 90.45%"
+
+    def test_without_one_the_infrastructure_figure_is_relabelled_not_borrowed(self):
+        from app.services.world_state import _availability_move
+
+        assert _availability_move(
+            self._metrics(None, 1.0), self._metrics(None, 0.9045)
+        ) == (
+            "infrastructure availability 100.00% → 90.45% "
+            "(customer-experienced availability UNKNOWN for this workspace)"
+        )
+
+    def test_one_missing_side_is_enough_to_fall_back(self):
+        """A baseline with customers and a simulation without is not a comparison."""
+        from app.services.world_state import _availability_move
+
+        assert "infrastructure availability" in _availability_move(
+            self._metrics(1.0, 1.0), self._metrics(None, 0.9)
+        )
+        assert "infrastructure availability" in _availability_move(
+            self._metrics(None, 1.0), self._metrics(0.9, 0.9)
+        )
+
+    def test_two_decimals_because_that_is_where_availability_lives(self):
+        from app.services.world_state import _availability_move
+
+        move = _availability_move(self._metrics(0.9999, 1.0), self._metrics(0.999, 1.0))
+        assert move == "availability 99.99% → 99.90%"
+
+
+class TestTheDashboardCountsWhatItSaysItCounts:
+    @pytest.mark.anyio
+    async def test_infrastructure_assets_exclude_the_things_that_are_not_infrastructure(
+        self, world
+    ):
+        """An organization node and a customer region are not assets an operator runs."""
+        counted = world.dashboard()["infrastructure_assets"]
+        excluded = {"ORGANIZATION", "CUSTOMER_REGION", "SECURITY_FINDING", "WORLD_EVENT"}
+        expected = sum(1 for e in world.entities() if e.type.value not in excluded)
+        assert counted == expected
+        assert counted < len(world.entities()), "the demo estate has an organization node"
+
+    @pytest.mark.anyio
+    async def test_critical_services_counts_workloads_not_sites(self, world):
+        counted = world.dashboard()["critical_services"]
+        wanted = {"BUSINESS_SERVICE", "APPLICATION", "MICROSERVICE", "DATABASE"}
+        expected = sum(
+            1
+            for e in world.entities()
+            if e.criticality.value == "CRITICAL" and e.type.value in wanted
+        )
+        assert counted == expected
+        # A datacenter can be CRITICAL without being a service.
+        assert counted < sum(1 for e in world.entities() if e.criticality.value == "CRITICAL")
+
+
+class TestTheQueryDefaults:
+    @pytest.mark.anyio
+    async def test_the_timeline_default_limit_is_a_hundred(self, world):
+        world._timeline.clear()
+        for index in range(140):
+            world._record_timeline(stage="test", message=f"entry {index}")
+        assert len(world.timeline()) == 100
+        assert len(world.timeline(limit=140)) == 140
+
+    @pytest.mark.anyio
+    async def test_material_risks_read_a_bounded_window_of_events(self, world):
+        """`events(limit=50)`. Unbounded, one noisy feed would dominate the risk list."""
+        import app.services.world_state as module
+
+        seen: dict[str, int] = {}
+        original = module.material_risks
+
+        def spy(graph, events):
+            seen["count"] = len(events)
+            return original(graph, events)
+
+        module.material_risks = spy
+        try:
+            for index in range(80):
+                event = _cve_event(f"CVE-2024-{index:04d}")
+                event.id = f"noise-{index}"
+                world._events[event.id] = event
+            world.material_risks()
+        finally:
+            module.material_risks = original
+        assert seen["count"] == 50
+
+
+class TestCorrelationByProductNameAlone:
+    @pytest.mark.anyio
+    async def test_an_event_with_product_names_and_no_cve_still_correlates(self, world):
+        """A KEV entry can name a product before a CVE id is assigned to the estate."""
+        world.graph = WorldGraph(
+            [_asset("web", software=[SoftwareComponent(name="nginx", version="1.0")])], []
+        )
+        event = _cve_event()
+        event.metadata = {"product_names": ["nginx"]}
+        assert world._correlates(event)
+
+        event.metadata = {"product_names": ["postgres"]}
+        assert not world._correlates(event)
+
+    @pytest.mark.anyio
+    async def test_a_malformed_product_list_does_not_correlate_by_accident(self, world):
+        world.graph = WorldGraph(
+            [_asset("web", software=[SoftwareComponent(name="nginx", version="1.0")])], []
+        )
+        event = _cve_event()
+        event.metadata = {"product_names": "nginx"}  # a string, not a list
+        assert not world._correlates(event)
+
+
+class TestChangesSinceOrdersEventsNewestFirst:
+    @pytest.mark.anyio
+    async def test_the_newest_event_leads(self, world):
+        world._events.clear()
+        for index in range(5):
+            event = _cve_event(f"CVE-2024-{index:04d}")
+            event.id = f"seq-{index}"
+            event.occurred_at = utcnow() - timedelta(minutes=index)
+            event.source.ingested_at = utcnow()
+            world._events[event.id] = event
+        events = world.changes_since(timedelta(hours=1))["new_events"]
+        assert [e.id for e in events] == ["seq-0", "seq-1", "seq-2", "seq-3", "seq-4"]
