@@ -185,6 +185,12 @@ class TestIdentifierSlugs:
         assert sanitize_identifier("_abc_") == "abc"
         assert sanitize_identifier("a_b") == "a_b"
 
+    def test_only_separators_are_trimmed_never_ordinary_characters(self):
+        """The strip set is exactly `-._:`. A wider one eats the first letter of an id."""
+        assert sanitize_identifier("xabcx") == "xabcx"
+        assert sanitize_identifier("Xevent-1X") == "Xevent-1X"
+        assert sanitize_identifier("0abc9") == "0abc9"
+
     def test_an_id_that_reduces_to_nothing_becomes_unknown(self):
         """An empty id would collide with every other empty id."""
         assert sanitize_identifier("") == "unknown"
