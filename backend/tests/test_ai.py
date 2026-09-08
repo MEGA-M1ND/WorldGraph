@@ -11,7 +11,7 @@ import pytest
 
 from app.ai.analyst import DeterministicAnalyst, analyst_status
 from app.ai.prompts import SYSTEM_PROMPT
-from app.ai.router import IntentRouter
+from app.ai.router import IntentRouter, _reachability_headline, _render_path
 from app.ai.tools import TOOLS, ToolContext, ToolError, run_tool, tool_definitions
 from app.config import RunMode, Settings
 from app.security.sanitize import (
@@ -302,3 +302,67 @@ class TestDeterministicAnalyst:
         for directive in answer.directives:
             for entity_id in directive.get("entity_ids", []):
                 assert world.entity(entity_id) is not None
+
+
+class TestReachabilityRendering:
+    """How attack paths are worded for the operator.
+
+    This is the presentation half of the attack-path evidence work: the engine labels each
+    hop, and these two functions are what an operator actually reads. Mutation testing
+    found them unpinned — the established/inferred split could collapse back into one
+    total, and the per-path basis label could invert, putting `[ESTABLISHED]` on a route
+    that rests on an inferred trust hop.
+
+    Nothing in the unit suite mentioned either label before this. Only the browser test
+    touched them, and indirectly.
+    """
+
+    def test_the_headline_never_states_one_combined_total(self):
+        """Compared whole, not by substring.
+
+        `assert "1 established" in headline` passes against "1 establishedX" — appending a
+        character to the word slips straight through a containment check. It survived
+        mutation for exactly that reason.
+        """
+        assert _reachability_headline(
+            {"count": 22, "established_count": 1, "inferred_count": 21}
+        ) == "22 reachability paths from the public internet (1 established, 21 inferred):"
+
+    def test_all_established_says_so_without_mentioning_inference(self):
+        assert (
+            _reachability_headline({"count": 3, "established_count": 3, "inferred_count": 0})
+            == "3 reachability paths from the public internet (3 established):"
+        )
+
+    def test_a_tool_result_without_the_split_falls_back_to_the_bare_count(self):
+        """The `is None` guard. It must not invent a split it was not given."""
+        headline = _reachability_headline({"count": 5})
+        assert headline == "5 reachability paths from the public internet:"
+        assert "established" not in headline
+
+    def test_a_partial_split_is_treated_as_no_split(self):
+        assert "established" not in _reachability_headline({"count": 5, "established_count": 2})
+        assert "established" not in _reachability_headline({"count": 5, "inferred_count": 2})
+
+    @pytest.mark.parametrize(
+        ("basis", "expected"),
+        [("INFERRED", "[INFERRED]"), ("ESTABLISHED", "[ESTABLISHED]"), (None, "[ESTABLISHED]")],
+    )
+    def test_each_path_carries_its_basis(self, basis, expected: str):
+        rendered = _render_path({"names": ["internet", "admin-api"], "basis": basis})
+        assert expected in rendered
+        assert "internet → admin-api" in rendered
+
+    def test_an_inferred_path_is_never_labelled_established(self):
+        """The inversion that would undo the whole distinction."""
+        rendered = _render_path({"names": ["a", "b"], "basis": "INFERRED"})
+        assert "[ESTABLISHED]" not in rendered
+
+    def test_the_router_answer_keeps_the_split_and_the_disclaimer(self, world):
+        answer = IntentRouter(ToolContext(state=world)).handle(
+            "which vulnerable systems can reach payments?"
+        ).answer
+        assert "established" in answer and "inferred" in answer
+        assert "[ESTABLISHED]" in answer
+        assert "[INFERRED]" in answer
+        assert "not proof of exploitability" in answer.lower()
