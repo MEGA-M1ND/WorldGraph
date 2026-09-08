@@ -184,3 +184,80 @@ class TestTheFormatterItself:
             record.exc_info = sys.exc_info()
         line = JsonFormatter().format(record)
         assert API_KEY not in line
+
+
+class TestTheUnhandledErrorHandler:
+    """The one place a stack trace and a user-facing response meet.
+
+    This is the call site the exception-redaction fix exists for, and it was untested.
+    Two properties: the browser gets a specific message and never the traceback, and the
+    log gets the traceback with any credential in it scrubbed.
+    """
+
+    @staticmethod
+    def _app_that_explodes(message: str):
+        from fastapi.testclient import TestClient
+
+        from app.config import RunMode, Settings
+        from app.main import create_app
+        from app.storage.repository import SqliteRepository
+
+        settings = Settings(
+            run_mode=RunMode.DEMO,
+            database_path=":memory:",
+            anthropic_api_key=None,
+            cesium_ion_token=None,
+            google_maps_api_key=None,
+        )
+        app = create_app(settings, SqliteRepository(":memory:"))
+
+        @app.get("/api/_probe_explode")
+        def explode():
+            raise RuntimeError(message)
+
+        return TestClient(app, raise_server_exceptions=False)
+
+    def test_the_browser_gets_a_specific_message_and_no_traceback(self):
+        """"Something went wrong" is banned; so is a stack trace in a response body."""
+        with self._app_that_explodes("boom at /srv/app/secret_path.py") as client:
+            response = client.get("/api/_probe_explode")
+        assert response.status_code == 500
+        body = response.json()
+        assert body["operation"] == "/api/_probe_explode"
+        assert "GET /api/_probe_explode" in body["detail"]
+        assert "remain available" in body["detail"]
+        for leak in ("Traceback", "RuntimeError", "/srv/app/secret_path.py"):
+            assert leak not in response.text
+
+    def test_the_log_gets_the_traceback_with_its_credential_scrubbed(self):
+        """The fix, exercised through the call site rather than the formatter.
+
+        `caplog` does not see this: the app installs its own handler on the `worldgraph`
+        logger, so the record is captured the way production captures it.
+        """
+        import logging
+
+        captured: list[logging.LogRecord] = []
+
+        class Capture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                captured.append(record)
+
+        handler = Capture()
+        logging.getLogger("worldgraph").addHandler(handler)
+        try:
+            with self._app_that_explodes(f"auth failed for {API_KEY}") as client:
+                client.get("/api/_probe_explode")
+        finally:
+            logging.getLogger("worldgraph").removeHandler(handler)
+
+        formatter = JsonFormatter()
+        records = [r for r in captured if r.getMessage() == "unhandled_error"]
+        assert records, "the handler must log, not swallow"
+        line = formatter.format(records[0])
+        assert "unhandled_error" in line
+        assert "/api/_probe_explode" in line
+        # The traceback is there — and the key in it is not.
+        assert "RuntimeError" in line
+        assert API_KEY not in line
+        assert "[redacted]" in line

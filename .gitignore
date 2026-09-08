@@ -35,3 +35,8 @@ screenshots/
 
 # Playwright browser override used by the local E2E runner
 .playwright-env
+
+# Coverage database, written by the audit tooling. Generated, never committed.
+.coverage
+.coverage.*
+htmlcov/

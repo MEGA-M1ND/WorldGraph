@@ -247,3 +247,94 @@ class TestImportSummaryArithmetic:
     def test_a_fully_supported_import_reports_one(self):
         summary = self._summary(resources_discovered=10, resources_supported=10)
         assert summary.support_rate == 1.0
+
+
+class TestInventoryCoverageArithmetic:
+    """Whether "nothing is affected" is a statement this estate can support.
+
+    `supports_negative_conclusion` is the gate on the whole INSUFFICIENT_DATA path, and
+    its zero-guard and its threshold were uncovered. Getting either wrong turns "we could
+    not look" back into "we looked and found nothing", which is the defect §12 records as
+    #4 and the one this report calls its central finding.
+    """
+
+    @staticmethod
+    def _coverage(with_inventory: int, assessable: int):
+        from app.models.analysis import InventoryCoverage
+
+        return InventoryCoverage(
+            assessable_entities=assessable, entities_with_inventory=with_inventory
+        )
+
+    def test_an_estate_with_nothing_to_search_supports_no_conclusion(self):
+        coverage = self._coverage(0, 0)
+        assert coverage.ratio == 0.0
+        assert coverage.supports_negative_conclusion is False
+        assert coverage.describe() == "no entity in this workspace could run software"
+
+    def test_an_estate_searched_but_uninventoried_supports_no_conclusion_either(self):
+        """The shape a cloud import produces: assets exist, inventory does not."""
+        coverage = self._coverage(0, 40)
+        assert coverage.ratio == 0.0
+        assert coverage.supports_negative_conclusion is False
+
+    @pytest.mark.parametrize(
+        ("with_inventory", "assessable", "supported"),
+        [
+            (19, 40, False),   # 0.475
+            (20, 40, True),    # exactly half — the boundary is inclusive
+            (40, 40, True),
+            (1, 1, True),
+        ],
+    )
+    def test_the_majority_threshold_sits_at_half(self, with_inventory, assessable, supported):
+        coverage = self._coverage(with_inventory, assessable)
+        assert coverage.supports_negative_conclusion is supported
+
+    def test_the_description_names_both_figures(self):
+        """An operator has to be able to weigh the negative, not just receive it."""
+        described = self._coverage(7, 40).describe()
+        assert "7 of 40" in described
+
+
+class TestOverrideDescriptions:
+    """One line each, because they are what a scenario's failure list actually shows."""
+
+    @staticmethod
+    def _override(kind, **kwargs):
+        from app.models.analysis import SimulationOverride
+
+        return SimulationOverride(id="ov-1", kind=kind, target_id="payments-api", **kwargs)
+
+    def test_a_health_override_reads_as_an_assignment(self):
+        from app.models.analysis import OverrideKind
+        from app.models.core import HealthState
+
+        assert (
+            self._override(OverrideKind.ENTITY_HEALTH, health=HealthState.DOWN).describe()
+            == "payments-api = DOWN"
+        )
+
+    def test_a_capacity_override_reads_as_a_percentage(self):
+        from app.models.analysis import OverrideKind
+
+        assert (
+            self._override(OverrideKind.ENTITY_CAPACITY, capacity=0.4).describe()
+            == "payments-api capacity = 40%"
+        )
+
+    def test_a_disabled_edge_reads_as_a_cut_link(self):
+        from app.models.analysis import OverrideKind
+
+        assert (
+            self._override(OverrideKind.EDGE_DISABLED).describe()
+            == "payments-api link disabled"
+        )
+
+    def test_a_health_kind_with_no_health_falls_through_rather_than_lying(self):
+        """It cannot describe an assignment it was not given."""
+        from app.models.analysis import OverrideKind
+
+        assert self._override(OverrideKind.ENTITY_HEALTH).describe() == (
+            "payments-api link disabled"
+        )
