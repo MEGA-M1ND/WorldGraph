@@ -533,6 +533,10 @@ export interface EventDetail {
     entity_id: string;
     name: string;
     component: string;
+    component_version: string;
+    /** CONFIRMED_AFFECTED means the asset's own inventory names the CVE. Anything else
+     *  matched on product name alone, with the version unchecked. */
+    assessment: VulnerabilityAssessment;
     internet_facing: boolean;
   }[];
   freshness_seconds: number | null;

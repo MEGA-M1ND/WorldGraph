@@ -489,12 +489,15 @@ class WorldState:
                 )
             return self._empty_analysis(event, assessment=assessment, coverage=coverage)
 
-        internet_facing = [m for m in matches if m.internet_facing]
+        confirmed = [m for m in matches if m.is_confirmed]
+        unverified = len(matches) - len(confirmed)
+        internet_facing = [m for m in confirmed if m.internet_facing]
         self._record_timeline(
             stage="correlate",
             message=(
-                f"{cve_id or 'Vulnerability'} matches {len(matches)} assets "
-                f"({len(internet_facing)} internet-facing)."
+                f"{cve_id or 'Vulnerability'} confirmed on {len(confirmed)} assets "
+                f"({len(internet_facing)} internet-facing)"
+                + (f", {unverified} unverified by product name." if unverified else ".")
             ),
             event_id=event.id,
             entity_ids=[m.entity.id for m in matches],
@@ -504,7 +507,9 @@ class WorldState:
         # The origin is the *reachable* attack surface, not every vulnerable asset. An
         # internal service running vulnerable code that nothing can reach is a patching
         # task, not a blast radius — conflating the two is what makes CVE dashboards noise.
-        origins = [m.entity.id for m in internet_facing] or [matches[0].entity.id]
+        # Falls back to a confirmed asset before an unverified one: with nothing
+        # reachable, the best available origin is still the strongest evidence.
+        origins = [m.entity.id for m in internet_facing] or [(confirmed or matches)[0].entity.id]
         result = calculate_blast_radius(
             self.graph,
             origin_ids=origins,

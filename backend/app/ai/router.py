@@ -405,16 +405,25 @@ class IntentRouter:
                 return RouterResult(answer="No vulnerability events are currently ingested.")
             cve_id = str(events["events"][0]["id"]).split(":")[-1].upper()
         exposure = self._call("get_vulnerability_exposure", cve_id=cve_id)
-        if exposure["count"] == 0:
+        unverified = int(exposure.get("unverified_count") or 0)
+        if exposure["count"] == 0 and not unverified:
             return RouterResult(answer=f"{cve_id}: {exposure['note']}")
         lines = [
-            f"{cve_id} — {exposure['count']} assets run the affected software, "
-            f"{exposure['internet_facing_count']} of them internet-facing.",
+            f"{cve_id} — {exposure['count']} assets confirmed running the affected "
+            f"software, {exposure['internet_facing_count']} of them internet-facing."
+            + (
+                f" {unverified} more match by product name only, version unverified."
+                if unverified
+                else ""
+            ),
             "",
         ]
         for asset in exposure["assets"]:
             marker = "INTERNET-FACING" if asset["internet_facing"] else asset["network_zone"]
-            lines.append(f"  {asset['name']} — {asset['component']} [{marker}]")
+            unconfirmed = asset.get("assessment") != "CONFIRMED_AFFECTED"
+            prefix = "  ? " if unconfirmed else "  "
+            suffix = "  (product name only — unverified)" if unconfirmed else ""
+            lines.append(f"{prefix}{asset['name']} — {asset['component']} [{marker}]{suffix}")
         lines.append("")
         lines.append(
             "Ask \"which vulnerable systems can reach payments?\" to trace the attack path, "
