@@ -241,6 +241,48 @@ test.describe('WorldGraph hero demo', () => {
     await page.screenshot({ path: `${SHOTS}/08-analyst.png` });
   });
 
+  test('the composer accepts the next question the moment an answer lands', async ({ page }) => {
+    test.slow();
+    await page.goto('/');
+    await waitForBoot(page);
+    await dismissFirstRun(page);
+
+    const input = page.locator('[data-bind="command-input"]');
+    const send = page.locator('[data-bind="command-send"]');
+
+    // Deliberately the expensive path: this answer creates a scenario, so it is followed
+    // by a scenario fetch, a comparison refresh, camera flights and a timeline refresh.
+    await input.fill('What happens if Singapore goes offline?');
+    await input.press('Enter');
+    await expect(page.locator('.message--analyst')).toHaveCount(1, { timeout: 65_000 });
+
+    // The answer is on screen, so the composer must be usable. It used to stay disabled
+    // for the ~8 s of presentation work that followed — and because a disabled submit
+    // button also suppresses a form's implicit submission, Enter did nothing whatsoever:
+    // no request, no notice, the typed question just sitting in the box.
+    //
+    // The timeouts here are deliberately far below that window. Playwright retries
+    // assertions, so a generous timeout would have waited out the defect and passed.
+    await expect(send).toBeEnabled({ timeout: 1_000 });
+
+    await input.fill('What should we do?');
+    await input.press('Enter');
+    // The submit handler clears the field synchronously, so an empty box is proof the
+    // submission was accepted rather than swallowed.
+    await expect(input).toHaveValue('', { timeout: 3_000 });
+    await expect(page.locator('.message--analyst')).toHaveCount(2, { timeout: 65_000 });
+
+    // The presentation work still happens — it was moved off the critical path, not
+    // dropped. The plan renders structurally, and every action still says it was not run.
+    await expect(page.locator('[data-bind="detail-title"]')).toHaveText('Response plan', {
+      timeout: 30_000,
+    });
+    expect(await page.locator('.plan__action').count()).toBeGreaterThanOrEqual(3);
+    for (const note of await page.locator('.plan__footnote').allInnerTexts()) {
+      expect(note).toContain('not executed');
+    }
+  });
+
   test('the analyst refuses to invent infrastructure', async ({ page }) => {
     await page.goto('/');
     await waitForBoot(page);
