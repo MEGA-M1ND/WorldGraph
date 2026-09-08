@@ -433,3 +433,76 @@ class TestCustomerExposureReporting:
         assert f"{worst.region} sees an estimated" in text
         for region in others:
             assert f"{region} sees an estimated" not in text
+
+
+class TestRiskWeightsArePinned:
+    """The numbers that turn a world state into a score.
+
+    Mutation testing found almost every constant in `risk.py` unprotected: the WEIGHTS
+    ceilings, the criticality multipliers, the severity multipliers, the SPOF availability
+    threshold, and the dependency-depth curve. The score is displayed as `61/100` with a
+    signed derivation beside it, so each of these is a number an operator reads and acts on.
+
+    The tables are pinned as literals rather than by importing and comparing to themselves.
+    A weight is a product decision; changing one should require changing a test that says
+    so, not slip through because the assertion moved with it.
+    """
+
+    def test_every_weight_is_the_documented_value(self):
+        assert WEIGHTS == {
+            "asset_criticality": 30.0,
+            "customer_facing": 25.0,
+            "single_point_of_failure": 20.0,
+            "event_proximity": 15.0,
+            "customer_exposure": 20.0,
+            "dependency_depth": 10.0,
+            "event_severity": 15.0,
+            "redundancy_credit": -12.0,
+            "freshness_penalty": -8.0,
+        }
+
+    def test_no_single_dimension_can_reach_critical_alone(self):
+        """The stated design rule above the table, asserted rather than trusted."""
+        positives = [v for v in WEIGHTS.values() if v > 0]
+        assert max(positives) < 75.0
+        # "reaching 75 needs at least three of them"
+        assert sum(sorted(positives, reverse=True)[:2]) < 75.0
+        assert sum(sorted(positives, reverse=True)[:3]) >= 75.0
+
+    def test_credits_are_negative_and_penalties_reduce_the_score(self):
+        assert WEIGHTS["redundancy_credit"] < 0
+        assert WEIGHTS["freshness_penalty"] < 0
+
+    @pytest.mark.parametrize(
+        ("criticality", "expected"),
+        [
+            (Criticality.CRITICAL, 30.0),
+            (Criticality.HIGH, 21.0),
+            (Criticality.MEDIUM, 12.0),
+            (Criticality.LOW, 4.5),
+            (Criticality.UNKNOWN, 0.0),
+        ],
+    )
+    def test_criticality_multiplier_scales_the_asset_contribution(
+        self, criticality: Criticality, expected: float
+    ):
+        """A fully-lost asset of each criticality earns weight x its multiplier.
+
+        The expected values are written out — 30 x 0.7 = 21 — so a change to the
+        multiplier table fails here instead of being absorbed by an assertion that reads
+        the table back.
+        """
+        graph = WorldGraph([entity("a", criticality=criticality, health=HealthState.DOWN)], [])
+        state = propagate(graph)
+        score = score_impact(graph, state, origin_ids=["a"])
+        found = [c for c in score.contributions if c.code == "asset_criticality"]
+        if criticality is Criticality.UNKNOWN:
+            # Not "scores zero" — scored at all. An undeclared criticality is excluded
+            # before the multiplier table is reached (REALITY_PASS_AUDIT B4: an undeclared
+            # criticality is not a low one). The `UNKNOWN: 0.0` entry in that table is
+            # therefore unreachable, which is why mutating it survives; the exclusion is
+            # the real behaviour and this is what pins it.
+            assert not found, "an undeclared criticality must not be scored at all"
+        else:
+            assert found, f"{criticality.value} should contribute to the score"
+            assert found[0].points == pytest.approx(expected, abs=0.05)
