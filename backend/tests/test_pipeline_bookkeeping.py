@@ -491,3 +491,154 @@ class TestChangesSinceRespectsItsWindow:
         assert len(entries) == 30
         assert [e.at for e in entries] == sorted((e.at for e in entries), reverse=True)
         assert len(changes["new_events"]) <= 20
+
+
+# ======================================================================================
+# The read API everything else is built on
+# ======================================================================================
+
+
+class TestEventQueryFilters:
+    """`events()` backs the incident list, the dashboard and three AI tools.
+
+    Its `since`, `category` and `limit` filters all survived mutation, as did the
+    newest-first sort. A filter that silently does nothing returns *more* than asked for,
+    which reads as a working answer.
+    """
+
+    @staticmethod
+    def _seed(world, count: int = 6) -> list[WorldEvent]:
+        world._events.clear()
+        made = []
+        for index in range(count):
+            event = _physical_event(location=None, radius_km=0.0)
+            event.id = f"seed-{index}"
+            event.occurred_at = utcnow() - timedelta(hours=index)
+            if index % 2:
+                event.category = EventCategory.SECURITY_VULNERABILITY
+            world._events[event.id] = event
+            made.append(event)
+        return made
+
+    @pytest.mark.anyio
+    async def test_events_come_back_newest_first(self, world):
+        self._seed(world)
+        ids = [e.id for e in world.events()]
+        assert ids == ["seed-0", "seed-1", "seed-2", "seed-3", "seed-4", "seed-5"]
+
+    @pytest.mark.anyio
+    async def test_the_limit_takes_the_newest_not_an_arbitrary_slice(self, world):
+        self._seed(world)
+        assert [e.id for e in world.events(limit=2)] == ["seed-0", "seed-1"]
+
+    @pytest.mark.anyio
+    async def test_since_excludes_older_events_at_the_boundary(self, world):
+        made = self._seed(world)
+        cutoff = made[2].occurred_at
+        ids = [e.id for e in world.events(since=cutoff)]
+        # Inclusive: an event exactly at the cutoff is inside the window.
+        assert ids == ["seed-0", "seed-1", "seed-2"]
+
+    @pytest.mark.anyio
+    async def test_the_category_filter_is_case_insensitive_and_exact(self, world):
+        self._seed(world)
+        ids = [e.id for e in world.events(category="security_vulnerability")]
+        assert ids == ["seed-1", "seed-3", "seed-5"]
+        assert [e.id for e in world.events(category="SECURITY_VULNERABILITY")] == ids
+        # An unknown category returns nothing rather than everything.
+        assert world.events(category="NOT_A_CATEGORY") == []
+
+    @pytest.mark.anyio
+    async def test_the_filters_compose(self, world):
+        made = self._seed(world)
+        ids = [
+            e.id
+            for e in world.events(category="SECURITY_VULNERABILITY", since=made[3].occurred_at)
+        ]
+        assert ids == ["seed-1", "seed-3"]
+
+
+class TestTimelineQueryFilters:
+    @pytest.mark.anyio
+    async def test_the_timeline_is_newest_first_and_limited(self, world):
+        world._timeline.clear()
+        for index in range(10):
+            world._record_timeline(stage="test", message=f"entry {index}")
+        rows = world.timeline(limit=3)
+        assert [r.message for r in rows] == ["entry 9", "entry 8", "entry 7"]
+
+    @pytest.mark.anyio
+    async def test_filtering_by_event_keeps_only_that_events_entries(self, world):
+        world._timeline.clear()
+        world._record_timeline(stage="test", message="mine", event_id="evt-a")
+        world._record_timeline(stage="test", message="theirs", event_id="evt-b")
+        world._record_timeline(stage="test", message="unattached")
+        assert [r.message for r in world.timeline(event_id="evt-a")] == ["mine"]
+        # No filter means everything, including the unattached entry.
+        assert len(world.timeline()) == 3
+
+    @pytest.mark.anyio
+    async def test_an_unknown_event_id_yields_nothing_rather_than_everything(self, world):
+        assert world.timeline(event_id="no-such-event") == []
+
+
+class TestWhatCountsAsAnActiveIncident:
+    """`_correlates` decides whether an event is counted against this estate at all.
+
+    Three independent routes to True — a directly named entity, a geographic hit, a
+    software match — and every one of their guards survived. An always-True version would
+    count somebody else's outage as our incident; an always-False one would empty the
+    dashboard.
+    """
+
+    @pytest.mark.anyio
+    async def test_a_named_entity_that_exists_here_correlates(self, world):
+        world.graph = WorldGraph([_asset("region-a")], [])
+        assert world._correlates(_physical_event(location=None, radius_km=0.0, named=["region-a"]))
+
+    @pytest.mark.anyio
+    async def test_a_named_entity_from_another_estate_does_not(self, world):
+        """The whole point of workspace isolation, in one predicate."""
+        world.graph = WorldGraph([_asset("region-a")], [])
+        assert not world._correlates(
+            _physical_event(location=None, radius_km=0.0, named=["someone-elses-region"])
+        )
+
+    @pytest.mark.anyio
+    async def test_a_geographic_hit_correlates_and_a_miss_does_not(self, world):
+        here = GeoPoint(lat=1.30, lon=103.85)
+        world.graph = WorldGraph(
+            [_asset("dc-1", entity_type=EntityType.DATACENTER, location=here)], []
+        )
+        assert world._correlates(_physical_event(location=here, radius_km=50.0))
+        assert not world._correlates(
+            _physical_event(location=GeoPoint(lat=-45.0, lon=170.0), radius_km=50.0)
+        )
+
+    @pytest.mark.anyio
+    async def test_an_event_with_a_location_but_no_radius_does_not_correlate_by_geography(
+        self, world
+    ):
+        """A zero radius is not "everywhere" — it is "no declared exposure area"."""
+        here = GeoPoint(lat=1.30, lon=103.85)
+        world.graph = WorldGraph(
+            [_asset("dc-1", entity_type=EntityType.DATACENTER, location=here)], []
+        )
+        assert not world._correlates(_physical_event(location=here, radius_km=0.0))
+
+    @pytest.mark.anyio
+    async def test_a_cve_correlates_only_when_the_inventory_names_it(self, world):
+        vulnerable = SoftwareComponent(name="nginx", version="1.0", cve_ids=["CVE-2024-0001"])
+        world.graph = WorldGraph([_asset("web", software=[vulnerable])], [])
+        assert world._correlates(_cve_event())
+
+        world.graph = WorldGraph([_asset("web", software=[])], [])
+        assert not world._correlates(_cve_event())
+
+    @pytest.mark.anyio
+    async def test_an_event_with_no_route_at_all_does_not_correlate(self, world):
+        """No named entity, no location, no software: nothing ties it to this estate."""
+        world.graph = WorldGraph([_asset("web")], [])
+        bare = _physical_event(location=None, radius_km=0.0)
+        assert bare.metadata == {}
+        assert not world._correlates(bare)
