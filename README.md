@@ -315,7 +315,7 @@ figures switch to the simulated world — badged as such.
 ## Testing
 
 ```bash
-cd backend && pytest                    # 590 tests
+cd backend && pytest                    # 597 tests
 cd frontend && npm run typecheck         # TypeScript strict
 cd frontend && npm test                  # 32 unit tests
 cd frontend && npm run test:e2e          # 19 Playwright specs (needs the backend running)

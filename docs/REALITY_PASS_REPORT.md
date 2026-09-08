@@ -38,12 +38,12 @@ what they cost, and the section that matters most is [§9](#9-what-is-still-not-
 | Tag values reach no instruction path | Prompt-injection payloads in `worldgraph.owner`, `depends_on`, and free text | **Verified** |
 | The whole flow works in a real browser | 19 Playwright tests driving the workspace switch, the analyst, and the layout at five viewport widths | **Verified** |
 | Import scales to 5 000 resources | Performance budgets at 100 / 1 000 / 5 000 | **Verified** |
-| Resource Graph paging is handled | 17 tests in `backend/tests/test_azure_pagination.py` against a fake client: exact-multiple boundaries, a vanishing token, a token that never vanishes, an empty page mid-walk, the ceiling, and a disagreeing `total_records` | **Verified against a fake client — see §2** |
+| Resource Graph paging is handled | 21 tests in `backend/tests/test_azure_pagination.py` against a fake client, run both with and without the optional SDK because the request shape differs: exact-multiple boundaries, a vanishing token, a token that never vanishes, an empty page mid-walk, the ceiling, and a disagreeing `total_records` | **Verified against a fake client — see §2** |
 | A vulnerability count matches its evidence | 14 tests in `backend/tests/test_vulnerability_counts.py`; confirmed and product-name-only matches counted and scored apart | **Verified** |
 | The model cannot state a figure it was not given | 20 tests in `backend/tests/test_answer_grounding.py`; unsourced figures with no tool calls are withheld, not returned | **Verified** |
 | **The live Azure connector works against a real subscription** | — | **NOT VERIFIED — see §2** |
 
-Totals: **590 backend tests, 32 frontend unit tests, 19 end-to-end tests.** All green.
+Totals: **597 backend tests, 32 frontend unit tests, 19 end-to-end tests.** All green.
 
 Three of those rows are new since this report was first written, and one of them —
 paging — replaced a claim that was quietly false. See [§12](#12-what-an-external-review-found-after-this-report-was-written).
@@ -85,6 +85,36 @@ including the case where Azure's own `total_records` disagrees with the row coun
 loop I wrote, not of Resource Graph. `fetch_resources` takes a `client_factory` argument
 purely so that loop can be driven in tests; it does not make the live path verified, and
 the docstring says so at the call site.
+
+### An attempt to run it, and what that turned up
+
+The live path was then attempted in an environment with the real SDK installed. It has
+**still never contacted Azure** — there were no credentials of any kind, and the network
+policy answers `403` to `CONNECT management.azure.com:443`. What it did establish:
+
+| Executed for the first time | Result |
+|---|---|
+| `pip install -r requirements-azure.txt` in a clean environment | **Failed.** `azure-mgmt-resourcegraph==8.0.0` does `from six import with_metaclass` at import time without declaring `six`, and nothing in its chain pulls it in any more |
+| The error an operator would then see | *"Azure SDK is not installed. Install the optional dependencies with `pip install -r requirements-azure.txt`"* — after they had just run exactly that |
+| `_request_factory()` against the real SDK | Builds a genuine `QueryRequest` with `options.top = 1000` and `options.skip_token` threaded — the first time the real model classes have accepted the shape the paging loop builds |
+| `fetch_resources()` reaching `DefaultAzureCredential` | Raised `AdapterError` naming only the exception type (`ClientAuthenticationError`); the subscription id appeared in neither the message nor the logs |
+| Log inspection at `INFO` and `WARNING` (the shipped default) | No request URL, tenant, or token in any line. At `DEBUG` the Azure SDK and `urllib3` emit their own request URLs — third-party output, not WorldGraph's, and absent at the level the app configures |
+
+So the connector's **failure** path is now executed rather than assumed, and the pinned
+dependency set was broken for anyone who followed the instructions in §11. Both are fixed;
+a CI job now installs the optional extras and imports what the adapter imports.
+
+**And a test was found lying.** The 17 paging tests read the continuation token with
+`request.get("skip_token") if isinstance(request, dict) else None`. With the optional SDK
+installed the request is a real `QueryRequest`, so that reported *no token at all* — the
+one test proving the loop threads its token passed while asserting nothing. CI runs
+without the SDK, so it only ever exercised the dict fallback, a shape that never reaches
+Azure. The token is now read from whichever shape was built, and the suite is run both
+ways.
+
+**None of this makes the live connector verified.** A request object the SDK accepts is
+not a query Resource Graph answers, and an authentication failure is not a successful
+read. The verdict above is unchanged.
 
 The failure mode is bounded: a credential or query failure raises `AdapterError`, the
 workspace is marked UNAVAILABLE with a reason, and the demo workspace is unaffected. But
@@ -235,6 +265,10 @@ and survives only as inert single-line text.
 `requirements-azure.txt` and are never installed by the normal path. A CI job installs
 without them, asserts `import azure` fails, and runs the full backend suite — WorldGraph
 must install, test and demo with no cloud account, or the demo is not reproducible.
+
+A second job now does the mirror of that, and it exists because only testing the *absence*
+path let a broken pin ship: it installs `requirements-azure.txt` on its own and imports
+the four symbols the adapter uses. See §2.
 
 **Two tag-parser defects the tests found.** A `worldgraph.depends_on` value longer than
 512 characters was silently truncated mid-list, so a declared twelve dependencies became
@@ -423,7 +457,7 @@ radius with walkable explanation paths, the risk score with its full derivation,
 simulation engine's never-mutate-the-baseline contract, correlation, the deterministic
 tool layer, provenance and data-mode labelling, workspace isolation, and the whole
 inventory import path. None of that references AtlasPay, and after this phase all of it
-runs correctly on an estate that declares nothing. The 590-test suite would lose its
+runs correctly on an estate that declares nothing. The 597-test suite would lose its
 fixture, not its subject.
 
 **Would need replacing — the demonstration, and it is most of what makes a viewer believe
@@ -465,7 +499,7 @@ cd frontend && npm ci && npm run build
 npm run preview -- --host 127.0.0.1 --port 5173 --strictPort
 
 # Tests
-cd backend  && python -m pytest          # 590
+cd backend  && python -m pytest          # 597
 cd frontend && npm test                  # 32
 cd frontend && npx playwright test       # 19, real browser
 ```

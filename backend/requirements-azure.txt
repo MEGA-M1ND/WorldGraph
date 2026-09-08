@@ -9,4 +9,8 @@
 # stores a secret itself), and only the Resource Graph *query* API is called — no
 # management-plane write client is installed or imported anywhere in this codebase.
 azure-identity==1.19.0
-azure-mgmt-resourcegraph==8.0.0
+# 8.0.1, not 8.0.0: that release does `from six import with_metaclass` at import time
+# without declaring `six`, and nothing in its dependency chain pulls it in any more. A
+# clean `pip install -r requirements-azure.txt` produced a package that could not be
+# imported — see the CI job that now installs this file and imports what the adapter uses.
+azure-mgmt-resourcegraph==8.0.1
