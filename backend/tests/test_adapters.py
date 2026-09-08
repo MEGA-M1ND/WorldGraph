@@ -297,3 +297,253 @@ class TestAdapterContract:
             "SIMULATED",
             "UNAVAILABLE",
         }
+
+
+class TestEveryErrorBranchIsSafeToShow:
+    """`_describe_error` is deliberately narrow: an upstream body can contain anything and
+    a request URL can contain a key. Only the exception *type* and a fixed explanation
+    escape.
+
+    Coverage found four of its seven branches never executed. Each is tested here with a
+    payload that would be damaging if it leaked.
+    """
+
+    LEAKY_URL = "https://api.example.invalid/v1/feed?api_key=sk-live-abc123&tenant=acme"
+
+    @staticmethod
+    def _adapter():
+        return ReplayEventAdapter()
+
+    def test_no_error_at_all_still_produces_a_message(self):
+        adapter = self._adapter()
+        assert adapter._describe_error(None) == f"{adapter.name} request failed"
+
+    def test_an_http_status_error_reports_the_code_and_nothing_else(self):
+        adapter = self._adapter()
+        request = httpx.Request("GET", self.LEAKY_URL)
+        response = httpx.Response(503, request=request, text="upstream stack trace here")
+        message = adapter._describe_error(
+            httpx.HTTPStatusError("boom", request=request, response=response)
+        )
+        assert message == f"{adapter.name} returned HTTP 503"
+        for leak in ("api_key", "sk-live-abc123", "acme", "stack trace"):
+            assert leak not in message
+
+    def test_a_transport_error_says_unreachable_without_the_url(self):
+        adapter = self._adapter()
+        message = adapter._describe_error(
+            httpx.ConnectError("failed to connect", request=httpx.Request("GET", self.LEAKY_URL))
+        )
+        assert message == f"{adapter.name} is unreachable"
+        assert "sk-live-abc123" not in message
+
+    def test_a_decode_failure_says_malformed_without_the_body(self):
+        adapter = self._adapter()
+        message = adapter._describe_error(ValueError('{"secret": "hunter2" — truncated'))
+        assert message == f"{adapter.name} returned a malformed response"
+        assert "hunter2" not in message
+
+    def test_a_timeout_names_the_budget_it_exceeded(self):
+        from app.adapters.base import DEFAULT_TIMEOUT_SECONDS
+
+        adapter = self._adapter()
+        message = adapter._describe_error(httpx.TimeoutException("x"))
+        assert message == f"{adapter.name} timed out after {DEFAULT_TIMEOUT_SECONDS:.0f}s"
+
+    def test_every_branch_names_the_adapter_so_a_status_row_is_attributable(self):
+        adapter = self._adapter()
+        for error in (
+            None,
+            httpx.TimeoutException("x"),
+            httpx.ConnectError("x", request=httpx.Request("GET", self.LEAKY_URL)),
+            ValueError("x"),
+            RuntimeError("x"),
+        ):
+            assert adapter.name in adapter._describe_error(error)
+
+
+class TestFreshnessBands:
+    """The provenance panel's age label. Every band above "minutes" was uncovered."""
+
+    @pytest.mark.parametrize(
+        ("seconds", "expected"),
+        [
+            (0, "0 seconds"),
+            (59, "59 seconds"),
+            (60, "1 minutes"),
+            (3599, "59 minutes"),
+            (3600, "1 hours"),
+            (86_399, "23 hours"),
+            (86_400, "1 days"),
+            (172_800, "2 days"),
+        ],
+    )
+    def test_the_bands_sit_where_they_claim_to(self, seconds: int, expected: str):
+        adapter = ReplayEventAdapter()
+        now = utcnow()
+        adapter._last_success = now - timedelta(seconds=seconds)
+        assert adapter.freshness_label(now=now) == expected
+
+    def test_never_is_not_zero_seconds(self):
+        """A feed that has never succeeded has no age, and must not read as a fresh one."""
+        assert ReplayEventAdapter().freshness_label() == "never"
+
+
+class TestFallbackIsDeclaredNotSilent:
+    def test_marking_fallback_changes_the_state_and_says_why(self):
+        """A feed serving bundled data must not present as LIVE."""
+        adapter = ReplayEventAdapter()
+        adapter.mark_fallback("upstream unreachable; serving the bundled snapshot")
+        status = adapter.get_status()
+        assert status.state is FeedState.FALLBACK
+        assert status.message == "upstream unreachable; serving the bundled snapshot"
+
+
+class TestTheResponseSizeCap:
+    @pytest.mark.anyio
+    async def test_an_oversized_response_is_refused_rather_than_parsed(self, monkeypatch):
+        """A feed returning hundreds of megabytes is a denial of service, not data."""
+        from app.adapters.base import MAX_RESPONSE_BYTES
+
+        adapter = ReplayEventAdapter()
+        oversized = b"x" * (MAX_RESPONSE_BYTES + 1)
+
+        class FakeResponse:
+            content = oversized
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):  # pragma: no cover - must never be reached
+                raise AssertionError("an oversized body must not be parsed")
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def get(self, url, headers=None):
+                return FakeResponse()
+
+        monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+        with pytest.raises(AdapterError) as error:
+            await adapter.http_get_json("https://example.invalid/feed")
+        assert "oversized response" in str(error.value)
+        assert "MB" in str(error.value)
+
+    @pytest.mark.anyio
+    async def test_a_response_inside_the_cap_is_parsed(self, monkeypatch):
+        adapter = ReplayEventAdapter()
+
+        class FakeResponse:
+            content = b'{"ok": true}'
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"ok": True}
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def get(self, url, headers=None):
+                return FakeResponse()
+
+        monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+        assert await adapter.http_get_json("https://example.invalid/feed") == {"ok": True}
+
+
+class TestThePollLoop:
+    @pytest.mark.anyio
+    async def test_a_started_adapter_polls_and_a_stopped_one_stops(self):
+        """`stop()` must not raise even if a poll is mid-flight."""
+        import asyncio
+
+        class Counting(ReplayEventAdapter):
+            refresh_interval_seconds = 0.01
+
+            def __init__(self):
+                super().__init__()
+                self.refreshes = 0
+
+            async def refresh(self):
+                self.refreshes += 1
+                await super().refresh()
+
+        adapter = Counting()
+        await adapter.initialize()
+        await adapter.start()
+        await asyncio.sleep(0.05)
+        await adapter.stop()
+        polled = adapter.refreshes
+        assert polled > 1, "the loop must have run beyond the initial refresh"
+
+        # And nothing runs after stop.
+        await asyncio.sleep(0.05)
+        assert adapter.refreshes == polled
+
+    @pytest.mark.anyio
+    async def test_stopping_an_adapter_that_never_started_is_safe(self):
+        adapter = ReplayEventAdapter()
+        await adapter.stop()
+        assert adapter.get_status().state is not FeedState.LIVE
+
+    @pytest.mark.anyio
+    async def test_the_loop_checks_again_after_waking_rather_than_refreshing_blind(self):
+        """The window between the sleep ending and the refresh starting.
+
+        Without the second check, an adapter told to stop during a long interval still
+        fires one more upstream request after the shutdown it acknowledged.
+        """
+        import asyncio
+
+        class Counting(ReplayEventAdapter):
+            refresh_interval_seconds = 0.08
+
+            def __init__(self):
+                super().__init__()
+                self.refreshes = 0
+
+            async def refresh(self):
+                self.refreshes += 1
+                await super().refresh()
+
+        adapter = Counting()
+        await adapter.initialize()
+        await adapter.start()
+        after_start = adapter.refreshes
+        # Let the loop reach its sleep first, then clear the flag without cancelling the
+        # task, then let the sleep end. Clearing it before the task runs would exit at the
+        # `while`, which is a different line and a different guarantee.
+        await asyncio.sleep(0.01)
+        adapter._running = False
+        await asyncio.sleep(0.15)
+        assert adapter.refreshes == after_start
+        assert adapter._task is not None and adapter._task.done()
+        await adapter.stop()
+
+    @pytest.mark.anyio
+    async def test_a_zero_interval_adapter_refreshes_once_and_starts_no_loop(self):
+        class OneShot(ReplayEventAdapter):
+            refresh_interval_seconds = 0.0
+
+        adapter = OneShot()
+        await adapter.initialize()
+        await adapter.start()
+        assert adapter._task is None
+        await adapter.stop()
