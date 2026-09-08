@@ -561,3 +561,119 @@ class TestConfidenceNamesTheTraversalsOwnLimits:
         ))
         notes = _estate_provenance_notes(WorldGraph([simulated], []))
         assert any("simulated world state" in note for note in notes)
+
+
+class TestThePlanCarriesTheAnalysisItsOwnCaveats:
+    """"Anything the impact model could not compute is an assumption the reader is making
+    implicitly, so it belongs in the plan rather than only in the analysis panel."
+
+    The truncation assumption and the entities-missing-from-the-graph guards were all
+    uncovered. A plan is what somebody acts on; a caveat that stayed behind in the
+    analysis panel is a caveat nobody read.
+    """
+
+    @staticmethod
+    def _result(**overrides):
+        from app.models.analysis import (
+            BlastRadiusResult,
+            BusinessImpact,
+            Confidence,
+            RiskScore,
+        )
+
+        base = {
+            "id": "blast-1",
+            "origin_kind": "ENTITY",
+            "origin_ids": ["a"],
+            "origin_label": "a",
+            "severity": Severity.HIGH,
+            "risk": RiskScore(score=50.0, severity=Severity.HIGH, contributions=[]),
+            "business_impact": BusinessImpact(
+                infrastructure_availability=0.5,
+                critical_services_impacted=1,
+                customer_regions_impacted=0,
+                unknown_reasons=["Revenue exposure is unknown: no revenue metadata."],
+            ),
+            "confidence": Confidence(score=0.7),
+        }
+        base.update(overrides)
+        return BlastRadiusResult(**base)
+
+    def test_the_impact_models_unknowns_become_the_plans_assumptions(self):
+        from app.analysis.response_plan import generate_response_plan
+
+        graph = WorldGraph([_entity("a")], [])
+        plan = generate_response_plan(graph, self._result())
+        assert "Revenue exposure is unknown: no revenue metadata." in plan.assumptions
+
+    def test_a_truncated_analysis_says_so_in_the_plan_not_only_in_the_analysis(self):
+        from app.analysis.response_plan import generate_response_plan
+
+        graph = WorldGraph([_entity("a")], [])
+        clean = generate_response_plan(graph, self._result())
+        truncated = generate_response_plan(graph, self._result(truncated=True))
+        assert not any("traversal was truncated" in a.lower() for a in clean.assumptions)
+        assert any(
+            a == "Dependency traversal was truncated; entities beyond the traversal bound are "
+            "not represented in this plan."
+            for a in truncated.assumptions
+        )
+
+    def test_a_plan_over_nothing_still_recommends_watching_rather_than_nothing(self):
+        from app.analysis.response_plan import generate_response_plan
+
+        graph = WorldGraph([_entity("a")], [])
+        plan = generate_response_plan(graph, self._result())
+        assert plan.actions
+        assert all(action.executed is False for action in plan.actions)
+
+
+class TestTheDemoHeadlineCountsAreDerived:
+    """"Derived, not hardcoded, so they cannot drift from the fixture."
+
+    The function that does the deriving was never called by a test, which is how a
+    "cannot drift" claim quietly stops being true.
+    """
+
+    def test_the_counts_match_a_count_of_the_fixture_itself(self):
+        from app.fixtures.atlaspay import build_atlaspay, headline_counts
+
+        entities, _edges = build_atlaspay()
+        counts = headline_counts()
+        wanted = {
+            EntityType.BUSINESS_SERVICE,
+            EntityType.APPLICATION,
+            EntityType.MICROSERVICE,
+            EntityType.DATABASE,
+        }
+        expected = sum(
+            1
+            for e in entities
+            if e.criticality.value == "CRITICAL" and e.type in wanted
+        )
+        assert counts["critical_services"] == expected > 0
+
+    def test_infrastructure_counts_the_types_an_operator_runs(self):
+        """An inclusion list, written out — an organization node is not an asset."""
+        from app.fixtures.atlaspay import build_atlaspay, headline_counts
+
+        entities, _edges = build_atlaspay()
+        counted = {
+            EntityType.KUBERNETES_CLUSTER,
+            EntityType.DATABASE,
+            EntityType.CLOUD_REGION,
+            EntityType.DATACENTER,
+            EntityType.OFFICE,
+            EntityType.SUPPLIER,
+            EntityType.FACTORY,
+            EntityType.NETWORK_NODE,
+            EntityType.EXTERNAL_API,
+            EntityType.MICROSERVICE,
+        }
+        counts = headline_counts()
+        assert counts["infrastructure_assets"] == sum(
+            1 for e in entities if e.type in counted
+        )
+        assert counts["infrastructure_assets"] < len(entities)
+        for absent in (EntityType.ORGANIZATION, EntityType.CUSTOMER_REGION):
+            assert absent not in counted
