@@ -346,3 +346,145 @@ class TestTheRouterSaysWhenItHasNothing:
         # depth 0 is the origin itself and must not appear as one of its own dependencies.
         assert not any("(depth 0)" in line for line in body)
         assert all("(depth " in line for line in body)
+
+
+# ======================================================================================
+# How a computed result is rendered
+# ======================================================================================
+
+
+class TestTheComparisonArrowsPointTheRightWay:
+    """A swapped arrow tells an operator a cascade improved things.
+
+    `{"worse": "▼", "better": "▲", "same": " "}` is the entire visual grammar of the
+    compare table in the text answer, and all three entries survived mutation.
+    """
+
+    @staticmethod
+    def _render(world, deltas: list[dict]) -> str:
+        return IntentRouter(ToolContext(state=world))._format_comparison(
+            {
+                "deltas": deltas,
+                "cascade_paths": [],
+                "newly_impacted": [],
+                "note": "Modelled, not measured.",
+            }
+        )
+
+    @pytest.mark.anyio
+    async def test_each_direction_gets_its_own_marker(self, world):
+        rendered = self._render(
+            world,
+            [
+                {"label": "Worse row", "baseline": "1", "simulated": "2", "direction": "worse"},
+                {"label": "Better row", "baseline": "2", "simulated": "1", "direction": "better"},
+                {"label": "Same row", "baseline": "1", "simulated": "1", "direction": "same"},
+            ],
+        )
+        lines = {line.split()[0]: line for line in rendered.splitlines() if line.startswith("  ")}
+        assert lines["Worse"].endswith("▼")
+        assert lines["Better"].endswith("▲")
+        assert not lines["Same"].rstrip().endswith(("▼", "▲"))
+
+    @pytest.mark.anyio
+    async def test_the_table_is_headed_so_the_columns_are_unambiguous(self, world):
+        rendered = self._render(
+            world, [{"label": "Row", "baseline": "1", "simulated": "2", "direction": "same"}]
+        )
+        assert rendered.splitlines()[0] == "CURRENT vs SIMULATION"
+        # Baseline before simulated, with the arrow between them.
+        assert "1  →  " in rendered
+
+    @pytest.mark.anyio
+    async def test_the_modelled_note_is_always_the_last_word(self, world):
+        rendered = self._render(
+            world, [{"label": "Row", "baseline": "1", "simulated": "2", "direction": "worse"}]
+        )
+        assert rendered.splitlines()[-1] == "Modelled, not measured."
+
+
+class TestTheBlastRadiusRenderingKeepsItsQualifiers:
+    """Risk contributions, unknown reasons, confidence and the truncation notice.
+
+    Each of these is a hedge attached to a number. Rendering the number without its hedge
+    is how a model estimate becomes a measurement in the reader's head.
+    """
+
+    @staticmethod
+    def _payload(**overrides) -> dict:
+        payload = {
+            "severity": "HIGH",
+            "origin": "cloud-region-singapore",
+            "risk_score": 62.0,
+            "risk_breakdown": [
+                {"points": 20.0, "label": "single-region dependency"},
+                {"points": -10.0, "label": "failover capacity available"},
+            ],
+            "direct_impact": [{"name": "payments-api", "availability": 0.25}],
+            "indirect_impact": [{"name": "checkout-platform", "availability": 0.4, "depth": 2}],
+            "critical_paths": ["a → b → c"],
+            "customer_exposure": [],
+            "business_impact": {
+                "availability": 0.9,
+                "critical_services_impacted": 3,
+                "disclaimer": "Modelled from declared traffic shares",
+                "unknown_reasons": ["no traffic share declared for EMEA"],
+            },
+            "confidence": {
+                "score": 0.72,
+                "strong_evidence": ["declared dependency edges"],
+                "uncertainties": ["health is inventory, not observation"],
+            },
+        }
+        payload.update(overrides)
+        return payload
+
+    @pytest.mark.anyio
+    async def test_a_negative_contribution_keeps_its_sign(self, world):
+        """A −10 failover credit rendering as "10" reads as extra risk, not less."""
+        rendered = IntentRouter(ToolContext(state=world))._format_blast(self._payload())
+        assert "  -10  failover capacity available" in rendered
+        assert "  +20  single-region dependency" in rendered
+
+    @pytest.mark.anyio
+    async def test_the_missing_input_is_named_beside_the_number_it_weakens(self, world):
+        rendered = IntentRouter(ToolContext(state=world))._format_blast(self._payload())
+        assert "  ? no traffic share declared for EMEA" in rendered
+        assert "Modelled from declared traffic shares." in rendered
+
+    @pytest.mark.anyio
+    async def test_confidence_carries_both_sides_of_the_evidence(self, world):
+        rendered = IntentRouter(ToolContext(state=world))._format_blast(self._payload())
+        assert "Confidence 72%" in rendered
+        assert "  + declared dependency edges" in rendered
+        assert "  ? health is inventory, not observation" in rendered
+
+    @pytest.mark.anyio
+    async def test_truncated_traversal_is_declared(self, world):
+        router = IntentRouter(ToolContext(state=world))
+        assert "Traversal truncated" not in router._format_blast(self._payload())
+        assert "Traversal truncated — impact may extend beyond what is listed." in (
+            router._format_blast(self._payload(truncated=True))
+        )
+
+    @pytest.mark.anyio
+    async def test_customer_exposure_is_labelled_estimated_and_modelled(self, world):
+        rendered = IntentRouter(ToolContext(state=world))._format_blast(
+            self._payload(
+                customer_exposure=[
+                    {"region": "APAC", "traffic_impact": 0.42, "customers": 41_500}
+                ]
+            )
+        )
+        assert (
+            "Estimated customer exposure: 42% of APAC traffic "
+            "(41,500 modelled customers)." in rendered
+        )
+
+    @pytest.mark.anyio
+    async def test_direct_and_indirect_are_headed_separately_with_their_counts(self, world):
+        rendered = IntentRouter(ToolContext(state=world))._format_blast(self._payload())
+        assert "Directly exposed (1):" in rendered
+        assert "Indirectly exposed (1):" in rendered
+        assert "  payments-api — 25% availability" in rendered
+        assert "  checkout-platform — 40% (depth 2)" in rendered

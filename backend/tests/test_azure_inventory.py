@@ -168,6 +168,46 @@ class TestSanitization:
             node = {"child": node}
         assert "[truncated]" in json.dumps(sanitize_properties(node))
 
+    def test_the_depth_bound_is_deep_enough_to_be_useful(self):
+        """Cutting too early would redact ordinary Azure config as though it were secret.
+
+        Azure property trees nest several levels before anything interesting appears, so
+        the bound has to sit past that. A shallow tree must survive whole.
+        """
+        shallow = {"a": {"b": {"c": {"d": {"e": "value"}}}}}
+        assert sanitize_properties(shallow) == shallow
+
+    def test_a_long_string_is_truncated_rather_than_stored_whole(self):
+        """An unbounded property value is how a snapshot grows a secret-sized blob."""
+        cleaned = sanitize_properties({"note": "x" * 2000})
+        assert len(cleaned["note"]) <= 512
+        assert cleaned["note"].startswith("x")
+
+    def test_a_long_list_is_capped(self):
+        cleaned = sanitize_properties({"items": [f"item-{i}" for i in range(400)]})
+        assert len(cleaned["items"]) == 50
+        # The head, not an arbitrary slice.
+        assert cleaned["items"][0] == "item-0"
+
+    def test_scalars_pass_through_with_their_types_intact(self):
+        """`0` and `False` must not be coerced into strings or dropped."""
+        cleaned = sanitize_properties(
+            {"count": 0, "ratio": 0.0, "enabled": False, "absent": None}
+        )
+        assert cleaned == {"count": 0, "ratio": 0.0, "enabled": False, "absent": None}
+        assert cleaned["enabled"] is False
+
+    def test_the_page_size_respects_what_resource_graph_will_actually_return(self):
+        """Resource Graph caps a response at 1000 rows regardless of what KQL asks for.
+
+        Asking for more does not fail — it silently returns 1000 and the paging loop
+        reads the short page as the end of the estate.
+        """
+        from app.adapters.azure_inventory import MAX_RESOURCES, PAGE_SIZE
+
+        assert PAGE_SIZE == 1000
+        assert MAX_RESOURCES > PAGE_SIZE, "a ceiling below one page could never page"
+
     def test_entities_carry_no_secret_from_the_snapshot(self, snapshot_resources, azure_workspace):
         blob = ""
         for resource in snapshot_resources:
